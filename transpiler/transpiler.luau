@@ -1,17 +1,25 @@
-local Transpiler = {Version = "3.30"}
+local Transpiler = {Version = "3.31"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
 local LAUA_ASYNC_RUNTIME_SOURCE = [====[
+type LauaPromiseStatus = "Pending" | "Fulfilled" | "Rejected"
+type LauaPackedValues = {n: number, [number]: any}
+type LauaPromiseState = {
+    _status: LauaPromiseStatus,
+    _values: LauaPackedValues?,
+    _waiters: {thread},
+}
+
 local Async: any = {}
-local Promise: any = {}
+local Promise: {[string]: any} = {}
 Promise.__index = Promise
 
 local function isPromise(value: any): boolean
     return type(value) == "table" and getmetatable(value) == Promise
 end
 
-local function settle(promise: any, status: string, values: any)
+local function settle(promise: LauaPromiseState, status: LauaPromiseStatus, values: LauaPackedValues)
     if promise._status ~= "Pending" then return end
     promise._status = status
     promise._values = values
@@ -23,10 +31,10 @@ end
 
 function Async.run(callback: (...any) -> ...any, ...: any)
     assert(type(callback) == "function", "Async.run expects a function")
-    local promise = setmetatable({_status = "Pending", _values = nil, _waiters = {}}, Promise)
-    local args = table.pack(...)
-    task.spawn(function()
-        local result = table.pack(pcall(callback, table.unpack(args, 1, args.n)))
+    local promise: LauaPromiseState = {_status = "Pending", _values = nil, _waiters = {}}
+    setmetatable(promise, Promise)
+    task.spawn(function(...)
+        local result = table.pack(pcall(callback, ...))
         if result[1] then
             local values = table.pack(table.unpack(result, 2, result.n))
             if values.n == 1 and isPromise(values[1]) then
@@ -42,7 +50,7 @@ function Async.run(callback: (...any) -> ...any, ...: any)
         else
             settle(promise, "Rejected", table.pack(result[2]))
         end
-    end)
+    end, ...)
     return promise
 end
 
@@ -92,7 +100,7 @@ function Promise:finally(callback: () -> ())
     end)
 end
 
-function Promise:getStatus()
+function Promise.getStatus(self: LauaPromiseState): LauaPromiseStatus
     return self._status
 end
 
@@ -230,29 +238,29 @@ end
 
 LauaCore.table = {}
 
-function LauaCore.table.filter(items: {any}, predicate: (any, number) -> boolean): {any}
-    local out = {}
+function LauaCore.table.filter<T>(items: {T}, predicate: (T, number) -> boolean): {T}
+    local out: {T} = {}
     for index, item in items do
         if predicate(item, index) then table.insert(out, item) end
     end
     return out
 end
 
-function LauaCore.table.map(items: {any}, callback: (any, number) -> any): {any}
-    local out = {}
+function LauaCore.table.map<T, U>(items: {T}, callback: (T, number) -> U): {U}
+    local out: {U} = table.create(#items)
     for index, item in items do
         out[index] = callback(item, index)
     end
     return out
 end
 
-function LauaCore.table.reduce(items: {any}, callback: (any, any, number) -> any, initial: any): any
-    local current = initial
+function LauaCore.table.reduce<T, U>(items: {T}, callback: (U, T, number) -> U, initial: U): U
+    local current: U = initial
     for index, item in items do current = callback(current, item, index) end
     return current
 end
 
-function LauaCore.table.findWhere(items: {any}, predicate: (any, number) -> boolean): any
+function LauaCore.table.findWhere<T>(items: {T}, predicate: (T, number) -> boolean): T?
     for index, item in items do
         if predicate(item, index) then return item end
     end
@@ -282,11 +290,17 @@ return LauaCore
 ]====]
 
 local LAUA_SIGNAL_RUNTIME_SOURCE = [====[
+type LauaSignalState = {
+    _event: BindableEvent,
+    _destroyed: boolean,
+    _types: {string}?,
+}
+
 local Signal: any = {}
 Signal.__index = Signal
 
 function Signal.new(typeNames: {string}?)
-    local state: {_event: BindableEvent, _destroyed: boolean, _types: {string}?} = { _event = Instance.new("BindableEvent"), _destroyed = false, _types = typeNames }
+    local state: LauaSignalState = { _event = Instance.new("BindableEvent"), _destroyed = false, _types = typeNames }
     return setmetatable(state, Signal)
 end
 
@@ -306,7 +320,7 @@ function Signal:Once(callback: (...any) -> ())
     return connection
 end
 
-function Signal.Fire(self: any, ...)
+function Signal.Fire(self: LauaSignalState, ...)
     assert(not self._destroyed, "Cannot fire a destroyed signal")
     local types: {string}? = self._types
     if types then
@@ -331,7 +345,7 @@ function Signal:Wait()
     return self._event.Event:Wait()
 end
 
-function Signal.Destroy(self: any)
+function Signal.Destroy(self: LauaSignalState)
     if self._destroyed then return end
     self._destroyed = true
     self._event:Destroy()
@@ -888,7 +902,7 @@ local function transpileClasses(source: string): string
             end
         end
         if plainClass then
-            local simple = {"local " .. name .. ": any = {}", name .. ".__index = " .. name}
+            local simple = {"local " .. name .. ": {[string]: any} = {}", name .. ".__index = " .. name}
             for _, field in statics do table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end
             table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             for _, field in fields do table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end
@@ -922,7 +936,7 @@ local function transpileClasses(source: string): string
             table.insert(generated, `if {base}.__final then error("Cannot extend final class '{base}'") end`)
             table.insert(generated, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
         else
-            table.insert(generated, "local " .. name .. ": any = {}")
+            table.insert(generated, "local " .. name .. ": {[string]: any} = {}")
         end
         table.insert(generated, `{name}.__final = {tostring(prefix == "final")}`)
         table.insert(generated, `{name}.__abstract = {tostring(prefix == "abstract")}`)
@@ -2175,7 +2189,7 @@ local function compactCoreRuntime(source: string): string
     if not CORE_RUNTIME_DECLARATIONS then
         local declarations = {}
         local available = {}
-        for start, name in LAUA_CORE_RUNTIME_SOURCE:gmatch("()function LauaCore%.([%a_][%w_%.]*)%(") do
+        for start, name in LAUA_CORE_RUNTIME_SOURCE:gmatch("()function LauaCore%.([%a_][%w_%.]*)[<(]") do
             table.insert(declarations, {Start = start, Name = name})
             available[name] = true
         end
@@ -2208,19 +2222,31 @@ local function compactCoreRuntime(source: string): string
     return table.concat(pieces, "\n\n")
 end
 
+-- Initialize runtime tables directly and isolate private bindings with do blocks.
+-- This avoids the one-shot function allocation/call without exposing internals.
+local function runtimeDoBlock(name: string, alias: string, body: string): string
+    local oldDeclaration = alias == "Async" and "local Async: any = {}" or (alias == "Signal" and "local Signal: any = {}" or "local LauaCore = {}")
+    local newDeclaration = "local " .. alias .. ": {[string]: any} = " .. name
+    local declarationAt = body:find(oldDeclaration, 1, true)
+    assert(declarationAt == 1 or (declarationAt ~= nil and body:sub(1, declarationAt - 1):find("^type ")), "Missing runtime library declaration")
+    body = body:gsub(oldDeclaration:gsub("(%W)", "%%%1"), newDeclaration, 1)
+    body = body:gsub("%s*return " .. alias .. "%s*$", "")
+    return "local " .. name .. ": {[string]: any} = {}\ndo\n" .. body .. "\nend"
+end
+
 -- Embedded runtimes are inserted once, after header directives. Generated
 -- scripts do not depend on separate Laua runtime ModuleScripts.
 local function insertEmbeddedRuntimes(source: string): string
     local masked = maskNonCode(source)
     local fragments = {}
-    if masked:find("__lauaAsync.", 1, true) and not masked:find("local%s+__lauaAsync%s*=") then
-        table.insert(fragments, "local __lauaAsync = (function()\n" .. LAUA_ASYNC_RUNTIME_SOURCE .. "\nend)()")
+    if masked:find("__lauaAsync.", 1, true) and not masked:find("local%s+__lauaAsync%f[%W]") then
+        table.insert(fragments, runtimeDoBlock("__lauaAsync", "Async", LAUA_ASYNC_RUNTIME_SOURCE))
     end
-    if masked:find("__lauaCore.", 1, true) and not masked:find("local%s+__lauaCore%s*=") then
-        table.insert(fragments, "local __lauaCore = (function()\n" .. compactCoreRuntime(source) .. "\nend)()")
+    if masked:find("__lauaCore.", 1, true) and not masked:find("local%s+__lauaCore%f[%W]") then
+        table.insert(fragments, runtimeDoBlock("__lauaCore", "LauaCore", compactCoreRuntime(source)))
     end
-    if masked:find("__lauaSignal.", 1, true) and not masked:find("local%s+__lauaSignal%s*=") then
-        table.insert(fragments, "local __lauaSignal = (function()\n" .. LAUA_SIGNAL_RUNTIME_SOURCE .. "\nend)()")
+    if masked:find("__lauaSignal.", 1, true) and not masked:find("local%s+__lauaSignal%f[%W]") then
+        table.insert(fragments, runtimeDoBlock("__lauaSignal", "Signal", LAUA_SIGNAL_RUNTIME_SOURCE))
     end
     if #fragments == 0 then return source end
 
