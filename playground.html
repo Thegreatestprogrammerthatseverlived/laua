@@ -115,8 +115,8 @@
         <div class="file-tools">
           <button id="newFileBtn" class="tab-add" title="New .laua file" aria-label="New .laua file">+</button>
           <button id="renameFileBtn" class="tab-action" title="Rename selected file">Rename</button>
-          <button id="openFilesBtn" class="tab-action" title="Open .laua files from your computer">Open</button>
-          <input id="openFilesInput" type="file" accept=".laua,text/plain" multiple hidden />
+          <button id="openFilesBtn" class="tab-action" title="Open .laua or .luau files from your computer">Open</button>
+          <input id="openFilesInput" type="file" accept=".laua,.luau,text/plain" multiple hidden />
         </div>
       </div>
       <div id="lauaEditor" class="editor"></div>
@@ -6172,15 +6172,17 @@ local part = message[1:7]`;
       function normalizeProjectFilename(input) {
         let name = String(input || "").trim().replace(/\\/g, "/");
         name = name.replace(/^\/+/, "");
-        if (!name.endsWith(".laua")) name += ".laua";
+        if (!/\.(?:laua|luau)$/.test(name)) name += ".laua";
         const pieces = name.split("/");
-        if (pieces.some(part => part === ".." || part === "." || !/^[A-Za-z_][A-Za-z0-9_]*\.laua$/.test(part) && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(part))) {
-          throw new Error("Use .laua names like main.laua or Modules/Zombie.laua (letters, digits and underscores only).");
+        if (pieces.some((part,index) => part === ".." || part === "." || (index === pieces.length-1 ? !/^[A-Za-z_][A-Za-z0-9_]*\.(?:laua|luau)$/.test(part) : !/^[A-Za-z_][A-Za-z0-9_]*$/.test(part)))) {
+          throw new Error("Use file names like main.laua, main.luau, or Modules/Zombie.laua (letters, digits and underscores only).");
         }
         return name;
       }
 
-      function removeLauaExtension(path) { return path.replace(/\.laua$/, ""); }
+      function removeLauaExtension(path) { return path.replace(/\.(?:laua|luau)$/, ""); }
+      function isCompiledLuauFile(file) { return file.name.endsWith(".luau"); }
+      function initialProjectFile() { return projectFiles.has("main.laua") ? "main.laua" : projectFiles.has("main.luau") ? "main.luau" : projectFiles.keys().next().value; }
 
       function resolveProjectImport(fromFile, importPath) {
         if (!/^(?:\.\/|\.\.\/)/.test(importPath)) return null;
@@ -6306,6 +6308,12 @@ local part = message[1:7]`;
       }
 
       function refreshFileMarkers(file) {
+        if (isCompiledLuauFile(file)) {
+          monaco.editor.setModelMarkers(file.model,"laua",[]);
+          monaco.editor.setModelMarkers(file.model,"laua-project",[]);
+          file.errors=0;file.warnings=0;
+          return {errors:0,warnings:0,hints:0,directives:readPlaygroundDirectives(file.model.getValue())};
+        }
         const result = updateLauaDiagnostics(file.model);
         const base = monaco.editor.getModelMarkers({owner:"laua",resource:file.model.uri}) || [];
         const projectErrors = projectImportMarkers(file);
@@ -6377,7 +6385,7 @@ local part = message[1:7]`;
             safe.push({name,source:(blankMain || oldDemo) ? STARTER : entry.source});
           }
           // A deleted main.laua must not make the next visit open Zombie.laua.
-          if (!seen.has("main.laua")) {
+          if (!seen.has("main.laua") && !seen.has("main.luau")) {
             safe.unshift({name:"main.laua",source:STARTER});
           }
           // A tab selected last visit should NOT decide what opens next visit.
@@ -6397,7 +6405,7 @@ local part = message[1:7]`;
         const normalized=normalizeProjectFilename(name);
         if (projectFiles.has(normalized)) throw new Error(`'${normalized}' already exists.`);
         const uri=monaco.Uri.parse(`inmemory://laua/${normalized}`);
-        const model=monaco.editor.createModel(source,"laua",uri);
+        const model=monaco.editor.createModel(source,normalized.endsWith(".luau") ? "lua" : "laua",uri);
         const output=monaco.editor.createModel("","lua",monaco.Uri.parse(`inmemory://laua-output/${removeLauaExtension(normalized)}.luau`));
         const file={name:normalized,model,output,sourceView:null,outputView:null,errors:0,warnings:0,generated:null};
         file.disposeChange=model.onDidChangeContent(()=>{
@@ -6541,6 +6549,11 @@ local part = message[1:7]`;
         // Never discard a source file because another file fails to compile.
         for (const file of projectFiles.values()) {
           const entry={sourceName:file.name,source:file.model.getValue(),outputName:removeLauaExtension(file.name)+".luau",output:null,error:null};
+          if (isCompiledLuauFile(file)) {
+            entry.output=entry.source;
+            result.push(entry);
+            continue;
+          }
           const sourcePreflight=refreshFileMarkers(file);
           if(sourcePreflight.errors){entry.error=`${sourcePreflight.errors} Laua preflight error(s)`;result.push(entry);continue;}
           const importErrors=projectImportMarkers(file);
@@ -6551,6 +6564,14 @@ local part = message[1:7]`;
             catch (error) {entry.error=error?.message || String(error);}
           }
           result.push(entry);
+        }
+        const usedOutputs=new Map();
+        for(const entry of result){
+          const previous=usedOutputs.get(entry.outputName);
+          if(previous){
+            entry.error=`Conflicting output name: ${entry.outputName}`;
+            previous.error=`Conflicting output name: ${entry.outputName}`;
+          }else usedOutputs.set(entry.outputName,entry);
         }
         return result;
       }
@@ -6644,7 +6665,7 @@ local part = message[1:7]`;
           }else if(kind==='module' && type==='ModuleScript'){
             const value=prop(item,'Source');
             if(value===null)throw new Error('ModuleScript has no Source: '+name);
-            store(path.concat(name.replace(/\.(?:luau|lua|laua)$/,'')+'.laua').join('/'),value);
+            store(path.concat(name.replace(/\.(?:luau|lua|laua)$/,'')+'.luau').join('/'),value);
           }
         }
         const project=roots.find(root=>prop(root,'Name')==='LauaProject');
@@ -6667,16 +6688,16 @@ local part = message[1:7]`;
         const imported=await readLauaProjectRbxmx(blob);
         const message=imported.originalLaua
           ? `Replace the current project with ${imported.files.length} original Laua source files from this model?`
-          : `Import ${imported.files.length} compiled Luau ModuleScripts as editable .laua files? Original Laua syntax cannot be recovered from compiled-only models. This replaces your saved project.`;
+          : `Import ${imported.files.length} compiled Luau ModuleScripts as editable .luau files? These files will bypass Laua-only transformations and diagnostics. Original Laua syntax cannot be recovered from compiled-only models. This replaces your saved project.`;
         if(!confirm(message))return false;
-        if(!imported.files.some(f=>f.name==='main.laua'))imported.files.unshift({name:'main.laua',source:''});
+        if(!imported.files.some(f=>f.name==='main.laua' || f.name==='main.luau'))imported.files.unshift({name:'main.laua',source:''});
         for(const file of projectFiles.values()){
           file.disposeChange.dispose();file.model.dispose();file.output.dispose();
         }
         projectFiles.clear();activeFile=null;
         diffSnapshots.length=0;
         for(const entry of imported.files)createProjectFile(entry.name,entry.source,{silent:true});
-        switchProjectFile('main.laua');
+        switchProjectFile(initialProjectFile());
         lintAllProjectFiles();rememberProject();
         projectStatus().textContent=`Imported ${imported.files.length} ${imported.originalLaua?'original Laua sources':'compiled Luau modules'}.`;
         projectStatus().className='ok';
@@ -6912,7 +6933,10 @@ local part = message[1:7]`;
 
         if (showStatus) {
           const modeInfo = ` · ${result.directives?.mode || "nonstrict"}${result.directives?.nolint ? " · nolint" : ""}${result.directives?.optimize !== null && result.directives?.optimize !== undefined ? ` · optimize ${result.directives.optimize} (Roblox)` : ""}`;
-          if (result.errors > 0) {
+          if (isCompiledLuauFile(projectFiles.get(activeFile))) {
+            status.textContent = "Luau source: Laua-only lint is not applied. Use Roblox Studio Script Analysis for full diagnostics.";
+            status.className = "ok";
+          } else if (result.errors > 0) {
             status.textContent =
               `Laua preflight (not Studio lint): ${result.errors} error(s), ${result.warnings} warning(s), ${result.hints} hint(s)${modeInfo}`;
 
@@ -6939,9 +6963,9 @@ local part = message[1:7]`;
           const file = projectFiles.get(activeFile);
           const preflight=refreshFileMarkers(file);
           if(preflight.errors>0)throw new Error(`Laua preflight detected ${preflight.errors} error(s). Fix marked source before transpiling.`);
-          const importErrors = projectImportMarkers(file);
+          const importErrors = isCompiledLuauFile(file) ? [] : projectImportMarkers(file);
           if (importErrors.length) throw new Error(importErrors.map(item=>item.message).join("; "));
-          const output = transpile(lauaEditor.getValue(), {Mode: document.getElementById("modeSelect").value,OutputStyle:document.getElementById("outputStyleSelect").value});
+          const output = isCompiledLuauFile(file) ? lauaEditor.getValue() : transpile(lauaEditor.getValue(), {Mode: document.getElementById("modeSelect").value,OutputStyle:document.getElementById("outputStyleSelect").value});
           if (recordForDiff) {
             diffSnapshots.push({
               filename: activeFile,
@@ -6952,7 +6976,7 @@ local part = message[1:7]`;
             if (diffSnapshots.length > 2) diffSnapshots.shift();
           }
           luauEditor.setValue(output);
-          const generatedErrors=generatedLuauPreflight(output);
+          const generatedErrors=isCompiledLuauFile(file) ? [] : generatedLuauPreflight(output);
           monaco.editor.setModelMarkers(luauEditor.getModel(),'laua-generated',generatedErrors.map(diagnostic=>{
             const range=makeRangeFromOffsets(luauEditor.getModel(),diagnostic.start,diagnostic.end);
             return {...range,severity:monaco.MarkerSeverity.Error,message:'Generated Luau preflight: '+diagnostic.message};
@@ -6963,7 +6987,9 @@ local part = message[1:7]`;
           const inputBytes = new TextEncoder().encode(lauaEditor.getValue()).length;
           const outputBytes = new TextEncoder().encode(output).length;
           const savedBytes = Math.max(0, inputBytes-outputBytes);
-          status.textContent = `Transpiled (preflight only; Studio not verified) · ${document.getElementById("modeSelect").value} · ${inputBytes.toLocaleString()} → ${outputBytes.toLocaleString()} bytes${savedBytes ? ` · ${savedBytes.toLocaleString()} fewer bytes` : ""} · Roblox optimize ${directives.optimize ?? "default"}${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`;
+          status.textContent = isCompiledLuauFile(file)
+            ? `Compiled Luau passthrough (no Laua transformations; Studio analysis not verified) · ${outputBytes.toLocaleString()} bytes${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`
+            : `Transpiled (preflight only; Studio not verified) · ${document.getElementById("modeSelect").value} · ${inputBytes.toLocaleString()} → ${outputBytes.toLocaleString()} bytes${savedBytes ? ` · ${savedBytes.toLocaleString()} fewer bytes` : ""} · Roblox optimize ${directives.optimize ?? "default"}${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`;
           status.className = "ok";
           return output;
         } catch (err) {
@@ -7208,13 +7234,13 @@ local part = message[1:7]`;
       lauaEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runTranspile(true));
       lauaEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyL, () => runLint(true));
 
-      // Always launch with main.laua selected and populated. Other saved
-      // .laua files remain available as tabs, including Zombie.laua.
+      // Always launch with the main project file selected. Imported compiled
+      // ModuleScripts remain .luau files instead of becoming invalid .laua source.
       const savedProject = restoredProject();
       const seed = savedProject?.files || [{name:"main.laua",source:STARTER}];
       for (const entry of seed) createProjectFile(entry.name,entry.source,{silent:true});
       projectReady = true;
-      switchProjectFile("main.laua");
+      switchProjectFile(initialProjectFile());
 
       // A failed background self-test should never prevent the starter editor
       // from appearing. The Tests button can still report full test failures.
@@ -7230,8 +7256,8 @@ local part = message[1:7]`;
         status.className = "error";
       }
       playgroundInitialized = true;
-      if (savedProject && projectFiles.get("main.laua")?.model.getValue() !== STARTER) {
-        status.textContent += " · Your saved main.laua was restored unchanged.";
+      if (savedProject && projectFiles.get(initialProjectFile())?.model.getValue() !== STARTER) {
+        status.textContent += ` · Your saved ${initialProjectFile()} was restored unchanged.`;
       }
     }, function (error) {
       const status = document.getElementById("status");
