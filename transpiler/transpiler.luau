@@ -920,9 +920,9 @@ local function transpileClasses(source: string): string
         local generated = {}
         if base then
             table.insert(generated, `if {base}.__final then error("Cannot extend final class '{base}'") end`)
-            table.insert(generated, `local {name}: any = setmetatable({}, {__index = {base}})`)
+            table.insert(generated, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
         else
-            table.insert(generated, `local {name}: any = {}`)
+            table.insert(generated, "local " .. name .. ": any = {}")
         end
         table.insert(generated, `{name}.__final = {tostring(prefix == "final")}`)
         table.insert(generated, `{name}.__abstract = {tostring(prefix == "abstract")}`)
@@ -1168,8 +1168,8 @@ local function transpileImports(source: string): string
         end
         local name, path = line:match('^import%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
         if not name then name, path = line:match("^import%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
-        local named, namedPath = line:match('^import%s+%{(.-)%}%s+from%s+"([^"\n]+)"%s*$')
-        if not named then named, namedPath = line:match("^import%s+%{(.-)%}%s+from%s+'([^'\n]+)'%s*$") end
+        local named, namedPath = line:match('^import%s+[{](.-)[}]%s+from%s+"([^"\n]+)"%s*$')
+        if not named then named, namedPath = line:match("^import%s+[{](.-)[}]%s+from%s+'([^'\n]+)'%s*$") end
         if not name and not named then error("Expected import Name or import {Name} from \"./Module\"") end
         path = path or namedPath
         if path:sub(1, 2) ~= "./" and path:sub(1, 3) ~= "../" then error("Import path must be relative to script: ./ or ../") end
@@ -1212,11 +1212,11 @@ local function transpileDestructuring(source: string): string
     local serial = 0
     for _, row in splitLines(source) do
         local raw = row.Text
-        if not trim(maskNonCode(raw)):match("^local%s*%{") then
+        if not trim(maskNonCode(raw)):match("^local%s*[{]") then
             table.insert(result, raw)
             continue
         end
-        local indent, names, expression = raw:match("^([ \t]*)local%s*%{([^{}]+)%}%s*=%s*(.-)%s*$")
+        local indent, names, expression = raw:match("^([ \t]*)local%s*[{]([^{}]+)[}]%s*=%s*(.-)%s*$")
         if not names or trim(expression) == "" then error("Expected local {a, b} = tableExpression") end
         serial += 1
         local temporary = `__lauaDestructure{serial}`
@@ -1879,7 +1879,7 @@ local function transpileAdditionalSyntax(source: string): string
 
         -- The v22 spread form accepts spreads-only table literals on the RHS.
         if masked:find("%.%.%.[%a_]") and original:find("{", 1, true) then
-            local prefix, values = original:match("^(.-)%{%s*(%.%.%.[^{}]-)%s*%}%s*$")
+            local prefix, values = original:match("^(.-)[{]%s*(%.%.%.[^{}]-)%s*[}]%s*$")
             if prefix and values then
                 local parts = {}
                 for part in values:gmatch("[^,]+") do
@@ -2200,7 +2200,7 @@ local function compactCoreRuntime(source: string): string
         local nextDeclaration = declarations[index + 1]
         local last = nextDeclaration and nextDeclaration.Start - 1 or #LAUA_CORE_RUNTIME_SOURCE
         local body = LAUA_CORE_RUNTIME_SOURCE:sub(declaration.Start, last)
-        body = body:gsub("\nLauaCore%.table%s*=%s*%{%}", "")
+        body = body:gsub("\nLauaCore%.table%s*=%s*[{][}]", "")
         body = body:gsub("\nreturn LauaCore%s*$", "")
         table.insert(pieces, trim(body))
     end
@@ -2313,7 +2313,7 @@ local function validateKnownVisibility(source: string)
 end
 
 local function compactGeneratedOutput(source: string): string
-    if source:find("%[%=*%[") or source:find("`",1,true) then return source end
+    if source:find("[[]=*[[]") or source:find("`",1,true) then return source end
     local result = {}
     for row in source:gmatch("([^\n]*)\n?") do
         local commentOnly = row:match("^%s*%-%-") and not row:match("^%s*%-%-[!#]")
@@ -2325,7 +2325,7 @@ end
 -- Compile-time inlining is explicit. Preserve ordinary dynamic function calls.
 -- Only a single pure return with zero/one argument can be substituted safely.
 local function transpileInlineFunctions(source: string): string
-    if source:find("%[%=*%[") or source:find("`", 1, true) then return source end
+    if source:find("[[]=*[[]") or source:find("`", 1, true) then return source end
     local cursor = 1
     while true do
         local masked = maskNonCode(source)
