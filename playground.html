@@ -75,7 +75,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.29 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.30 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions">
       <button id="exampleBtn" title="Load the built-in starter example into main.laua (other files stay unchanged)">Default main.laua</button>
@@ -101,7 +101,8 @@
       <button id="docsBtn" title="Generate reference documentation from Laua declarations">Docs</button>
       <button id="exportBtn" title="Export active file as Luau">Export Luau</button>
       <button id="exportProjectBtn" title="Export compiled ModuleScripts only; keep your .laua files separately to retain the original syntax">Export Project .rbxmx</button>
-      <button id="importProjectBtn" title="Import a Roblox .rbxmx model containing ModuleScripts">Import Project .rbxmx</button>
+      <button id="exportStudioBtn" title="Export the original .laua and .luau sources for the Laua Studio plugin. The standard compiled-only export is unchanged.">Export Editable Studio .rbxmx</button>
+      <button id="importProjectBtn" title="Import compiled modules or an editable Laua Studio project .rbxmx">Import Project .rbxmx</button>
       <input id="importProjectInput" type="file" accept=".rbxmx,application/xml,text/xml" hidden />
       <button id="nextErrorBtn" title="Jump to the next error or warning (F8)">Next Problem</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
@@ -6834,6 +6835,59 @@ local part = message[1:7]`;
         return {blob:new Blob([fragments.join('')],{type:'application/xml;charset=utf-8'}),errors:[]};
       }
 
+      // Editable Studio export preserves original source, separately from the
+      // existing compiled-only model. No source maps or runtime scripts needed.
+      function makeStudioSourceRbxmx() {
+        const invalidXml = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u;
+        const escapeXml = value => {
+          const str=String(value);
+          if(invalidXml.test(str))throw new Error('Source contains XML-invalid characters.');
+          return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;').replace(/\r/g,'&#13;');
+        };
+        const folder=name=>({kind:'Folder',name,children:[],dirs:new Map()});
+        const project=folder('LauaStudioProject');
+        const sources=folder('Sources');
+        project.children.push(sources);
+        for(const file of projectFiles.values()) {
+          const path=normalizeProjectFilename(file.name).split('/');
+          let parent=sources;
+          for(const segment of path.slice(0,-1)) {
+            if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(segment))throw new Error('Studio source folder needs a Luau identifier: '+segment);
+            if(!parent.dirs.has(segment)) {
+              const dir=folder(segment);parent.dirs.set(segment,dir);parent.children.push(dir);
+            }
+            parent=parent.dirs.get(segment);
+          }
+          const name=path.at(-1);
+          if(!/^[A-Za-z_][A-Za-z0-9_]*\.(laua|luau)$/.test(name))throw new Error('Studio source file name must be a valid identifier with a .laua or .luau extension: '+name);
+          parent.children.push({kind:'StringValue',name,value:file.model.getValue()});
+        }
+        let referent=0;
+        const parts=['<?xml version="1.0" encoding="utf-8"?>\n','<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">','<External>null</External><External>nil</External>'];
+        function emit(node) {
+          parts.push('<Item class="',node.kind,'" referent="RBXLAUASTUDIO',String(++referent),'">','<Properties><string name="Name">',escapeXml(node.name),'</string>');
+          if(node.kind==='StringValue')parts.push('<string name="Value">',escapeXml(node.value),'</string>');
+          parts.push('</Properties>');
+          for(const child of node.children||[])emit(child);
+          parts.push('</Item>');
+        }
+        emit(project);
+        parts.push('</roblox>');
+        return new Blob([parts.join('')],{type:'application/xml;charset=utf-8'});
+      }
+
+      function exportStudioSourceProject() {
+        try {
+          const blob=makeStudioSourceRbxmx();
+          downloadProjectBlob('Laua-v3.30-editable-studio.rbxmx',blob);
+          projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
+          projectStatus().className='ok';
+        } catch(error) {
+          projectStatus().textContent=error?.message||String(error);
+          projectStatus().className='error';
+        }
+      }
+
       // XML import accepts our compiled-only model, old Laua models with
       // original sources, and simple Roblox models made of ModuleScripts.
       // Parsing and validation finish before the saved project is replaced.
@@ -6870,7 +6924,7 @@ local part = message[1:7]`;
           }else if(kind==='source' && type==='StringValue'){
             const value=prop(item,'Value');
             if(value===null)throw new Error('Source entry has no Value: '+name);
-            if(!name.endsWith('.laua'))return;
+            if(!name.endsWith('.laua') && !name.endsWith('.luau'))return;
             store(path.concat(name).join('/'),value);
           }else if(kind==='module' && type==='ModuleScript'){
             const value=prop(item,'Source');
@@ -6878,9 +6932,9 @@ local part = message[1:7]`;
             store(path.concat(name.replace(/\.(?:luau|lua|laua)$/,'')+'.luau').join('/'),value);
           }
         }
-        const project=roots.find(root=>prop(root,'Name')==='LauaProject');
+        const project=roots.find(root=>prop(root,'Name')==='LauaProject' || prop(root,'Name')==='LauaStudioProject');
         const top=project ? children(project,'Item') : roots;
-        const originalSources=top.find(item=>prop(item,'Name')==='LauaSources');
+        const originalSources=top.find(item=>prop(item,'Name')==='LauaSources' || prop(item,'Name')==='Sources');
         if(originalSources){
           for(const item of children(originalSources,'Item'))walk(item,[],'source');
         }
@@ -6891,13 +6945,13 @@ local part = message[1:7]`;
           for(const item of compiled ? children(compiled,'Item') : top)walk(item,[],'module');
         }
         if(!decoded.length)throw new Error('No importable ModuleScripts were found.');
-        return {files:decoded, originalLaua:Boolean(originalSources)};
+        return {files:decoded, originalLaua:decoded.some(entry=>entry.name.endsWith('.laua')), hasEditableSources:Boolean(originalSources)};
       }
 
       async function importProjectRbxmx(blob) {
         const imported=await readLauaProjectRbxmx(blob);
-        const message=imported.originalLaua
-          ? `Replace the current project with ${imported.files.length} original Laua source files from this model?`
+        const message=imported.hasEditableSources
+          ? `Replace the current project with ${imported.files.length} editable source files from this model?`
           : `Import ${imported.files.length} compiled Luau ModuleScripts as editable .luau files? These files will bypass Laua-only transformations and diagnostics. Original Laua syntax cannot be recovered from compiled-only models. This replaces your saved project.`;
         if(!confirm(message))return false;
         if(!imported.files.some(f=>f.name==='main.laua' || f.name==='main.luau'))imported.files.unshift({name:'main.laua',source:''});
@@ -6909,7 +6963,7 @@ local part = message[1:7]`;
         for(const entry of imported.files)createProjectFile(entry.name,entry.source,{silent:true});
         switchProjectFile(initialProjectFile());
         lintAllProjectFiles();rememberProject();
-        projectStatus().textContent=`Imported ${imported.files.length} ${imported.originalLaua?'original Laua sources':'compiled Luau modules'}.`;
+        projectStatus().textContent=`Imported ${imported.files.length} ${imported.hasEditableSources?'editable sources':'compiled Luau modules'}.`;
         projectStatus().className='ok';
         return true;
       }
@@ -6923,7 +6977,7 @@ local part = message[1:7]`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.29-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.30-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -7347,6 +7401,7 @@ local part = message[1:7]`;
         status.className=errors.length?"error":"ok";
       });
       document.getElementById("exportProjectBtn").addEventListener("click",exportProject);
+      document.getElementById("exportStudioBtn").addEventListener("click",exportStudioSourceProject);
       document.getElementById("importProjectBtn").addEventListener("click",()=>document.getElementById("importProjectInput").click());
       document.getElementById("importProjectInput").addEventListener("change",async event=>{
         const file=event.target.files?.[0];event.target.value="";
