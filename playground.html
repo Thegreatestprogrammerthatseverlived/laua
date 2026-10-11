@@ -129,7 +129,7 @@
   </main>
 
   <div id="status" role="status" aria-live="polite">Loading Laua Playground...</div>
-  <div id="robloxApiStatus" role="status" aria-live="polite" title="The API dump covers Roblox engine classes and enums; constructor globals come from a bundled Roblox datatype catalog.">Roblox API: checking current Studio version...</div>
+  <div id="robloxApiStatus" role="status" aria-live="polite" title="Engine classes and enums use the current Roblox Studio API dump (with fallbacks). Luau primitives, buffer, and standard libraries use the bundled catalog.">Roblox API: checking current Studio version...</div>
   <dialog id="diffDialog" aria-label="Generated output differences">
     <div style="display:flex;gap:14px;align-items:center;justify-content:space-between">
       <strong>Generated Luau changes</strong>
@@ -290,11 +290,102 @@
       ],
       buffer: [
         "copy", "create", "fill", "fromstring", "len", "readf32", "readf64",
-        "readi8", "readi16", "readi32", "readstring", "readu8", "readu16",
+        "readbits", "readi8", "readi16", "readi32", "readstring", "readu8", "readu16",
         "readu32", "tostring", "writef32", "writef64", "writei8", "writei16",
-        "writei32", "writestring", "writeu8", "writeu16", "writeu32"
+        "writei32", "writebits", "writestring", "writeu8", "writeu16", "writeu32"
       ]
     };
+
+    // Primitive buffers have no instance methods in Luau. The editor presents
+    // library-call rewrites on `myBuffer.` rather than generating invalid Lua.
+    const BUFFER_SIGNATURES = {
+      create: ["size: number", "Create a new buffer", false],
+      fromstring: ["str: string", "Create a buffer from a string", false],
+      tostring: ["b: buffer", "Convert a buffer to a string", true],
+      len: ["b: buffer", "Get the buffer size", true],
+      readbits: ["b: buffer, bitOffset: number, bitCount: number", "Read up to 32 bits", true],
+      writebits: ["b: buffer, bitOffset: number, bitCount: number, value: number", "Write up to 32 bits", true],
+      readstring: ["b: buffer, offset: number, count: number", "Read a string from a buffer", true],
+      writestring: ["b: buffer, offset: number, value: string, count: number?", "Write a string into a buffer", true],
+      copy: ["target: buffer, targetOffset: number, source: buffer, sourceOffset: number?, count: number?", "Copy buffer bytes", true],
+      fill: ["b: buffer, offset: number, value: number, count: number?", "Fill buffer bytes", true]
+    };
+    for (const suffix of ["i8", "u8", "i16", "u16", "i32", "u32", "f32", "f64"]) {
+      BUFFER_SIGNATURES[`read${suffix}`] = ["b: buffer, offset: number", `Read ${suffix} from a buffer`, true];
+      BUFFER_SIGNATURES[`write${suffix}`] = ["b: buffer, offset: number, value: number", `Write ${suffix} into a buffer`, true];
+    }
+    const HIDDEN_DEPRECATED_BUILTINS = new Set(["getfenv", "setfenv", "table.maxn", "BasePart.Velocity", "Humanoid.LoadAnimation", "PathfindingService.FindPathAsync"]);
+    const ROBLOX_PRIMITIVE_TYPES = new Set(["buffer", "string", "number", "boolean"]);
+
+    function makeLibraryMembers(owner) {
+      const members = {};
+      for (const name of LIBRARY_MEMBERS[owner] || []) {
+        if (HIDDEN_DEPRECATED_BUILTINS.has(`${owner}.${name}`)) continue;
+        const definition = owner === "buffer" ? BUFFER_SIGNATURES[name] : null;
+        members[name] = {
+          kind: owner === "math" && ["pi", "huge"].includes(name) || owner === "utf8" && name === "charpattern" ? "field" : "function",
+          params: definition?.[0] || "",
+          detail: definition?.[1] || `${owner} standard library`,
+          documentation: definition?.[1] || `Luau ${owner}.${name}`
+        };
+      }
+      return members;
+    }
+
+    function inferRobloxConstructorType(rhs) {
+      const text = rhs.trim();
+      const direct = text.match(/^([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(/);
+      if (!direct) return null;
+      const [, type, method] = direct;
+      if (type === "buffer" && ["create", "fromstring"].includes(method)) return "buffer";
+      if (type === "Instance" && method === "new") {
+        const named = text.match(/^Instance\.new\s*\(\s*["']([A-Za-z_]\w*)["']/);
+        return named?.[1] || "Instance";
+      }
+      if (ROBLOX_DATATYPE_STATIC[type] && ROBLOX_DATATYPE_STATIC[type][method] !== undefined) {
+        if (type === "DateTime" && method === "now") return "DateTime";
+        if (type === "BrickColor" && method === "random") return "BrickColor";
+        return type;
+      }
+      return null;
+    }
+
+    function getInferredLocalType(symbols, name) {
+      const info = symbols.locals[name] || symbols.parameters[name];
+      return info?.type?.replace(/\?$/, "").trim() || info?.robloxClass || info?.service || null;
+    }
+
+    function isBufferVariable(symbols, name) {
+      return getInferredLocalType(symbols, name) === "buffer";
+    }
+
+    function makeBufferCallSuggestions(monacoApi, model, position, owner, typedPartial, lineBefore) {
+      const dotMatch = lineBefore.match(/([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)?$/);
+      if (!dotMatch || dotMatch[1] !== owner) return [];
+      const replacementStart = position.column - dotMatch[0].length;
+      const range = new monacoApi.Range(position.lineNumber, replacementStart, position.lineNumber, position.column);
+      const suggestions = [];
+      for (const [name, [signature, documentation, acceptsBuffer]] of Object.entries(BUFFER_SIGNATURES)) {
+        if (!acceptsBuffer || !name.toLowerCase().startsWith(typedPartial.toLowerCase())) continue;
+        const parts = signature.split(", ").slice(1).map((entry, i) => {
+          const label = entry.split(":")[0].replace(/\?$/, "");
+          return `\${${i + 1}:${label}}`;
+        });
+        const suffix = parts.length ? `, ${parts.join(", ")}` : "";
+        suggestions.push({
+          label: `${name}  →  buffer.${name}(${owner}, …)`,
+          filterText: name,
+          sortText: `0000_buffer_${name}`,
+          kind: monacoApi.languages.CompletionItemKind.Function,
+          insertText: `buffer.${name}(${owner}${suffix})`,
+          insertTextRules: monacoApi.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          detail: "Valid buffer library call (replaces variable.method)",
+          documentation: `${documentation}\n\nBuffer values do not have methods. The result uses the global buffer library.`,
+          range
+        });
+      }
+      return suggestions;
+    }
 
     const STARTER = `--!strict
 class Character
@@ -2631,6 +2722,26 @@ local part = message[1:7]`;
       Instance: {
         new: "function"
       },
+      RBXScriptConnection: {Connected: "field", Disconnect: "function"},
+      RBXScriptSignal: {Connect: "function", ConnectParallel: "function", Once: "function", Wait: "function"},
+      Random: {NextInteger: "function", NextNumber: "function", Shuffle: "function", NextUnitVector: "function", Clone: "function"},
+      RaycastParams: {FilterDescendantsInstances: "field", FilterType: "field", IgnoreWater: "field", CollisionGroup: "field", RespectCanCollide: "field", BruteForceAllSlow: "field", AddToFilter: "function"},
+      OverlapParams: {FilterDescendantsInstances: "field", FilterType: "field", MaxParts: "field", CollisionGroup: "field", RespectCanCollide: "field", BruteForceAllSlow: "field", AddToFilter: "function"},
+      TweenInfo: {Time: "field", EasingStyle: "field", EasingDirection: "field", RepeatCount: "field", Reverses: "field", DelayTime: "field"},
+      RaycastResult: {Instance: "field", Position: "field", Normal: "field", Material: "field", Distance: "field"},
+      DateTime: {UnixTimestamp: "field", UnixTimestampMillis: "field", FormatUniversalTime: "function", FormatLocalTime: "function", ToIsoDate: "function", ToUniversalTime: "function", ToLocalTime: "function"},
+      NumberRange: {Min: "field", Max: "field"},
+      UDim: {Scale: "field", Offset: "field"},
+      NumberSequence: {Keypoints: "field"},
+      ColorSequence: {Keypoints: "field"},
+      NumberSequenceKeypoint: {Time: "field", Value: "field", Envelope: "field"},
+      ColorSequenceKeypoint: {Time: "field", Value: "field"},
+      PhysicalProperties: {Density: "field", Friction: "field", Elasticity: "field", FrictionWeight: "field", ElasticityWeight: "field"},
+      BrickColor: {Name: "field", Number: "field", Color: "field", r: "field", g: "field", b: "field"},
+      Rect: {Min: "field", Max: "field", Width: "field", Height: "field"},
+      Ray: {Origin: "field", Direction: "field", Unit: "field", ClosestPoint: "function", Distance: "function"},
+      Region3: {CFrame: "field", Size: "field", ExpandToGrid: "function"},
+
       RemoteEvent: {
         FireServer: "function", FireClient: "function", FireAllClients: "function",
         OnServerEvent: "field", OnClientEvent: "field", Destroy: "function",
@@ -2651,14 +2762,14 @@ local part = message[1:7]`;
         FindFirstChild: "function", WaitForChild: "function", GetDescendants: "function", Destroy: "function"
       },
       BasePart: {
-        Position: "field", CFrame: "field", Size: "field", Velocity: "field", AssemblyLinearVelocity: "field",
+        Position: "field", CFrame: "field", Size: "field", AssemblyLinearVelocity: "field",
         AssemblyAngularVelocity: "field", Anchored: "field", CanCollide: "field", Touched: "field",
         ApplyImpulse: "function", GetTouchingParts: "function", FindFirstChild: "function", Destroy: "function"
       },
       Humanoid: {
         Health: "field", MaxHealth: "field", WalkSpeed: "field", JumpPower: "field", JumpHeight: "field",
         MoveDirection: "field", RootPart: "field", Move: "function", TakeDamage: "function",
-        ChangeState: "function", GetState: "function", LoadAnimation: "function", Died: "field"
+        ChangeState: "function", GetState: "function", Died: "field"
       }
     };
 
@@ -2693,7 +2804,7 @@ local part = message[1:7]`;
         ListDataStoresAsync: "function"
       },
       PathfindingService: {
-        CreatePath: "function", FindPathAsync: "function"
+        CreatePath: "function"
       },
       ContextActionService: {
         BindAction: "function", BindActionAtPriority: "function", UnbindAction: "function",
@@ -2857,7 +2968,7 @@ local part = message[1:7]`;
       }
 
       for (const tag of robloxTags(descriptor)) {
-        if (tag === "Deprecated") return true;
+        if (tag === "Deprecated" || (tag && typeof tag === "object" && (tag.Name === "Deprecated" || tag.Tag === "Deprecated"))) return true;
 
         // Current API dumps can encode a deprecated alias as a tag object
         // pointing to the preferred replacement descriptor.
@@ -2995,7 +3106,7 @@ local part = message[1:7]`;
       const name = robloxTypeName(type);
 
       if (category === "Class") return name;
-      if (name && ROBLOX_API.classes.has(name)) return name;
+      if (name && (ROBLOX_API.classes.has(name) || ROBLOX_DATATYPE_STATIC[name] || BUILTIN_MEMBER_SETS[name])) return name;
 
       return null;
     }
@@ -3004,8 +3115,10 @@ local part = message[1:7]`;
       return ROBLOX_API.classes.get(className) || null;
     }
 
+    const apiMemberCache = new Map();
     function getRobloxApiMembers(className, seen = new Set()) {
       if (!className || seen.has(className)) return {};
+      if (apiMemberCache.has(className)) return apiMemberCache.get(className);
 
       const classInfo = getRobloxClassInfo(className);
       if (!classInfo) return {};
@@ -3034,10 +3147,9 @@ local part = message[1:7]`;
         };
       }
 
-      return {
-        ...inherited,
-        ...own
-      };
+      const result = {...inherited, ...own};
+      apiMemberCache.set(className, result);
+      return result;
     }
 
     function getRobloxEnumTypes() {
@@ -3103,6 +3215,7 @@ local part = message[1:7]`;
     let robloxApiLoadPromise = null;
 
     function installRobloxApiDump(dump, metadata = {}) {
+      apiMemberCache.clear();
       ROBLOX_API.classes.clear();
       ROBLOX_API.enums.clear();
       ROBLOX_API.services.clear();
@@ -3334,6 +3447,7 @@ local part = message[1:7]`;
       const result = {};
 
       for (const [name, kind] of Object.entries(rawMembers || {})) {
+        if (HIDDEN_DEPRECATED_BUILTINS.has(`${detailPrefix}.${name}`)) continue;
         result[name] = {
           kind,
           detail: `${detailPrefix} ${kind === "function" ? "method" : "member"}`
@@ -3354,6 +3468,57 @@ local part = message[1:7]`;
       );
     }
 
+    function getDatatypeValueMembers(typeName) {
+      if (!typeName) return null;
+      const raw = BUILTIN_MEMBER_SETS[typeName];
+      if (!raw) return null;
+      const result = membersToCompletionMap(raw, typeName);
+      // Constructors belong to the global datatype table, not an instance.
+      for (const name of Object.keys(ROBLOX_DATATYPE_STATIC[typeName] || {})) delete result[name];
+      return result;
+    }
+
+    function membersForType(typeName) {
+      if (!typeName) return null;
+      if (ROBLOX_API.ready && ROBLOX_API.classes.has(typeName)) return getRobloxApiMembers(typeName);
+      return getDatatypeValueMembers(typeName) || (SERVICE_MEMBER_SETS[typeName]
+        ? membersToCompletionMap(SERVICE_MEMBER_SETS[typeName], typeName) : null);
+    }
+
+    function getChainedMembers(symbols, expression, cursorOffset) {
+      // Resolve ordinary property chains such as part.CFrame.Position or
+      // game.Workspace.CurrentCamera without pretending to be a full Luau analyzer.
+      const names = expression.split(/\s*[.:]\s*/);
+      if (names.length < 2) return null;
+      let members = getSymbolMembers(symbols, names[0], ".", cursorOffset);
+      for (const name of names.slice(1)) {
+        if (!members) return null;
+        const descriptor = members[name];
+        if (!descriptor) return null;
+        let resultType = descriptor.returnClass || null;
+        if (!resultType && name === "Parent") resultType = "Instance";
+        members = membersForType(resultType);
+      }
+      return members;
+    }
+
+    function completeRobloxStringArgument(model, position, lineBefore) {
+      const match = lineBefore.match(/(?:\b(Instance)\.new|\b(game):GetService|\b[A-Za-z_]\w*:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*(["'])([A-Za-z_]\w*)?$/);
+      if (!match) return null;
+      const kind = match[1] === "Instance" ? "construct" : match[2] === "game" ? "service" : "class";
+      let names;
+      if (kind === "service") names = ROBLOX_API.ready ? [...ROBLOX_API.services] : ROBLOX_SERVICES;
+      else if (ROBLOX_API.ready) names = [...ROBLOX_API.classes].filter(([, info]) => kind !== "construct" ||
+        !hasRobloxTag(info, "NotCreatable") && !hasRobloxTag(info, "Service") && !hasRobloxTag(info, "NotScriptable")).map(([name]) => name);
+      else names = Object.keys(BUILTIN_MEMBER_SETS).filter(name => !ROBLOX_DATATYPE_STATIC[name]);
+      const partial = match[4] || "";
+      const range = new monaco.Range(position.lineNumber, position.column - partial.length, position.lineNumber, position.column);
+      return { suggestions: names.filter(name => name.toLowerCase().startsWith(partial.toLowerCase())).map(name => ({
+        label: name, insertText: name, kind: monaco.languages.CompletionItemKind.Class,
+        detail: kind === "service" ? "Roblox service" : "Roblox Instance class", range
+      })) };
+    }
+
     function getSymbolMembers(symbols, owner, operator, cursorOffset) {
       // User-defined Laua symbols always win.
       if (symbols.namespaces[owner]) return symbols.namespaces[owner].members;
@@ -3367,18 +3532,7 @@ local part = message[1:7]`;
       if (staticMembers) return operator === "." ? staticMembers : {};
 
       // Luau standard libraries.
-      if (LIBRARY_MEMBERS[owner]) {
-        const members = {};
-
-        for (const member of LIBRARY_MEMBERS[owner]) {
-          members[member] = {
-            kind: "function",
-            detail: `${owner} member`
-          };
-        }
-
-        return members;
-      }
+      if (LIBRARY_MEMBERS[owner]) return makeLibraryMembers(owner);
 
       // Roblox enums from the current API dump.
       if (owner === "Enum" && ROBLOX_API.ready) {
@@ -3432,9 +3586,7 @@ local part = message[1:7]`;
           return getRobloxApiMembers(typeName);
         }
 
-        if (typeName && BUILTIN_MEMBER_SETS[typeName]) {
-          return membersToCompletionMap(BUILTIN_MEMBER_SETS[typeName], typeName);
-        }
+        if (typeName && BUILTIN_MEMBER_SETS[typeName]) return getDatatypeValueMembers(typeName);
 
         if (localInfo.service) {
           if (ROBLOX_API.ready && ROBLOX_API.classes.has(localInfo.service)) {
@@ -3486,9 +3638,7 @@ local part = message[1:7]`;
           return getRobloxApiMembers(typeName);
         }
 
-        if (BUILTIN_MEMBER_SETS[typeName]) {
-          return membersToCompletionMap(BUILTIN_MEMBER_SETS[typeName], typeName);
-        }
+        if (BUILTIN_MEMBER_SETS[typeName]) return getDatatypeValueMembers(typeName);
       }
 
       const enclosingClass = findClassAtOffset(symbols, cursorOffset);
@@ -3518,6 +3668,13 @@ local part = message[1:7]`;
         symbols.locals[match[1]].detail = `Roblox service: ${match[2]}`;
       }
 
+      const connectionPattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*[^\n]*?:(?:Connect|ConnectParallel|Once)\s*\(/g;
+      while ((match = connectionPattern.exec(source)) !== null) {
+        if (!symbols.locals[match[1]]) symbols.locals[match[1]] = {name: match[1], type: null, detail: "Local variable"};
+        symbols.locals[match[1]].type ||= "RBXScriptConnection";
+        symbols.locals[match[1]].detail = "RBXScriptConnection";
+      }
+
       const instancePattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Instance\.new\s*\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']/g;
 
       while ((match = instancePattern.exec(source)) !== null) {
@@ -3527,6 +3684,31 @@ local part = message[1:7]`;
 
         symbols.locals[match[1]].robloxClass = match[2];
         symbols.locals[match[1]].detail = `Roblox instance: ${match[2]}`;
+      }
+
+      // Infer variables assigned to native datatype constructors. Unlike the
+      // Roblox Studio class API dump, these primitives are defined by Luau.
+      const datatypePattern = /\blocal\s+([A-Za-z_]\w*)\s*(?::\s*([A-Za-z_]\w*\??))?\s*=\s*([^\n]+)/g;
+      while ((match = datatypePattern.exec(source)) !== null) {
+        const name = match[1];
+        const inferred = inferRobloxConstructorType(match[3]);
+        if (!inferred) continue;
+        if (!symbols.locals[name]) symbols.locals[name] = {name, type: null, detail: "Local variable"};
+        if (!symbols.locals[name].type) symbols.locals[name].type = inferred;
+        if (inferred !== "buffer") symbols.locals[name].robloxClass ||= inferred;
+        symbols.locals[name].detail = `${inferred} value`;
+      }
+
+      // Common instance properties of Roblox datatypes also carry a type.
+      const propertyTypePattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.(Position|Size|Velocity|AssemblyLinearVelocity|AssemblyAngularVelocity|LookVector|RightVector|UpVector|CFrame|Color|Unit|WorldPivot)\b/g;
+      const typeByProperty = {
+        Position: "Vector3", Size: "Vector3", Velocity: "Vector3", AssemblyLinearVelocity: "Vector3",
+        AssemblyAngularVelocity: "Vector3", LookVector: "Vector3", RightVector: "Vector3", UpVector: "Vector3",
+        CFrame: "CFrame", Color: "Color3", Unit: "Vector3", WorldPivot: "CFrame"
+      };
+      while ((match = propertyTypePattern.exec(source)) !== null) {
+        if (!symbols.locals[match[1]]) symbols.locals[match[1]] = {name: match[1], type: null, detail: "Local variable"};
+        symbols.locals[match[1]].type ||= typeByProperty[match[3]];
       }
 
       const workspaceAliasPattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*workspace\b/g;
@@ -5329,8 +5511,8 @@ local part = message[1:7]`;
         ]
       });
 
-      monaco.languages.registerCompletionItemProvider("laua", {
-        triggerCharacters: [".", ":", "@", "!"],
+      for (const languageId of ["laua", "lua"]) monaco.languages.registerCompletionItemProvider(languageId, {
+        triggerCharacters: [".", ":", "@", "!", "\"", "'"],
 
         async provideCompletionItems(model, position) {
           const word = model.getWordUntilPosition(position);
@@ -5428,8 +5610,8 @@ local part = message[1:7]`;
 
           const suggestions = [
             ...LUAU_KEYWORDS.map(k => makeKeyword(k)),
-            ...LAUA_KEYWORDS.map(k => makeKeyword(k, "Laua keyword")),
-            ...LUAU_GLOBALS.map(label => ({
+            ...(model.getLanguageId() === "laua" ? LAUA_KEYWORDS.map(k => makeKeyword(k, "Laua keyword")) : []),
+            ...LUAU_GLOBALS.filter(label => !HIDDEN_DEPRECATED_BUILTINS.has(label)).map(label => ({
               label,
               kind: monaco.languages.CompletionItemKind.Variable,
               insertText: label,
@@ -5576,6 +5758,14 @@ local part = message[1:7]`;
             snippet("enum auto values", "enum ${1:Name}\n\t${2:First}\n\t${3:Second}\n\t${4:Third}\nend", "Laua enum", "Create a Laua enum with automatic numeric values.")
           );
 
+          if (model.getLanguageId() === "lua") {
+            // Imported compiled ModuleScripts are ordinary Luau. Offer Roblox
+            // APIs and native snippets, but not Laua-only syntax expansions.
+            for (let i = suggestions.length - 1; i >= 0; i--) {
+              if (/^Laua(?:\s|$)/.test(suggestions[i].detail || "")) suggestions.splice(i, 1);
+            }
+          }
+
           const sourceSymbols = getProjectSymbols(model);
           const deprecatedFunctions = indexPlaygroundDeprecatedFunctions(model.getValue(), maskNonCode(model.getValue()));
 
@@ -5591,13 +5781,13 @@ local part = message[1:7]`;
           }
 
           for (const [functionName, functionInfo] of Object.entries(sourceSymbols.localFunctions)) {
+            if (deprecatedFunctions.has(functionName)) continue;
             suggestions.unshift({
               label: functionName,
               kind: monaco.languages.CompletionItemKind.Function,
               insertText: functionName,
               detail: functionInfo.detail,
               documentation: functionInfo.params ? `Parameters: ${functionInfo.params}` : undefined,
-              tags: deprecatedFunctions.has(functionName) ? [monaco.languages.CompletionItemTag.Deprecated] : undefined,
               sortText: "0000_localfn_" + functionName,
               range
             });
@@ -5658,7 +5848,16 @@ local part = message[1:7]`;
             }
           }
 
-          const memberMatch = lineBefore.match(/([A-Za-z_][A-Za-z0-9_]*)\s*([.:])\s*([A-Za-z_][A-Za-z0-9_]*)?$/);
+          const quotedCall = completeRobloxStringArgument(model, position, lineBefore);
+          if (quotedCall) {
+            if (!ROBLOX_API.ready) {
+              await ensureRobloxApiLoaded();
+              return completeRobloxStringArgument(model, position, lineBefore) || quotedCall;
+            }
+            return quotedCall;
+          }
+
+          const memberMatch = lineBefore.match(/([A-Za-z_]\w*(?:\s*[.:]\s*[A-Za-z_]\w*)*)\s*([.:])\s*([A-Za-z_]\w*)?$/);
 
           if (memberMatch) {
             const owner = memberMatch[1];
@@ -5682,18 +5881,30 @@ local part = message[1:7]`;
               SERVICE_MEMBER_SETS[owner] !== undefined ||
               (typedName && (
                 BUILTIN_MEMBER_SETS[typedName] !== undefined ||
-                SERVICE_MEMBER_SETS[typedName] !== undefined
+                SERVICE_MEMBER_SETS[typedName] !== undefined ||
+                (!ROBLOX_PRIMITIVE_TYPES.has(typedName) && !ROBLOX_DATATYPE_STATIC[typedName] && !LIBRARY_MEMBERS[typedName])
               ));
 
             if (needsRobloxApi && !ROBLOX_API.ready) {
               await ensureRobloxApiLoaded();
             }
 
-            const members = getSymbolMembers(sourceSymbols, owner, operator, cursorOffset);
+            // A buffer is a primitive, not an object with methods: complete
+            // `buff.` to e.g. `buffer.readu8(buff, 0)` instead of invalid code.
+            if (isBufferVariable(sourceSymbols, owner)) {
+              return { suggestions: operator === "."
+                ? makeBufferCallSuggestions(monaco, model, position, owner, memberMatch[3] || "", lineBefore)
+                : [] };
+            }
+
+            const members = owner.includes(".") || owner.includes(":")
+              ? getChainedMembers(sourceSymbols, owner, cursorOffset)
+              : getSymbolMembers(sourceSymbols, owner, operator, cursorOffset);
             const memberSuggestions = [];
 
             if (members) {
               for (const [memberName, memberInfo] of Object.entries(members)) {
+                if (deprecatedFunctions.has(`${owner}.${memberName}`) || deprecatedFunctions.has(`${owner}:${memberName}`)) continue;
                 const isFunction = memberInfo.kind === "function";
                 const params = memberInfo.params?.trim() || "";
 
@@ -5708,8 +5919,7 @@ local part = message[1:7]`;
                         : monaco.languages.CompletionItemKind.Field,
                   insertText: memberName,
                   detail: memberInfo.detail || "Laua member",
-                  tags: deprecatedFunctions.has(`${owner}.${memberName}`) || deprecatedFunctions.has(`${owner}:${memberName}`) ? [monaco.languages.CompletionItemTag.Deprecated] : undefined,
-                  documentation: params ? `Parameters: ${params}` : undefined,
+              documentation: [memberInfo.documentation, params ? `Parameters: ${params}` : ""].filter(Boolean).join("\n\n") || undefined,
                   sortText: "0000_" + memberName,
                   range
                 });
