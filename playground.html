@@ -44,7 +44,25 @@
     #diffResult { max-height:65vh; overflow:auto; background:#0c1018; padding:14px; font-size:12px; white-space:pre; line-height:1.5; }
 
     /* v3.13 multi-file project workspace */
-    .actions { flex-wrap: wrap; justify-content: flex-end; }
+    /* Studio-friendly command bar: primary commands never wrap unexpectedly. */
+    header { gap: 16px; position: relative; z-index: 30; flex-shrink: 0; }
+    .brand { flex: 0 1 285px; min-width: 140px; align-items: center; }
+    .brand h1 { font-size: 18px; white-space: nowrap; }
+    .brand span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .actions { flex: 1 1 auto; min-width: 0; flex-wrap: nowrap; justify-content: flex-end; align-items: center; gap: 7px; }
+    .actions > button, .actions > label { flex-shrink: 0; white-space: nowrap; }
+    .actions > button { padding: 7px 10px; }
+    .header-more { position: relative; flex-shrink: 0; }
+    .header-more > summary { user-select: none; display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; cursor: pointer; border: 1px solid #343b49; border-radius: 8px; background: #232936; font-size: 13px; font-weight: 600; list-style: none; }
+    .header-more > summary::-webkit-details-marker { display: none; }
+    .header-more > summary:hover, .header-more[open] > summary { background: #2b3342; }
+    .header-more > summary:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
+    .more-panel { position: absolute; right: 0; top: calc(100% + 9px); z-index: 100; width: min(315px, calc(100vw - 24px)); max-height: min(68vh, 560px); overflow-y: auto; border: 1px solid #3d4960; border-radius: 11px; padding: 9px; background: #191f2b; box-shadow: 0 18px 50px rgba(0,0,0,.55); display: grid; grid-template-columns: 1fr; gap: 5px; }
+    .more-panel button { width: 100%; text-align: left; white-space: normal; font-size: 12px; padding: 10px 11px; }
+    .more-section { color: #94a3b8; font-size: 10px; text-transform: uppercase; font-weight: 700; letter-spacing: .1em; padding: 7px 7px 3px; }
+    @media (max-width: 1050px) { .brand span { display: none; } .brand { flex-basis: 170px; } }
+    @media (max-width: 760px) { header { height: auto; min-height: 58px; flex-wrap: wrap; padding: 10px 12px; gap: 8px; } .brand { flex-basis: 100%; } .actions { justify-content: flex-start; width: 100%; flex-wrap: wrap; gap: 6px; } .actions > button { padding: 7px 9px; } }
+
     .file-tabs { display:flex; align-items:center; gap:3px; flex:1; min-width:0; overflow-x:auto; scrollbar-width:thin; }
     .file-tab { white-space:nowrap; display:inline-flex; align-items:center; gap:7px; background:transparent; color:#a6b3c6; border:1px solid transparent; border-bottom:2px solid transparent; border-radius:7px 7px 0 0; padding:7px 9px; font-size:12px; font-weight:500; }
     .file-tab:hover { background:#232b3b; }
@@ -77,11 +95,8 @@
       <h1>Laua Playground</h1>
       <span>pronounced “Lawah” · v3.30 · multi-file · validated export · live preflight</span>
     </div>
-    <div class="actions">
-      <button id="exampleBtn" title="Load the built-in starter example into main.laua (other files stay unchanged)">Default main.laua</button>
-      <button id="clearBtn">Clear</button>
+    <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
-      <button id="refreshApiBtn" title="Fetch the latest Roblox Studio API dump again">Refresh Roblox API</button>
       <label class="mode-label" for="modeSelect">Mode
         <select id="modeSelect" aria-label="Laua compile mode">
           <option value="Development">Development</option>
@@ -96,16 +111,26 @@
         </select>
       </label>
       <button id="transpileBtn">Transpile</button>
-      <button id="testsBtn" title="Run compiler regression tests">Tests</button>
-      <button id="diffBtn" title="Compare the last two successful manual transpiles (including different files)">Output Diff</button>
-      <button id="docsBtn" title="Generate reference documentation from Laua declarations">Docs</button>
-      <button id="exportBtn" title="Export active file as Luau">Export Luau</button>
-      <button id="exportProjectBtn" title="Export compiled ModuleScripts only; keep your .laua files separately to retain the original syntax">Export Project .rbxmx</button>
-      <button id="exportStudioBtn" title="Export the original .laua and .luau sources for the Laua Studio plugin. The standard compiled-only export is unchanged.">Export Editable Studio .rbxmx</button>
-      <button id="importProjectBtn" title="Import compiled modules or an editable Laua Studio project .rbxmx">Import Project .rbxmx</button>
-      <input id="importProjectInput" type="file" accept=".rbxmx,application/xml,text/xml" hidden />
-      <button id="nextErrorBtn" title="Jump to the next error or warning (F8)">Next Problem</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
+      <details class="header-more" id="headerMore">
+        <summary aria-label="More Laua actions">More ▾</summary>
+        <div class="more-panel">
+          <span class="more-section">Project and files</span>
+          <button id="exampleBtn" title="Load the built-in starter example into main.laua (other files stay unchanged)">Default main.laua</button>
+          <button id="clearBtn">Clear</button>
+          <button id="exportBtn" title="Export active file as Luau">Export Luau</button>
+          <button id="exportProjectBtn" title="Export compiled ModuleScripts only; keep .laua sources separately">Export Project .rbxmx</button>
+          <button id="exportStudioBtn" title="Export original Laua and Luau sources for Studio">Export Editable Studio .rbxmx</button>
+          <button id="importProjectBtn" title="Import compiled modules or an editable Studio project">Import Project .rbxmx</button>
+          <span class="more-section">Tools</span>
+          <button id="refreshApiBtn" title="Fetch the latest Roblox Studio API dump again">Refresh Roblox API</button>
+          <button id="testsBtn" title="Run compiler regression tests">Tests</button>
+          <button id="diffBtn" title="Compare the last two successful manual transpiles">Output Diff</button>
+          <button id="docsBtn" title="Generate reference documentation from Laua declarations">Docs</button>
+          <button id="nextErrorBtn" title="Jump to the next error or warning (F8)">Next Problem</button>
+        </div>
+      </details>
+      <input id="importProjectInput" type="file" accept=".rbxmx,application/xml,text/xml" hidden />
     </div>
   </header>
 
@@ -7537,6 +7562,20 @@ local part = message[1:7]`;
     } else {
       window.addEventListener("laua-monaco-loader-ready", initializeLauaPlayground, { once: true });
     }
+  </script>
+  <script>
+    (() => {
+      const more = document.getElementById('headerMore');
+      more?.addEventListener('click', event => {
+        if (event.target.closest('button')) more.open = false;
+      });
+      document.addEventListener('pointerdown', event => {
+        if (more?.open && !more.contains(event.target)) more.open = false;
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && more?.open) more.open = false;
+      });
+    })();
   </script>
 </body>
 </html>

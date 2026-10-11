@@ -5,7 +5,7 @@
 local studioPlugin = plugin
 if not studioPlugin then return end
 
-local VERSION = "0.2.1"
+local VERSION = "0.2.2"
 local PROJECT_NAME = "LauaStudioProject"
 local SOURCES_NAME = "Sources"
 local SNAPSHOTS_NAME = "Snapshots"
@@ -27,7 +27,7 @@ local function fetchCompiler(): string
     local ok, result = pcall(function()
         local source = game:GetService("HttpService"):GetAsync(COMPILER_URL, true)
         if #source < 10000 or #source > 1000000 then error("Unexpected compiler download size") end
-        if not source:match('^%s*local%s+Transpiler%s*=%s*%{') or not source:match('return%s+Transpiler%s*$') then
+        if not source:find("local Transpiler =", 1, true) or not source:find("return Transpiler", 1, true) then
             error("The GitHub response is not a Laua transpiler")
         end
 
@@ -41,7 +41,9 @@ local function fetchCompiler(): string
             if game:GetService("ScriptEditorService"):GetEditorSource(temporary) ~= source then
                 error("Studio did not accept the downloaded compiler source")
             end
-            return require(temporary)
+            local required, module = pcall(require, temporary)
+            if not required then error(module, 0) end
+            return module
         end)
         temporary:Destroy()
         if not loadedOk then error(loaded, 0) end
@@ -725,9 +727,10 @@ searchBox:GetPropertyChangedSignal("Text"):Connect(function()
 end)
 
 editor:GetPropertyChangedSignal("Text"):Connect(function()
-    if changingSelection or not selected then return end
+    local currentSource = selected
+    if changingSelection or currentSource == nil then return end
     if editor.Text ~= editorBaseline then
-        status.Text = "Unsaved edits to " .. selected.Name .. " — click Save or Compile"
+        status.Text = "Unsaved edits to " .. currentSource.Name .. " — click Save or Compile"
         status.TextColor3 = Color3.fromRGB(255, 210, 125)
     end
 end)
