@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.31"}
+local Transpiler = {Version = "3.32"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -290,8 +290,22 @@ return LauaCore
 ]====]
 
 local LAUA_SIGNAL_RUNTIME_SOURCE = [====[
+type LauaSignalConnection = {
+    Connected: boolean,
+    Disconnect: (LauaSignalConnection) -> (),
+    _owner: LauaSignalState?,
+    _callback: ((...any) -> ())?,
+    _once: boolean,
+    _next: LauaSignalConnection?,
+    _prev: LauaSignalConnection?,
+}
+
 type LauaSignalState = {
-    _event: BindableEvent,
+    _head: LauaSignalConnection?,
+    _tail: LauaSignalConnection?,
+    _waiters: {thread},
+    _retired: {LauaSignalConnection},
+    _dispatchDepth: number,
     _destroyed: boolean,
     _types: {string}?,
 }
@@ -299,56 +313,146 @@ type LauaSignalState = {
 local Signal: any = {}
 Signal.__index = Signal
 
+local function disconnect(self: LauaSignalConnection)
+    if not self.Connected then return end
+    self.Connected = false
+    local owner = self._owner
+    self._owner = nil
+    self._callback = nil
+    if not owner then return end
+
+    local previous = self._prev
+    local following = self._next
+    if previous then previous._next = following else owner._head = following end
+    if following then following._prev = previous else owner._tail = previous end
+    self._prev = nil
+
+    -- A Fire may still be walking this connection. Preserve its next link
+    -- until the outermost dispatch completes, then release the reference.
+    if owner._dispatchDepth > 0 then
+        table.insert(owner._retired, self)
+    else
+        self._next = nil
+    end
+end
+
 function Signal.new(typeNames: {string}?)
-    local state: LauaSignalState = { _event = Instance.new("BindableEvent"), _destroyed = false, _types = typeNames }
+    local state: LauaSignalState = {
+        _head = nil,
+        _tail = nil,
+        _waiters = {},
+        _retired = {},
+        _dispatchDepth = 0,
+        _destroyed = false,
+        _types = typeNames,
+    }
     return setmetatable(state, Signal)
 end
 
-function Signal:Connect(callback: (...any) -> ())
+function Signal.Connect(self: LauaSignalState, callback: (...any) -> (), once: boolean?): LauaSignalConnection
     assert(not self._destroyed, "Cannot connect to a destroyed signal")
     assert(type(callback) == "function", "Connect expects a function")
-    return self._event.Event:Connect(callback)
+    local previous = self._tail
+    local connection: LauaSignalConnection = {
+        Connected = true,
+        Disconnect = disconnect,
+        _owner = self,
+        _callback = callback,
+        _once = once == true,
+        _next = nil,
+        _prev = previous,
+    }
+    if previous then previous._next = connection else self._head = connection end
+    self._tail = connection
+    return connection
 end
 
-function Signal:Once(callback: (...any) -> ())
-    assert(type(callback) == "function", "Once expects a function")
-    local connection: RBXScriptConnection? = nil
-    connection = self:Connect(function(...)
-        if connection then connection:Disconnect() end
-        callback(...)
-    end)
-    return connection
+function Signal.Once(self: LauaSignalState, callback: (...any) -> ()): LauaSignalConnection
+    return Signal.Connect(self, callback, true)
 end
 
 function Signal.Fire(self: LauaSignalState, ...)
     assert(not self._destroyed, "Cannot fire a destroyed signal")
-    local types: {string}? = self._types
+    local types = self._types
     if types then
         assert(select("#", ...) == #types, "Signal argument count mismatch")
         for index, name in types do
             local value = select(index, ...)
             local optional = name:sub(-1) == "?"
-            local typeName = optional and name:sub(1,-2) or name
-            if value == nil and optional then continue end
-            if typeof(value) ~= typeName then
-                if not (typeof(value) == "Instance" and (value :: Instance):IsA(typeName)) then
-                    error("Signal expected " .. typeName .. " at argument " .. index, 2)
+            local typeName = optional and name:sub(1, -2) or name
+            if value ~= nil or not optional then
+                local actualType = typeof(value)
+                if actualType ~= typeName then
+                    if not (actualType == "Instance" and (value :: Instance):IsA(typeName)) then
+                        error("Signal expected " .. typeName .. " at argument " .. index, 2)
+                    end
                 end
             end
         end
     end
-    self._event:Fire(...)
+
+    -- Capture only pre-existing waiters. A listener that starts waiting
+    -- during this Fire must wait for the next Fire, not this one.
+    local waiters: {thread}? = nil
+    if #self._waiters > 0 then
+        waiters = self._waiters
+        self._waiters = {}
+    end
+
+    -- Snapshot the current tail so listeners added during this Fire don't
+    -- receive the already-in-progress event. No listener array is allocated.
+    local node = self._head
+    local last = self._tail
+    self._dispatchDepth += 1
+    while node do
+        local following = node._next
+        if node.Connected then
+            local callback = node._callback
+            if node._once then node:Disconnect() end
+            if callback then task.spawn(callback, ...) end
+        end
+        if node == last then break end
+        node = following
+    end
+    self._dispatchDepth -= 1
+    if self._dispatchDepth == 0 then
+        for _, removed in self._retired do removed._next = nil end
+        table.clear(self._retired)
+    end
+
+    -- Waiters are one-shot. This branch allocates nothing when unused.
+    if waiters then
+        for _, thread in waiters do task.spawn(thread, true, ...) end
+    end
 end
 
-function Signal:Wait()
+function Signal.Wait(self: LauaSignalState)
     assert(not self._destroyed, "Cannot wait on a destroyed signal")
-    return self._event.Event:Wait()
+    local current = coroutine.running()
+    assert(current, "Signal:Wait requires a running coroutine")
+    table.insert(self._waiters, current)
+    local result = table.pack(coroutine.yield())
+    if not result[1] then error("Signal destroyed while waiting", 2) end
+    return table.unpack(result, 2, result.n)
 end
 
 function Signal.Destroy(self: LauaSignalState)
     if self._destroyed then return end
     self._destroyed = true
-    self._event:Destroy()
+    local node = self._head
+    while node do
+        local following = node._next
+        node:Disconnect()
+        node = following
+    end
+    self._head = nil
+    self._tail = nil
+    self._types = nil
+    if #self._waiters > 0 then
+        local waiters = self._waiters
+        self._waiters = {}
+        for _, thread in waiters do task.spawn(thread, false) end
+    end
 end
 
 return Signal
