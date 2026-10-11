@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.29"}
+local Transpiler = {Version = "3.30"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
