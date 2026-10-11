@@ -75,7 +75,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.22 · multi-file · optimized output · live lint</span>
+      <span>pronounced “Lawah” · v3.29 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions">
       <button id="exampleBtn" title="Load the built-in starter example into main.laua (other files stay unchanged)">Default main.laua</button>
@@ -100,9 +100,9 @@
       <button id="diffBtn" title="Compare the last two successful manual transpiles (including different files)">Output Diff</button>
       <button id="docsBtn" title="Generate reference documentation from Laua declarations">Docs</button>
       <button id="exportBtn" title="Export active file as Luau">Export Luau</button>
-      <button id="exportProjectBtn" title="Export compiled ModuleScripts, original Laua sources and limited line maps for Roblox Studio">Export Project .rbxmx</button>
-      <button id="importProjectBtn" title="Restore all Laua files from an exported ZIP">Import Project ZIP</button>
-      <input id="importProjectInput" type="file" accept=".zip,application/zip" hidden />
+      <button id="exportProjectBtn" title="Export compiled ModuleScripts only; keep your .laua files separately to retain the original syntax">Export Project .rbxmx</button>
+      <button id="importProjectBtn" title="Import a Roblox .rbxmx model containing ModuleScripts">Import Project .rbxmx</button>
+      <input id="importProjectInput" type="file" accept=".rbxmx,application/xml,text/xml" hidden />
       <button id="nextErrorBtn" title="Jump to the next error or warning (F8)">Next Problem</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
     </div>
@@ -305,8 +305,12 @@ class Character
     end
 end
 
-async function CheckCharacter()
-    using connection = game:GetService("RunService").Heartbeat:Connect(function(dt)
+local async function LauaAsyncOperation()
+    return true
+end
+
+local async function CheckCharacter()
+    using connection = game:GetService("RunService").Heartbeat:Connect(function(_dt)
         -- Active until this async operation finishes
     end)
 
@@ -316,10 +320,6 @@ async function CheckCharacter()
     return character.IsAlive and result
 end
 
-async function LauaAsyncOperation()
-    return true
-end
-
 local operation = CheckCharacter()
 operation:andThen(function(result)
     print(result)
@@ -327,7 +327,7 @@ end)
 
 -- Laua examples
 local numbers = {1, 2, 3}
-local doubled = (n) => n * 2
+local doubled = (n: number) => n * 2
 local mapped = table.map(numbers, doubled)
 local allNumbers = {...numbers, ...mapped}
 local message = "Welcome to Laua"
@@ -657,10 +657,10 @@ local part = message[1:7]`;
           const indent = line.match(/^\s*/)[0];
 
           if (depth === 0) {
-            const fn = trimmed.match(/^function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*$/);
+            const fn = trimmed.match(/^function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*(:\s*[A-Za-z_]\w*)?\s*$/);
             if (fn) {
               depth++;
-              return `${indent}function ${name}.${fn[1]}(${fn[2]})`;
+              return `${indent}${name}.${fn[1]} = function(${fn[2]})${fn[3] || ''}`;
             }
 
             const localFn = /^local\s+function\b/.test(trimmed);
@@ -733,14 +733,22 @@ local part = message[1:7]`;
     }
 
     function transpileClass(source) {
+      const allocationRequirements = new Map();
+      let searchFrom = 0;
       while (true) {
         const masked = maskNonCode(source);
-        const classIdx = findKeyword(masked, "class");
+        const classIdx = findKeyword(masked, "class", searchFrom);
         if (classIdx === -1) break;
 
         const lineStart = source.lastIndexOf("\n", classIdx - 1) + 1;
         const prefix = source.slice(lineStart, classIdx).trim();
-        if (prefix && !/^(?:final|abstract)$/.test(prefix)) throw new Error(`Invalid class modifier: ${prefix}`);
+        if (prefix && !/^(?:final|abstract)$/.test(prefix)) {
+          const endOfLine = source.indexOf('\n', classIdx);
+          const candidate = source.slice(classIdx, endOfLine < 0 ? source.length : endOfLine).trim();
+          if (/^class\s+[A-Za-z_]\w*(?:\s+extends\s+[A-Za-z_][\w.]*)?$/.test(candidate)) throw new Error(`Invalid class modifier: ${prefix}`);
+          searchFrom = classIdx + 5; continue;
+        }
+        searchFrom = 0;
         const declStart = prefix ? lineStart + source.slice(lineStart, classIdx).indexOf(prefix) : classIdx;
         const isAbstract = prefix === "abstract";
         const isFinal = prefix === "final";
@@ -928,24 +936,28 @@ local part = message[1:7]`;
         if (ctor && !base && /\bsuper\b/.test(maskNonCode(constructorBody))) throw new Error(`Class '${name}' has no parent for super`);
         // An ordinary class only needs a metatable, constructor, fields, and methods.
         // Advanced class hooks are emitted only for classes that use them.
+        const parentAllocation = base ? allocationRequirements.get(base) : null;
+        const needsValues = !!(watchers.length || lazyFields.length || (base && (parentAllocation ? parentAllocation.values : true)));
+        const needsInitialized = !!(lazyFields.length || (base && (parentAllocation ? parentAllocation.initialized : true)));
+        allocationRequirements.set(name, {values: needsValues, initialized: needsInitialized});
         const plainClass = !base && !isAbstract && !isFinal && !getters.length && !setters.length && !lazyFields.length && !watchers.length && !ctor?.attributes && methods.every(member => !member.abstract && !member.final && !member.override);
         if (plainClass) {
-          let output = `local ${name} = {}\n${name}.__index = ${name}\n`;
+          let output = `local ${name}: any = {}\n${name}.__index = ${name}\n`;
           for (const field of statics) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
-          output += `function ${name}.__init(self${ctor?.params?.trim() ? ", " + ctor.params : ""})\n`;
+          output += `function ${name}.__init(self: any${ctor?.params?.trim() ? ", " + ctor.params : ""})\n`;
           for (const field of fields) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
           for (const item of signals) output += `    self.${item.name} = __lauaSignal.new(${item.types.length ? '{' + item.types.map(t => JSON.stringify(t)).join(', ') + '}' : ''})\n`;
           const initBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
           if (initBody) output += initBody + "\n";
-          output += `end\nfunction ${name}.new(...)\n    local self = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
+          output += `end\nfunction ${name}.new(...: any): any\n    local self: any = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
           for (const operator of operators) {
             const memberBody = normalizeBlockIndent(transpileCore(operator.body), "    ");
-            output += `function ${name}.${operator.name}(self${operator.params ? ", " + operator.params : ""})\n${memberBody ? memberBody + "\n" : ""}end\n`;
+            output += `function ${name}.${operator.name}(self: any${operator.params ? ", " + (/^[A-Za-z_]\w*$/.test(operator.params.trim()) ? operator.params.trim() + ": any" : operator.params) : ""})\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
           for (const member of methods) {
             const memberBody = normalizeBlockIndent(transpileCore(member.body), "    ");
             if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw new Error("super(...) can only be called in constructors");
-            output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}${member.static ? "." : ":"}${member.name}(${member.params})\n${memberBody ? memberBody + "\n" : ""}end\n`;
+            output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
           source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
           continue;
@@ -954,36 +966,68 @@ local part = message[1:7]`;
         const setTableMeta = base ? `setmetatable({}, {__index = ${base}.__setters})` : "{}";
         const ownFinalMethods = methods.filter(method => method.final).map(method => `[${JSON.stringify(method.name)}] = true`).join(", ");
         const finalMethods = base ? `setmetatable({${ownFinalMethods}}, {__index = ${base}.__finalMethods})` : `{${ownFinalMethods}}`;
-        let generated = `local ${name} = {}\n`;
-        if (base) {
-          generated += `if ${base}.__final then error("Cannot extend final class '${base}'") end\n`;
-          generated += `setmetatable(${name}, {__index = ${base}})\n`;
-        }
+        let generated = base
+          ? `if ${base}.__final then error("Cannot extend final class '${base}'") end\nlocal ${name}: any = setmetatable({}, {__index = ${base}})\n`
+          : `local ${name}: any = {}\n`;
         generated += `${name}.__abstract = ${isAbstract}\n${name}.__final = ${isFinal}\n`;
         generated += `${name}.__finalMethods = ${finalMethods}\n`;
         generated += `${name}.__getters = ${getTableMeta}\n${name}.__setters = ${setTableMeta}\n`;
         const inherited = table => base ? `setmetatable({}, {__index = ${base}.${table}})` : '{}';
         generated += `${name}.__lazy = ${inherited('__lazy')}\n${name}.__watchers = ${inherited('__watchers')}\n${name}.__watchedFields = ${inherited('__watchedFields')}\n`;
         for (const item of watchers) generated += `${name}.__watchedFields[${JSON.stringify(item.name)}] = true\n`;
-        generated += `${name}.__index = function(self, key)\n` +
-          `    local getter = ${name}.__getters[key]\n    if getter then return getter(self) end\n` +
-          `    local lazy = ${name}.__lazy[key]\n    if lazy then\n` +
+        generated += `${name}.__index = function(self: any, key: any)\n` +
+          `    local getter: ((any) -> any)? = ${name}.__getters[key]\n    if getter then return getter(self) end\n` +
+          `    local lazy: ((any) -> any)? = ${name}.__lazy[key]\n    if lazy then\n` +
           `        if not self.__lauaInitialized[key] then\n            self.__lauaInitialized[key] = true\n` +
           `            local ok, value = pcall(lazy, self)\n` +
           `            if not ok then self.__lauaInitialized[key] = nil; error(value, 0) end\n` +
           `            self.__lauaValues[key] = value\n        end\n        return self.__lauaValues[key]\n    end\n` +
           `    if ${name}.__watchedFields[key] then return self.__lauaValues[key] end\n` +
           `    return ${name}[key]\nend\n`;
-        generated += `${name}.__newindex = function(self, key, value)\n` +
-          `    local setter = ${name}.__setters[key]\n    if setter then setter(self, value); return end\n` +
+        generated += `${name}.__newindex = function(self: any, key: any, value: any)\n` +
+          `    local setter: ((any, any) -> ())? = ${name}.__setters[key]\n    if setter then setter(self, value); return end\n` +
           `    if ${name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end\n` +
           `    if ${name}.__watchedFields[key] or ${name}.__lazy[key] then\n` +
           `        local oldValue = self.__lauaValues[key]\n` +
           `        if ${name}.__lazy[key] and not self.__lauaInitialized[key] then self.__lauaInitialized[key] = true end\n` +
           `        self.__lauaValues[key] = value\n` +
-          `        local watcher = ${name}.__watchers[key]\n` +
+          `        local watcher: ((any, any, any) -> ())? = ${name}.__watchers[key]\n` +
           `        if watcher and oldValue ~= value then watcher(self, oldValue, value) end\n        return\n    end\n` +
           `    rawset(self, key, value)\nend\n`;
+        if (!base && !lazyFields.length && !watchers.length) {
+          // This class uses no lazy/watched storage. Avoid checking those dictionaries
+          // on every normal property access or assignment.
+          const fullRead = `${name}.__index = function(self: any, key: any)\n` +
+            `    local getter: ((any) -> any)? = ${name}.__getters[key]\n    if getter then return getter(self) end\n` +
+            `    local lazy: ((any) -> any)? = ${name}.__lazy[key]\n    if lazy then\n` +
+            `        if not self.__lauaInitialized[key] then\n            self.__lauaInitialized[key] = true\n` +
+            `            local ok, value = pcall(lazy, self)\n` +
+            `            if not ok then self.__lauaInitialized[key] = nil; error(value, 0) end\n` +
+            `            self.__lauaValues[key] = value\n        end\n        return self.__lauaValues[key]\n    end\n` +
+            `    if ${name}.__watchedFields[key] then return self.__lauaValues[key] end\n` +
+            `    return ${name}[key]\nend\n`;
+          const shortRead = `${name}.__index = function(self: any, key: any)\n` +
+            `    local getter: ((any) -> any)? = ${name}.__getters[key]\n` +
+            `    if getter then return getter(self) end\n` +
+            `    return ${name}[key]\nend\n`;
+          const fullWrite = `${name}.__newindex = function(self: any, key: any, value: any)\n` +
+            `    local setter: ((any, any) -> ())? = ${name}.__setters[key]\n    if setter then setter(self, value); return end\n` +
+            `    if ${name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end\n` +
+            `    if ${name}.__watchedFields[key] or ${name}.__lazy[key] then\n` +
+            `        local oldValue = self.__lauaValues[key]\n` +
+            `        if ${name}.__lazy[key] and not self.__lauaInitialized[key] then self.__lauaInitialized[key] = true end\n` +
+            `        self.__lauaValues[key] = value\n` +
+            `        local watcher: ((any, any, any) -> ())? = ${name}.__watchers[key]\n` +
+            `        if watcher and oldValue ~= value then watcher(self, oldValue, value) end\n        return\n    end\n` +
+            `    rawset(self, key, value)\nend\n`;
+          const shortWrite = `${name}.__newindex = function(self: any, key: any, value: any)\n` +
+            `    local setter: ((any, any) -> ())? = ${name}.__setters[key]\n` +
+            `    if setter then setter(self, value); return end\n` +
+            `    if ${name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end\n` +
+            `    rawset(self, key, value)\nend\n`;
+          if (!generated.includes(fullRead) || !generated.includes(fullWrite)) throw new Error("Laua internal class generation mismatch");
+          generated = generated.replace(fullRead, shortRead).replace(fullWrite, shortWrite);
+        }
         for (const item of lazyFields) generated += `${name}.__lazy[${JSON.stringify(item.name)}] = function(self) return ${transpileCore(item.value)} end\n`;
         for (const item of watchers) {
           const body = normalizeBlockIndent(transpileCore(base ? replaceSuperReferences(item.body, base) : item.body), '    ');
@@ -991,7 +1035,7 @@ local part = message[1:7]`;
         }
         for (const f of statics) generated += `${name}.${f.name} = ${transpileCore(f.value)}\n`;
         const arglist = ctor ? ctor.params : "...";
-        generated += `\nfunction ${name}.__init(self${arglist.trim() ? ", " + arglist : ""})\n`;
+        generated += `\nfunction ${name}.__init(self: any${arglist.trim() ? ", " + arglist : ""})\n`;
         if (parentInit) generated += `    ${parentInit}\n`;
         for (const f of fields) {
           if (watchers.some(item => item.name === f.name)) generated += `    self.__lauaValues[${JSON.stringify(f.name)}] = ${transpileCore(f.value)}\n`;
@@ -1001,31 +1045,31 @@ local part = message[1:7]`;
         constructorBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
         if (constructorBody) generated += constructorBody + "\n";
         generated += "end\n";
-        generated += `\n${ctor?.attributes ? ctor.attributes + "\n" : ""}function ${name}.new(...)\n`;
+        generated += `\n${ctor?.attributes ? ctor.attributes + "\n" : ""}function ${name}.new(...: any): any\n`;
         generated += `    if ${name}.__abstract then error("Cannot instantiate abstract class '${name}'") end\n`;
         const instanceSlots = [];
-        if (base || watchers.length || lazyFields.length) instanceSlots.push('__lauaValues = {}');
-        if (base || lazyFields.length) instanceSlots.push('__lauaInitialized = {}');
-        generated += `    local self = setmetatable({${instanceSlots.join(', ')}}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
+        if (needsValues) instanceSlots.push('__lauaValues = {}');
+        if (needsInitialized) instanceSlots.push('__lauaInitialized = {}');
+        generated += `    local self: any = setmetatable({${instanceSlots.join(', ')}}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
         for (const member of [...getters, ...setters]) {
           const tableName = getters.includes(member) ? "__getters" : "__setters";
           let memberBody = base ? replaceSuperReferences(member.body, base) : member.body;
           if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw new Error("super(...) can only be called in constructors");
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
-          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self${member.params.trim() ? ", " + member.params : ""})\n`;
+          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self: any${member.params.trim() ? ", " + member.params : ""})\n`;
           if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
         }
         for (const op of operators) {
           const body = normalizeBlockIndent(transpileCore(base ? replaceSuperReferences(op.body, base) : op.body), "    ");
-          generated += `\nfunction ${name}.${op.name}(self${op.params ? ", " + op.params : ""})\n${body ? body + "\n" : ""}end\n`;
+          generated += `\nfunction ${name}.${op.name}(self: any${op.params ? ", " + (/^[A-Za-z_]\w*$/.test(op.params.trim()) ? op.params.trim() + ": any" : op.params) : ""})\n${body ? body + "\n" : ""}end\n`;
         }
         for (const member of methods) {
           if (base) generated += `\nif ${base}.__finalMethods and ${base}.__finalMethods[${JSON.stringify(member.name)}] then error("Cannot override final method '${member.name}'") end\n`;
           let memberBody = base ? replaceSuperReferences(member.body, base) : member.body;
           if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw new Error("super(...) can only be called in constructors");
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
-          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}${member.static ? "." : ":"}${member.name}(${member.params})\n`;
+          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n`;
           if (member.abstract) generated += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
           else if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
@@ -1055,7 +1099,7 @@ local part = message[1:7]`;
       for (const replacement of deferred.reverse()) {
         body = body.slice(0, replacement.start) + replacement.code + body.slice(replacement.end);
       }
-      const wrapped = `local __lauaDefers = {}\nlocal __lauaResult = table.pack(xpcall(function()\n${normalizeBlockIndent(body, "    ")}\nend, function(err) return err end))\n` +
+      const wrapped = `local __lauaDefers: {() -> ...any} = {}\nlocal __lauaResult = table.pack(xpcall(function()\n${normalizeBlockIndent(body, "    ")}\nend, function(err) return err end))\n` +
         `local __lauaCleanupError = nil\nfor __lauaIndex = #__lauaDefers, 1, -1 do\n    local __lauaOK, __lauaError = pcall(__lauaDefers[__lauaIndex])\n    if not __lauaOK and not __lauaCleanupError then __lauaCleanupError = __lauaError end\nend\n` +
         `if __lauaCleanupError then error(__lauaCleanupError, 0) end\nif not __lauaResult[1] then error(__lauaResult[2], 0) end\nreturn table.unpack(__lauaResult, 2, __lauaResult.n)`;
       return { code: wrapped, hasDefer: true };
@@ -1148,16 +1192,18 @@ local part = message[1:7]`;
         const at = findKeyword(masked, 'inline', cursor);
         if (at < 0) return source;
         const lineStart = source.lastIndexOf('\n', at - 1) + 1;
-        if (source.slice(lineStart, at).trim()) { cursor = at + 6; continue; }
+        if (source.slice(lineStart, at).trim() !== "" && source.slice(lineStart, at).trim() !== "local") { cursor = at + 6; continue; }
         const headerEnd = source.indexOf('\n', at);
         if (headerEnd < 0) throw new Error('inline function needs a body');
         const header = source.slice(at, headerEnd);
-        const decl = /^inline\s+function\s+([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*)?\s*\)\s*$/.exec(header);
-        if (!decl) throw new Error('inline supports top-level functions with zero or one untyped parameter');
-        const [, name, param] = decl;
+        const decl = /^inline\s+function\s+([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*(?:\s*:\s*[A-Za-z_]\w*\??)?)?\s*\)\s*(?::\s*[A-Za-z_]\w*)?\s*$/.exec(header);
+        if (!decl) throw new Error('inline supports top-level functions with zero or one parameter (optionally typed)');
+        const [, name, annotatedParam] = decl;
+        const param = annotatedParam?.split(':')[0].trim() || undefined;
         const adjusted = source.slice(0, at) + header.replace(/^inline\s+/, '') + source.slice(headerEnd);
         const closing = findMatchingEndByLines(adjusted, at);
         const adjustedHeaderEnd = adjusted.indexOf('\n', at);
+        if (annotatedParam?.includes(':') || /\)\s*:\s*[A-Za-z_]\w*\s*$/.test(header)) { source = adjusted; cursor = closing.end; continue; }
         const body = adjusted.slice(adjustedHeaderEnd + 1, closing.start).trim();
         const pure = param ? new RegExp(`^return\\s+${param}\\s*([+*/-])\\s*(-?\\d+(?:\\.\\d+)?)$`).exec(body) : null;
         const identity = !!param && body === `return ${param}`;
@@ -1522,7 +1568,7 @@ local part = message[1:7]`;
           if(closing<0)throw new Error('Unclosed optional method call');
           const receiver=source.slice(left,pos).trim();
           const args=source.slice(openAt+1,closing);
-          const invoke=`__lauaMethod(${colon?'__lauaReceiver'+(args.trim()? ', ':'') : ''}${args})`;
+          const invoke=`(__lauaMethod :: ((...any) -> any))(${colon?'__lauaReceiver'+(args.trim()? ', ':'') : ''}${args})`;
           rewrite(left, closing+1, `__lauaCore.optionalCall(${receiver}, function(__lauaReceiver) local __lauaMethod = __lauaCore.optional(__lauaReceiver, "${name[1]}"); if __lauaMethod == nil then return nil end; return ${invoke} end)`);
           continue;
         }
@@ -1619,18 +1665,22 @@ local part = message[1:7]`;
         results.push([
           `${indent}local ${name} = ${expression}`,
           `${indent}defer`,
-          `${indent}    if ${name} ~= nil then`,
-          `${indent}        if typeof(${name}) == "RBXScriptConnection" then`,
-          `${indent}            ${name}:Disconnect()`,
-          `${indent}        elseif typeof(${name}) == "Instance" then`,
-          `${indent}            ${name}:Destroy()`,
-          `${indent}        elseif type(${name}) == "table" then`,
-          `${indent}            if type(${name}.Dispose) == "function" then`,
-          `${indent}                ${name}:Dispose()`,
-          `${indent}            elseif type(${name}.Disconnect) == "function" then`,
-          `${indent}                ${name}:Disconnect()`,
-          `${indent}            elseif type(${name}.Destroy) == "function" then`,
-          `${indent}                ${name}:Destroy()`,
+          `${indent}    local __lauaResource: any = ${name}`,
+          `${indent}    if __lauaResource ~= nil then`,
+          `${indent}        if typeof(__lauaResource) == "RBXScriptConnection" then`,
+          `${indent}            (__lauaResource :: RBXScriptConnection):Disconnect()`,
+          `${indent}        elseif typeof(__lauaResource) == "Instance" then`,
+          `${indent}            (__lauaResource :: Instance):Destroy()`,
+          `${indent}        elseif type(__lauaResource) == "table" then`,
+          `${indent}            if type(__lauaResource.Dispose) == "function" then`,
+          `${indent}                local __lauaInvoke: (any) -> () = (__lauaResource.Dispose :: any)`,
+          `${indent}                __lauaInvoke(__lauaResource)`,
+          `${indent}            elseif type(__lauaResource.Disconnect) == "function" then`,
+          `${indent}                local __lauaInvoke: (any) -> () = (__lauaResource.Disconnect :: any)`,
+          `${indent}                __lauaInvoke(__lauaResource)`,
+          `${indent}            elseif type(__lauaResource.Destroy) == "function" then`,
+          `${indent}                local __lauaInvoke: (any) -> () = (__lauaResource.Destroy :: any)`,
+          `${indent}                __lauaInvoke(__lauaResource)`,
           `${indent}            else`,
           `${indent}                error("using resource has no Dispose, Disconnect, or Destroy method")`,
           `${indent}            end`,
@@ -1712,9 +1762,9 @@ local part = message[1:7]`;
 
     // The playground embeds the same runtime implementations as transpiler.luau.
     // Generated output is self-contained; no sibling Laua runtime ModuleScripts are required.
-    const LAUA_ASYNC_RUNTIME_SOURCE = "local Async = {}\nlocal Promise = {}\nPromise.__index = Promise\n\nlocal function isPromise(value)\n    return type(value) == \"table\" and getmetatable(value) == Promise\nend\n\nlocal function settle(promise, status, values)\n    if promise._status ~= \"Pending\" then return end\n    promise._status = status\n    promise._values = values\n    for _, thread in promise._waiters do\n        task.spawn(thread, status == \"Fulfilled\", table.unpack(values, 1, values.n))\n    end\n    table.clear(promise._waiters)\nend\n\nfunction Async.run(callback, ...)\n    assert(type(callback) == \"function\", \"Async.run expects a function\")\n    local promise = setmetatable({_status = \"Pending\", _values = nil, _waiters = {}}, Promise)\n    local args = table.pack(...)\n    task.spawn(function()\n        local result = table.pack(xpcall(function()\n            return callback(table.unpack(args, 1, args.n))\n        end, function(err) return err end))\n        if result[1] then\n            local values = table.pack(table.unpack(result, 2, result.n))\n            if values.n == 1 and isPromise(values[1]) then\n                local settled = table.pack(pcall(Async.await, values[1]))\n                if settled[1] then\n                    settle(promise, \"Fulfilled\", table.pack(table.unpack(settled, 2, settled.n)))\n                else\n                    settle(promise, \"Rejected\", table.pack(settled[2]))\n                end\n            else\n                settle(promise, \"Fulfilled\", values)\n            end\n        else\n            settle(promise, \"Rejected\", table.pack(result[2]))\n        end\n    end)\n    return promise\nend\n\nfunction Async.await(value)\n    if not isPromise(value) then\n        if type(value) == \"table\" and type(value.Wait) == \"function\" and type(value.Fire) == \"function\" then\n            return value:Wait()\n        end\n        return value\n    end\n    if value._status == \"Fulfilled\" then\n        return table.unpack(value._values, 1, value._values.n)\n    end\n    if value._status == \"Rejected\" then error(value._values[1], 2) end\n    local current = coroutine.running()\n    if not current then error(\"await requires a yieldable coroutine\", 2) end\n    table.insert(value._waiters, current)\n    local outcome = table.pack(coroutine.yield())\n    if not outcome[1] then error(outcome[2], 2) end\n    return table.unpack(outcome, 2, outcome.n)\nend\n\nfunction Promise:await()\n    return Async.await(self)\nend\n\nfunction Promise:andThen(callback)\n    return Async.run(function()\n        return callback(Async.await(self))\n    end)\nend\n\nfunction Promise:catch(callback)\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        if result[1] then return table.unpack(result, 2, result.n) end\n        return callback(result[2])\n    end)\nend\n\nfunction Promise:finally(callback)\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        callback()\n        if not result[1] then error(result[2], 0) end\n        return table.unpack(result, 2, result.n)\n    end)\nend\n\nfunction Promise:getStatus()\n    return self._status\nend\n\nAsync.Promise = Promise\nAsync.isPromise = isPromise\nreturn Async";
-    const LAUA_CORE_RUNTIME_SOURCE = "local LauaCore = {}\n\nfunction LauaCore.optional(value: any, key: any): any\n    if value == nil then return nil end\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[key] end)\n        if ok then return result end\n        if typeof(key) == \"string\" then return value:FindFirstChild(key) end\n        return nil\n    end\n    return value[key]\nend\n\nfunction LauaCore.coalesce(value: any, fallback: () -> any): any\n    if value ~= nil then return value end\n    return fallback()\nend\n\n\n-- Laua: spread merges consecutive array entries and then named keys.\nfunction LauaCore.spread(...: any): {[any]: any}\n    local result = {}\n    for index = 1, select(\"#\", ...) do\n        local item = select(index, ...)\n        assert(type(item) == \"table\", \"spread expects tables\")\n        for arrayIndex = 1, #item do\n            table.insert(result, item[arrayIndex])\n        end\n        for key, value in item do\n            if type(key) ~= \"number\" or key % 1 ~= 0 or key < 1 or key > #item then\n                result[key] = value\n            end\n        end\n    end\n    return result\nend\n\nfunction LauaCore.slice(value: any, first: number?, last: number?): any\n    local valueType = typeof(value)\n    if valueType == \"string\" then\n        return string.sub(value, first or 1, last or #value)\n    end\n    if valueType == \"buffer\" then\n        local length = buffer.len(value)\n        local startIndex = first or 1\n        local endIndex = last or length\n        if startIndex < 0 then startIndex = length + startIndex + 1 end\n        if endIndex < 0 then endIndex = length + endIndex + 1 end\n        startIndex = math.clamp(startIndex, 1, length + 1)\n        endIndex = math.clamp(endIndex, 0, length)\n        local size = math.max(0, endIndex - startIndex + 1)\n        local result = buffer.create(size)\n        if size > 0 then buffer.copy(result, 0, value, startIndex - 1, size) end\n        return result\n    end\n    error(\"slice supports strings and buffers only\")\nend\n\n\n-- Laua is: matches a Laua class or one of its ancestors.\nfunction LauaCore.is(value: any, class: any): boolean\n    if type(class) ~= \"table\" or type(value) ~= \"table\" then return false end\n    local candidate = getmetatable(value)\n    local visited = {}\n    while type(candidate) == \"table\" and not visited[candidate] do\n        if candidate == class then return true end\n        visited[candidate] = true\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    return false\nend\n\n-- Unlike an eager index, the index expression is not evaluated for nil.\nfunction LauaCore.optionalCall(value: any, callback: (any) -> any): any\n    if value == nil then return nil end\n    return callback(value)\nend\n\nfunction LauaCore.optionalIndex(value: any, key: () -> any): any\n    if value == nil then return nil end\n    local index = key()\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[index] end)\n        if ok then return result end\n        if typeof(index) == \"string\" then return value:FindFirstChild(index) end\n        return nil\n    end\n    return value[index]\nend\n\n-- Cache complete result tuples, including nils; cache keys use argument identity.\nfunction LauaCore.memo(callback: (...any) -> ...any): (...any) -> ...any\n    local root = {}\n    local nilKey = {}\n    local terminal = {}\n    return function(...)\n        local node = root\n        for index = 1, select(\"#\", ...) do\n            local key = select(index, ...)\n            if key == nil then key = nilKey end\n            local nextNode = node[key]\n            if not nextNode then nextNode = {}; node[key] = nextNode end\n            node = nextNode\n        end\n        local cached = node[terminal]\n        if not cached then\n            cached = table.pack(callback(...))\n            node[terminal] = cached\n        end\n        return table.unpack(cached, 1, cached.n)\n    end\nend\n\nLauaCore.table = {}\n\nfunction LauaCore.table.filter(items: {any}, predicate: (any, number) -> boolean): {any}\n    local out = {}\n    for index, item in items do\n        if predicate(item, index) then table.insert(out, item) end\n    end\n    return out\nend\n\nfunction LauaCore.table.map(items: {any}, callback: (any, number) -> any): {any}\n    local out = {}\n    for index, item in items do\n        out[index] = callback(item, index)\n    end\n    return out\nend\n\nfunction LauaCore.table.reduce(items: {any}, callback: (any, any, number) -> any, initial: any): any\n    local current = initial\n    for index, item in items do current = callback(current, item, index) end\n    return current\nend\n\nfunction LauaCore.table.findWhere(items: {any}, predicate: (any, number) -> boolean): any\n    for index, item in items do\n        if predicate(item, index) then return item end\n    end\n    return nil\nend\n\n-- Lazy imports can break *some* initialisation cycles if neither module\n-- accesses the other before both have finished loading.\nfunction LauaCore.lazyModule(resolve: () -> any): any\n    local loaded = false\n    local target = nil\n    local function get()\n        if not loaded then\n            target = resolve()\n            loaded = true\n        end\n        return target\n    end\n    return setmetatable({}, {\n        __index = function(_, key) return get()[key] end,\n        __newindex = function(_, key, value) get()[key] = value end,\n        __call = function(_, ...) return get()(...) end,\n    })\nend\n\nreturn LauaCore";
-    const LAUA_SIGNAL_RUNTIME_SOURCE = "local Signal = {}\nSignal.__index = Signal\n\nfunction Signal.new(typeNames: {string}?)\n    return setmetatable({ _event = Instance.new(\"BindableEvent\"), _destroyed = false, _types = typeNames }, Signal)\nend\n\nfunction Signal:Connect(callback: (...any) -> ())\n    assert(not self._destroyed, \"Cannot connect to a destroyed signal\")\n    assert(type(callback) == \"function\", \"Connect expects a function\")\n    return self._event.Event:Connect(callback)\nend\n\nfunction Signal:Once(callback: (...any) -> ())\n    assert(type(callback) == \"function\", \"Once expects a function\")\n    local connection\n    connection = self:Connect(function(...)\n        if connection then connection:Disconnect() end\n        callback(...)\n    end)\n    return connection\nend\n\nfunction Signal:Fire(...)\n    assert(not self._destroyed, \"Cannot fire a destroyed signal\")\n    local types = self._types\n    if types then\n        assert(select(\"#\", ...) == #types, \"Signal argument count mismatch\")\n        for index, name in types do\n            local value = select(index, ...)\n            local optional = name:sub(-1) == \"?\"\n            local typeName = optional and name:sub(1,-2) or name\n            if value == nil and optional then continue end\n            if typeof(value) ~= typeName then\n                if not (typeof(value) == \"Instance\" and value:IsA(typeName)) then\n                    error(\"Signal expected \" .. typeName .. \" at argument \" .. index, 2)\n                end\n            end\n        end\n    end\n    self._event:Fire(...)\nend\n\nfunction Signal:Wait()\n    assert(not self._destroyed, \"Cannot wait on a destroyed signal\")\n    return self._event.Event:Wait()\nend\n\nfunction Signal:Destroy()\n    if self._destroyed then return end\n    self._destroyed = true\n    self._event:Destroy()\nend\n\nreturn Signal";
+    const LAUA_ASYNC_RUNTIME_SOURCE = "local Async: any = {}\nlocal Promise: any = {}\nPromise.__index = Promise\n\nlocal function isPromise(value: any): boolean\n    return type(value) == \"table\" and getmetatable(value) == Promise\nend\n\nlocal function settle(promise: any, status: string, values: any)\n    if promise._status ~= \"Pending\" then return end\n    promise._status = status\n    promise._values = values\n    for _, thread in promise._waiters do\n        task.spawn(thread, status == \"Fulfilled\", table.unpack(values, 1, values.n))\n    end\n    table.clear(promise._waiters)\nend\n\nfunction Async.run(callback: (...any) -> ...any, ...: any)\n    assert(type(callback) == \"function\", \"Async.run expects a function\")\n    local promise = setmetatable({_status = \"Pending\", _values = nil, _waiters = {}}, Promise)\n    local args = table.pack(...)\n    task.spawn(function()\n        local result = table.pack(pcall(callback, table.unpack(args, 1, args.n)))\n        if result[1] then\n            local values = table.pack(table.unpack(result, 2, result.n))\n            if values.n == 1 and isPromise(values[1]) then\n                local settled = table.pack(pcall(Async.await, values[1]))\n                if settled[1] then\n                    settle(promise, \"Fulfilled\", table.pack(table.unpack(settled, 2, settled.n)))\n                else\n                    settle(promise, \"Rejected\", table.pack(settled[2]))\n                end\n            else\n                settle(promise, \"Fulfilled\", values)\n            end\n        else\n            settle(promise, \"Rejected\", table.pack(result[2]))\n        end\n    end)\n    return promise\nend\n\nfunction Async.await(value: any)\n    if not isPromise(value) then\n        if type(value) == \"table\" and type(value.Wait) == \"function\" and type(value.Fire) == \"function\" then\n            return (value :: {Wait: (any) -> ...any}):Wait()\n        end\n        return value\n    end\n    if value._status == \"Fulfilled\" then\n        return table.unpack(value._values, 1, value._values.n)\n    end\n    if value._status == \"Rejected\" then error(value._values[1], 2) end\n    local current = coroutine.running()\n    if not current then error(\"await requires a yieldable coroutine\", 2) end\n    table.insert(value._waiters, current)\n    local outcome = table.pack(coroutine.yield())\n    if not outcome[1] then error(outcome[2], 2) end\n    return table.unpack(outcome, 2, outcome.n)\nend\n\nfunction Promise:await()\n    return Async.await(self)\nend\n\nfunction Promise:andThen(callback: (...any) -> ...any)\n    return Async.run(function()\n        return callback(Async.await(self))\n    end)\nend\n\nfunction Promise:catch(callback: (...any) -> ...any)\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        if result[1] then return table.unpack(result, 2, result.n) end\n        return callback(result[2])\n    end)\nend\n\nfunction Promise:finally(callback: () -> ())\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        callback()\n        if not result[1] then error(result[2], 0) end\n        return table.unpack(result, 2, result.n)\n    end)\nend\n\nfunction Promise:getStatus()\n    return self._status\nend\n\nAsync.Promise = Promise\nAsync.isPromise = isPromise\nreturn Async";
+    const LAUA_CORE_RUNTIME_SOURCE = "local LauaCore = {}\n\nfunction LauaCore.optional(value: any, key: any): any\n    if value == nil then return nil end\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[key] end)\n        if ok then return result end\n        if typeof(key) == \"string\" then return (value :: Instance):FindFirstChild(key) end\n        return nil\n    end\n    return value[key]\nend\n\nfunction LauaCore.coalesce(value: any, fallback: () -> any): any\n    if value ~= nil then return value end\n    return fallback()\nend\n\n\n-- Laua: spread merges consecutive array entries and then named keys.\nfunction LauaCore.spread(...: any): {[any]: any}\n    local result = {}\n    for index = 1, select(\"#\", ...) do\n        local item = select(index, ...)\n        assert(type(item) == \"table\", \"spread expects tables\")\n        for arrayIndex = 1, #item do\n            table.insert(result, item[arrayIndex])\n        end\n        for key, value in item do\n            if type(key) ~= \"number\" or key % 1 ~= 0 or key < 1 or key > #item then\n                result[key] = value\n            end\n        end\n    end\n    return result\nend\n\nfunction LauaCore.slice(value: any, first: number?, last: number?): any\n    local valueType = typeof(value)\n    if valueType == \"string\" then\n        return string.sub(value, first or 1, last or #value)\n    end\n    if valueType == \"buffer\" then\n        local length = buffer.len(value)\n        local startIndex = first or 1\n        local endIndex = last or length\n        if startIndex < 0 then startIndex = length + startIndex + 1 end\n        if endIndex < 0 then endIndex = length + endIndex + 1 end\n        startIndex = math.clamp(startIndex, 1, length + 1)\n        endIndex = math.clamp(endIndex, 0, length)\n        local size = math.max(0, endIndex - startIndex + 1)\n        local result = buffer.create(size)\n        if size > 0 then buffer.copy(result, 0, value, startIndex - 1, size) end\n        return result\n    end\n    error(\"slice supports strings and buffers only\")\nend\n\n\n-- Laua is: matches a Laua class or one of its ancestors.\nfunction LauaCore.is(value: any, class: any): boolean\n    if type(class) ~= \"table\" or type(value) ~= \"table\" then return false end\n    local candidate = getmetatable(value)\n    for _ = 1, 4 do\n        if type(candidate) ~= \"table\" then return false end\n        if candidate == class then return true end\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    local visited = {}\n    while type(candidate) == \"table\" and not visited[candidate] do\n        if candidate == class then return true end\n        visited[candidate] = true\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    return false\nend\n\n-- Unlike an eager index, the index expression is not evaluated for nil.\nfunction LauaCore.optionalCall(value: any, callback: (any) -> any): any\n    if value == nil then return nil end\n    return callback(value)\nend\n\nfunction LauaCore.optionalIndex(value: any, key: () -> any): any\n    if value == nil then return nil end\n    local index = key()\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[index] end)\n        if ok then return result end\n        if typeof(index) == \"string\" then return (value :: Instance):FindFirstChild(index) end\n        return nil\n    end\n    return value[index]\nend\n\n-- Cache complete result tuples, including nils; cache keys use argument identity.\nfunction LauaCore.memo(callback: (...any) -> ...any): (...any) -> ...any\n    local root: {[any]: any} = {}\n    local nilKey = {}\n    local terminal = {}\n    return function(...)\n        local node: {[any]: any} = root\n        for index = 1, select(\"#\", ...) do\n            local key = select(index, ...)\n            if key == nil then key = nilKey end\n            local nextNode: {[any]: any}? = node[key]\n            if nextNode ~= nil then\n                node = nextNode\n            else\n                local created: {[any]: any} = {}\n                node[key] = created\n                node = created\n            end\n        end\n        local cached: {n: number, [number]: any}? = node[terminal]\n        if cached == nil then\n            local result = table.pack(callback(...))\n            node[terminal] = result\n            return table.unpack(result, 1, result.n)\n        end\n        return table.unpack(cached, 1, cached.n)\n    end\nend\n\nLauaCore.table = {}\n\nfunction LauaCore.table.filter(items: {any}, predicate: (any, number) -> boolean): {any}\n    local out = {}\n    for index, item in items do\n        if predicate(item, index) then table.insert(out, item) end\n    end\n    return out\nend\n\nfunction LauaCore.table.map(items: {any}, callback: (any, number) -> any): {any}\n    local out = {}\n    for index, item in items do\n        out[index] = callback(item, index)\n    end\n    return out\nend\n\nfunction LauaCore.table.reduce(items: {any}, callback: (any, any, number) -> any, initial: any): any\n    local current = initial\n    for index, item in items do current = callback(current, item, index) end\n    return current\nend\n\nfunction LauaCore.table.findWhere(items: {any}, predicate: (any, number) -> boolean): any\n    for index, item in items do\n        if predicate(item, index) then return item end\n    end\n    return nil\nend\n\n-- Lazy imports can break *some* initialisation cycles if neither module\n-- accesses the other before both have finished loading.\nfunction LauaCore.lazyModule(resolve: () -> any): any\n    local loaded = false\n    local target = nil\n    local function get()\n        if not loaded then\n            target = resolve()\n            loaded = true\n        end\n        return target\n    end\n    return setmetatable({}, {\n        __index = function(_, key) return get()[key] end,\n        __newindex = function(_, key, value) get()[key] = value end,\n        __call = function(_, ...) return get()(...) end,\n    })\nend\n\nreturn LauaCore";
+    const LAUA_SIGNAL_RUNTIME_SOURCE = "local Signal: any = {}\nSignal.__index = Signal\n\nfunction Signal.new(typeNames: {string}?)\n    local state: {_event: BindableEvent, _destroyed: boolean, _types: {string}?} = { _event = Instance.new(\"BindableEvent\"), _destroyed = false, _types = typeNames }\n    return setmetatable(state, Signal)\nend\n\nfunction Signal:Connect(callback: (...any) -> ())\n    assert(not self._destroyed, \"Cannot connect to a destroyed signal\")\n    assert(type(callback) == \"function\", \"Connect expects a function\")\n    return self._event.Event:Connect(callback)\nend\n\nfunction Signal:Once(callback: (...any) -> ())\n    assert(type(callback) == \"function\", \"Once expects a function\")\n    local connection: RBXScriptConnection? = nil\n    connection = self:Connect(function(...)\n        if connection then connection:Disconnect() end\n        callback(...)\n    end)\n    return connection\nend\n\nfunction Signal.Fire(self: any, ...)\n    assert(not self._destroyed, \"Cannot fire a destroyed signal\")\n    local types: {string}? = self._types\n    if types then\n        assert(select(\"#\", ...) == #types, \"Signal argument count mismatch\")\n        for index, name in types do\n            local value = select(index, ...)\n            local optional = name:sub(-1) == \"?\"\n            local typeName = optional and name:sub(1,-2) or name\n            if value == nil and optional then continue end\n            if typeof(value) ~= typeName then\n                if not (typeof(value) == \"Instance\" and (value :: Instance):IsA(typeName)) then\n                    error(\"Signal expected \" .. typeName .. \" at argument \" .. index, 2)\n                end\n            end\n        end\n    end\n    self._event:Fire(...)\nend\n\nfunction Signal:Wait()\n    assert(not self._destroyed, \"Cannot wait on a destroyed signal\")\n    return self._event.Event:Wait()\nend\n\nfunction Signal.Destroy(self: any)\n    if self._destroyed then return end\n    self._destroyed = true\n    self._event:Destroy()\nend\n\nreturn Signal";
 
     // Generate only the LauaCore helpers used by this file. This avoids
     // initializing unrelated functions in every compiled script, but keeps
@@ -1747,9 +1797,9 @@ local part = message[1:7]`;
     function insertLauaEmbeddedRuntimes(source) {
       const masked = maskNonCode(source);
       const fragments = [];
-      if (/\b__lauaAsync\./.test(masked)) fragments.push(`local __lauaAsync = (function()\n${LAUA_ASYNC_RUNTIME_SOURCE}\nend)()`);
-      if (/\b__lauaCore\./.test(masked)) fragments.push(`local __lauaCore = (function()\n${compactLauaCoreRuntime(source)}\nend)()`);
-      if (/\b__lauaSignal\./.test(masked)) fragments.push(`local __lauaSignal = (function()\n${LAUA_SIGNAL_RUNTIME_SOURCE}\nend)()`);
+      if (/\b__lauaAsync\./.test(masked) && !/\blocal\s+__lauaAsync\s*=/.test(masked)) fragments.push(`local __lauaAsync = (function()\n${LAUA_ASYNC_RUNTIME_SOURCE}\nend)()`);
+      if (/\b__lauaCore\./.test(masked) && !/\blocal\s+__lauaCore\s*=/.test(masked)) fragments.push(`local __lauaCore = (function()\n${compactLauaCoreRuntime(source)}\nend)()`);
+      if (/\b__lauaSignal\./.test(masked) && !/\blocal\s+__lauaSignal\s*=/.test(masked)) fragments.push(`local __lauaSignal = (function()\n${LAUA_SIGNAL_RUNTIME_SOURCE}\nend)()`);
       if (!fragments.length) return source;
       const lines = source.split("\n");
       let at = 0;
@@ -1814,7 +1864,7 @@ local part = message[1:7]`;
           if (!raw.includes('table.' + name)) continue;
           const regex = new RegExp('\\btable\\.'+name+'\\s*\\\(', 'g');
           const code = maskNonCode(raw);
-          const indices = [...code.matchAll(regex)].map(m=>m.index);
+          const indices = [...code.matchAll(regex)].map(m=>m.index).filter(index => index === 0 || !/[A-Za-z0-9_.:]/.test(code[index-1]));
           for (const index of indices.reverse()) raw = raw.slice(0,index)+'__lauaCore.'+raw.slice(index);
         }
         const lazy = raw.trim().match(/^import\s+lazy\s+([A-Za-z_]\w*)\s+from\s+"([^"]+)"\s*$/);
@@ -1914,7 +1964,9 @@ local part = message[1:7]`;
           if(!m){parsed.push(piece.trim());continue;}
           const name=/^[A-Za-z_]\w*/.exec(m[1]);
           if(!name)throw new Error('Invalid default parameter');
-          parsed.push(m[1].trim());
+          const original=m[1].trim();
+          const inferred=/^-?\d+(?:\.\d+)?$/.test(m[2].trim()) ? 'number?' : /^(["']).*\1$/.test(m[2].trim()) ? 'string?' : /^(?:true|false)$/.test(m[2].trim()) ? 'boolean?' : 'any';
+          parsed.push(/:\s*/.test(original) ? original : `${name[0]}: ${inferred}`);
           initializers.push(`if ${name[0]} == nil then ${name[0]} = ${m[2]} end`);
         }
         return raw.slice(0,open+1)+parsed.join(', ')+raw.slice(close)+'\n'+initializers.map(s=>(raw.match(/^[ \t]*/)[0]+'    '+s)).join('\n');
@@ -2045,6 +2097,11 @@ local part = message[1:7]`;
       if (output.includes('__laua')) output = insertLauaEmbeddedRuntimes(output);
       if (exported.names.length) output += `\nreturn {${exported.names.map(name => `${name} = ${name}`).join(', ')}}`;
       output = output.replace(/[\t ]+(?=\n|$)/g, '');
+      // Detect malformed adjacent expression tokens before reporting successful compilation.
+      // This is not a full Luau grammar/type checker.
+      if(!/\[(?:=*)\[/.test(output) && /[})]\d/.test(maskNonCode(output))){
+        throw new Error('Generated Luau contains an expression immediately followed by a number without a separator.');
+      }
       return style==='Compact' ? compactGeneratedOutput(output) : output;
     }
 
@@ -2095,7 +2152,8 @@ local part = message[1:7]`;
             members[exportedFunction[1]] = {
               kind: "function",
               params: exportedFunction[2],
-              detail: "Laua namespace function"
+              detail: "Laua namespace function",
+              declarationOffset: lines[li].start + raw.indexOf("function")
             };
 
             try {
@@ -2207,7 +2265,8 @@ local part = message[1:7]`;
               params: fn[3],
               visibility,
               final: isFinal,
-              detail: fn[1] === "function" ? (isStatic ? "Laua static method" : `Laua ${visibility} method`) : `Laua computed property (${fn[1]})`
+              detail: fn[1] === "function" ? (isStatic ? "Laua static method" : `Laua ${visibility} method`) : `Laua computed property (${fn[1]})`,
+              declarationOffset: lines[li].start + raw.indexOf(fn[1])
             };
 
             try {
@@ -2263,9 +2322,13 @@ local part = message[1:7]`;
           const endPos = findMatchingEndByLines(source, idx);
           const body = source.slice(headerEnd + 1, endPos.start);
 
+          const members = parseNamespaceMembers(body);
+          for (const member of Object.values(members)) {
+            if (member.declarationOffset !== undefined) member.declarationOffset += headerEnd + 1;
+          }
           symbols.namespaces[match[1]] = {
             name: match[1],
-            members: parseNamespaceMembers(body),
+            members,
             start: idx,
             end: endPos.end
           };
@@ -2343,6 +2406,9 @@ local part = message[1:7]`;
           const endPos = findMatchingEndByLines(source, idx);
           const body = source.slice(headerEnd + 1, endPos.start);
           const members = parseClassMembers(body);
+          for (const member of [...Object.values(members.instanceMembers), ...Object.values(members.staticMembers)]) {
+            if (member.declarationOffset !== undefined) member.declarationOffset += headerEnd + 1;
+          }
 
           symbols.classes[match[1]] = {
             name: match[1],
@@ -3754,8 +3820,15 @@ local part = message[1:7]`;
 
         if (!trimmed || trimmed.startsWith("--!") || trimmed.startsWith("@")) continue;
 
+        // Enum entries are declarations, not standalone Luau expressions.
+        // The block stack is updated by the same pass, so this works for
+        // multiple enums and enums nested inside other supported blocks.
+        if (stack.length && stack[stack.length - 1].kind === "enum" &&
+            !/^end\b/.test(trimmed) &&
+            /^[A-Za-z_][A-Za-z0-9_]*(?:\s*=\s*.+)?[,]?$/.test(trimmed)) continue;
+
         const bare = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*)\s*;?$/);
-        if (bare && !["break", "continue", "else", "end", "repeat", "do", "defer", "case", "default"].includes(bare[1])) {
+        if (bare && !["return", "break", "continue", "else", "end", "repeat", "do", "defer", "case", "default"].includes(bare[1])) {
           const name = bare[1].split(/[.:]/)[0];
           const guess = nearestLintKeyword(name);
           issue(lineStart, bare[1].length,
@@ -4856,6 +4929,23 @@ local part = message[1:7]`;
       }
     }
 
+    function generatedLuauPreflight(source) {
+      // Check a small set of definitely invalid emitted token combinations.
+      // This is NOT a substitute for Roblox Studio's parser and type checker.
+      const errors=[];
+      const lines=source.split('\n');
+      const maskedLines=maskNonCode(source).split('\n');
+      let offset=0;
+      for(let index=0;index<lines.length;index++){
+        const line=lines[index];
+        const masked=maskedLines[index];
+        const found=/[})](?=\d)/.exec(masked);
+        if(found)errors.push({start:offset+found.index,end:offset+found.index+2,message:'Missing operator or separator after a closing delimiter.'});
+        offset+=line.length+1;
+      }
+      return errors;
+    }
+
     function updateLauaDiagnostics(model) {
       if (model.getLanguageId() !== "laua") return;
 
@@ -4956,12 +5046,13 @@ local part = message[1:7]`;
 
       // New class features use transpiler validation as a second syntax pass.
       try {
-        transpile(source);
-      } catch (error) {
-        const message = error?.message || String(error);
-        if (/final|getter|setter|property|defer|using|async|await|super|constructor|Invalid member|lazy|watch|export|import|match|\?\?=|Labeled|Constrained|Nominal|positional|Truthy|falsy|regular expressions|Spread|Arrow|Slice/i.test(message)) {
-          pushMarker(0, Math.max(1, source.length && Math.min(source.length, 5)), monaco.MarkerSeverity.Error, message, "syntax");
+        const output=transpile(source);
+        for(const diagnostic of generatedLuauPreflight(output)){
+          pushMarker(0,Math.min(Math.max(1,source.length),5),monaco.MarkerSeverity.Error,'Generated Luau preflight: '+diagnostic.message,'syntax');
         }
+      } catch (error) {
+        const message=error?.message || String(error);
+        pushMarker(0,Math.min(Math.max(1,source.length),5),monaco.MarkerSeverity.Error,message,'syntax');
       }
       for (const classInfo of Object.values(symbols.classes)) {
         const parent = classInfo.base && symbols.classes[classInfo.base];
@@ -4976,6 +5067,34 @@ local part = message[1:7]`;
                 `Cannot override final method '${methodName}' from '${parent.name}'.`, "syntax");
             }
           }
+        }
+      }
+      if(directives.mode==='strict'){
+        // Static hint only: not a full Luau type checker. Catch the numeric-arrow
+        // pattern that otherwise generates an avoidable Studio Script Analysis warning.
+        for(const matched of masked.matchAll(/\((\s*[A-Za-z_]\w*\s*)\)\s*=>\s*([^\n]+)/g)){
+          const parameter=matched[1].trim();
+          const expression=matched[2];
+          if(new RegExp('\\b'+parameter+'\\s*[+*\\/-]\\s*\\d|\\d\\s*[+*\\/-]\\s*'+parameter+'\\b').test(expression)){
+            const at=matched.index+1+matched[1].indexOf(parameter);
+            pushMarker(at,at+parameter.length,monaco.MarkerSeverity.Warning,
+              `Numeric arrow parameter '${parameter}' has no explicit type under --!strict; use (${parameter}: number) => ...`,
+              'lint','ImplicitNumericParameter');
+          }
+        }
+        for(const matched of masked.matchAll(/^\s*(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/gm)){
+          const original=source.slice(matched.index,matched.index+matched[0].length);
+          if(/^\s*local\b/.test(original))continue;
+          const keywordStart = matched.index + original.search(/\b(?:async\s+)?function\b/);
+          const ownerClass = findClassAtOffset(symbols, keywordStart);
+          if (ownerClass) {
+            const declaration = ownerClass.instanceMembers[matched[1]] || ownerClass.staticMembers[matched[1]];
+            if (declaration && declaration.declarationOffset === keywordStart) continue;
+          }
+          const ownerNamespace = Object.values(symbols.namespaces).find(info => keywordStart >= info.start && keywordStart <= info.end);
+          if (ownerNamespace && ownerNamespace.members[matched[1]]?.declarationOffset === keywordStart) continue;
+          const at=matched.index+matched[0].lastIndexOf(matched[1]);
+          pushMarker(at,at+matched[1].length,monaco.MarkerSeverity.Warning,`Global function '${matched[1]}': use 'local function' or define the global intentionally. Forward calls may fail strict analysis.`,'lint','ImplicitGlobal');
         }
       }
       lintSpecialSyntax(source, masked, pushMarker);
@@ -6422,6 +6541,8 @@ local part = message[1:7]`;
         // Never discard a source file because another file fails to compile.
         for (const file of projectFiles.values()) {
           const entry={sourceName:file.name,source:file.model.getValue(),outputName:removeLauaExtension(file.name)+".luau",output:null,error:null};
+          const sourcePreflight=refreshFileMarkers(file);
+          if(sourcePreflight.errors){entry.error=`${sourcePreflight.errors} Laua preflight error(s)`;result.push(entry);continue;}
           const importErrors=projectImportMarkers(file);
           if (importErrors.length) {
             entry.error=importErrors.map(marker=>marker.message).join("; ");
@@ -6434,142 +6555,131 @@ local part = message[1:7]`;
         return result;
       }
 
-      // A native Roblox XML model: compiled ModuleScripts and lossless source
-      // StringValues in separate folder trees. ZIP import remains available.
+      // A compiled-only Roblox XML model; source maps and source copies are NOT exported.
+      // Export is deliberately blocked if any source failed, to prevent silent data loss.
       function makeProjectRbxmx(files) {
         const invalidXml = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u;
         const escapeXml = value => {
-          const text = String(value);
-          if (invalidXml.test(text)) throw new Error("A Laua source contains characters unsupported by Roblox XML. Remove invalid control characters before exporting.");
-          return text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;").replace(/'/g,"&apos;").replace(/\r/g,"&#13;");
+          const text=String(value);
+          if(invalidXml.test(text))throw new Error("Project contains XML-invalid characters; fix them before exporting.");
+          return text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;").replace(/\r/g,"&#13;");
         };
         const cdata = value => {
           const text=String(value);
-          if(invalidXml.test(text)) throw new Error("A compiled Luau file contains characters unsupported by Roblox XML.");
-          return "<![CDATA["+text.replace(/]]>/g,"]]]]><![CDATA[>")+"]]>";
+          if(invalidXml.test(text))throw new Error("Compiled Luau contains XML-invalid characters.");
+          return '<![CDATA['+text.replace(/]]>/g,']]]]><![CDATA[>')+']]>';
         };
-        const folder = name => ({kind:"Folder",name,children:[],dirs:new Map()});
-        const project=folder("LauaProject");
-        const modules=folder("Modules"), sources=folder("LauaSources"), maps=folder("SourceMaps");
-        project.children.push(modules,sources);
-        const errors=[];
-        function attach(base, path, kind, value) {
-          const parts=path.split("/");
-          let parent=base;
-          for(let i=0;i<parts.length-1;i++){
-            const part=parts[i];
-            if(!parent.dirs.has(part)) {
-              const child=folder(part);
-              parent.children.push(child);
-              parent.dirs.set(part,child);
-            }
-            parent=parent.dirs.get(part);
-          }
-          const name=kind==="ModuleScript" ? parts.at(-1).replace(/\.luau$/,"") : parts.at(-1);
-          parent.children.push({kind,name,value});
-        }
+        const errors=files.filter(f=>f.error || f.output === null).map(f=>f.sourceName+': '+(f.error||'Compilation failed'));
+        if(errors.length)throw new Error('Cannot export a partial project. Fix compilation errors first: '+errors.join('; '));
+        const folder=name=>({kind:'Folder',name,children:[],dirs:new Map()});
+        const project=folder('LauaProject');
+        const modules=folder('Modules');
+        project.children.push(modules);
         for(const entry of files){
-          // Do not discard even an empty or uncompileable Laua source.
-          attach(sources,entry.sourceName,"StringValue",entry.source);
-          if(entry.error){errors.push(entry.sourceName+": "+entry.error);continue;}
-          attach(modules,entry.outputName,"ModuleScript",entry.output);
-          if(entry.sourceMap !== undefined && entry.sourceMap !== null) attach(maps,entry.outputName+".map.json","StringValue",entry.sourceMap);
+          const path=entry.outputName.split('/');
+          let parent=modules;
+          for(const segment of path.slice(0,-1)){
+            if(!parent.dirs.has(segment)){
+              const dir=folder(segment);parent.dirs.set(segment,dir);parent.children.push(dir);
+            }
+            parent=parent.dirs.get(segment);
+          }
+          parent.children.push({kind:'ModuleScript',name:path.at(-1).replace(/\.luau$/,''),value:entry.output});
         }
-        if(maps.children.length) project.children.push(maps);
-        if(errors.length) project.children.push({kind:"StringValue",name:"CompilationErrors",value:errors.join("\n")});
         let referent=0;
         const fragments=['<?xml version="1.0" encoding="utf-8"?>\n',
           '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">',
           '<External>null</External><External>nil</External>'];
-        const emit=node=>{
-          fragments.push('<Item class="',node.kind,'" referent="RBXLAUA',String(++referent),'"><Properties>',
-            '<string name="Name">',escapeXml(node.name),'</string>');
-          if(node.kind==="ModuleScript") fragments.push('<ProtectedString name="Source">',cdata(node.value),'</ProtectedString>');
-          if(node.kind==="StringValue") fragments.push('<string name="Value">',escapeXml(node.value),'</string>');
+        function emit(node){
+          fragments.push('<Item class="',node.kind,'" referent="RBXLAUA',String(++referent),'">',
+            '<Properties><string name="Name">',escapeXml(node.name),'</string>');
+          if(node.kind==='ModuleScript')fragments.push('<ProtectedString name="Source">',cdata(node.value),'</ProtectedString>');
           fragments.push('</Properties>');
-          for(const child of node.children||[]) emit(child);
+          for(const child of node.children||[])emit(child);
           fragments.push('</Item>');
-        };
+        }
         emit(project);
         fragments.push('</roblox>');
-        const xml=fragments.join('');
-        return {blob:new Blob([xml],{type:"application/xml;charset=utf-8"}),errors};
+        return {blob:new Blob([fragments.join('')],{type:'application/xml;charset=utf-8'}),errors:[]};
       }
 
-      // ZIP importer supports store and DEFLATE (when browser DecompressionStream
-      // supports deflate-raw). Validate EVERY archive entry before touching project.
-      async function readLauaProjectZip(blob) {
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        if (bytes.length > 30*1024*1024) throw new Error("Project ZIP exceeds 30 MB limit.");
-        const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
-        const u16=at=>view.getUint16(at,true),u32=at=>view.getUint32(at,true);
-        let end=-1;
-        for(let i=bytes.length-22;i>=Math.max(0,bytes.length-65557);i--) {
-          if(u32(i)===0x06054b50 && i+22+u16(i+20)===bytes.length){end=i;break;}
+      // XML import accepts our compiled-only model, old Laua models with
+      // original sources, and simple Roblox models made of ModuleScripts.
+      // Parsing and validation finish before the saved project is replaced.
+      async function readLauaProjectRbxmx(blob) {
+        if(blob.size>40*1024*1024)throw new Error('The Roblox model exceeds 40 MB.');
+        const xml=await blob.text();
+        if(/<!DOCTYPE|<!ENTITY/i.test(xml))throw new Error('XML DTDs and entities are not supported.');
+        if(!/^\s*<\?xml\b|^\s*<roblox\b/.test(xml))throw new Error('Not a Roblox XML model.');
+        const doc=new DOMParser().parseFromString(xml,'application/xml');
+        if(doc.getElementsByTagName('parsererror').length || doc.documentElement?.tagName!=='roblox')throw new Error('Malformed Roblox XML model.');
+        const children=(node,tag)=>Array.from(node.children).filter(el=>el.tagName===tag);
+        const prop=(node,key)=>{
+          const properties=children(node,'Properties')[0];
+          return properties ? Array.from(properties.children).find(el=>el.getAttribute('name')===key)?.textContent : null;
+        };
+        const roots=children(doc.documentElement,'Item');
+        if(!roots.length)throw new Error('Model contains no Roblox items.');
+        const decoded=[];
+        let total=0;
+        function store(path,source){
+          const filename=normalizeProjectFilename(path);
+          if(decoded.some(item=>item.name===filename))throw new Error('Duplicate module: '+filename);
+          if(source.length>2*1024*1024)throw new Error('Module exceeds 2 MB: '+filename);
+          total+=source.length;
+          if(total>20*1024*1024 || decoded.length>=100)throw new Error('The model exceeds Laua project limits.');
+          decoded.push({name:filename,source});
         }
-        if(end<0)throw new Error("Invalid ZIP central directory.");
-        const count=u16(end+10),start=u32(end+16),directorySize=u32(end+12);
-        if(count>200 || start+directorySize>bytes.length)throw new Error("Project ZIP structure or file count is invalid.");
-        const utf8=new TextDecoder("utf-8",{fatal:true});
-        const decoded=[];let offset=start,total=0;
-        for(let i=0;i<count;i++) {
-          if(offset+46>bytes.length || u32(offset)!==0x02014b50)throw new Error("Damaged ZIP directory entry.");
-          const flags=u16(offset+8),method=u16(offset+10),checksum=u32(offset+16),packed=u32(offset+20),size=u32(offset+24);
-          const nameLen=u16(offset+28),extras=u16(offset+30),comment=u16(offset+32),localAt=u32(offset+42);
-          if(offset+46+nameLen+extras+comment>bytes.length)throw new Error("ZIP entry extends beyond archive.");
-          const pathname=utf8.decode(bytes.slice(offset+46,offset+46+nameLen));
-          offset+=46+nameLen+extras+comment;
-          if(pathname.endsWith("/") || pathname==="COMPILATION_ERRORS.txt")continue;
-          if(!pathname.startsWith("source/") || !pathname.endsWith(".laua"))continue;
-          if((flags&1) || ![0,8].includes(method))throw new Error("Encrypted or unsupported ZIP file: "+pathname);
-          if(size>2*1024*1024 || packed>30*1024*1024)throw new Error("Source file too large: "+pathname);
-          total+=size;if(total>20*1024*1024)throw new Error("Project sources exceed 20 MB limit.");
-          if(localAt+30>bytes.length || u32(localAt)!==0x04034b50)throw new Error("Damaged local file entry.");
-          const payloadStart=localAt+30+u16(localAt+26)+u16(localAt+28);
-          if(payloadStart+packed>bytes.length)throw new Error("Truncated ZIP data.");
-          let data=bytes.slice(payloadStart,payloadStart+packed);
-          if(method===8) {
-            if(typeof DecompressionStream!=="function")throw new Error("This browser cannot read compressed ZIP entries. Import an uncompressed project ZIP or use a browser supporting DEFLATE.");
-            const stream=new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-            const chunks=[],reader=stream.getReader();let received=0;
-            while(true){
-              const {done,value}=await reader.read();if(done)break;
-              received+=value.length;
-              if(received>size || received>2*1024*1024){await reader.cancel();throw new Error("Compressed ZIP entry exceeds declared size: "+pathname);}
-              chunks.push(value);
-            }
-            data=new Uint8Array(received);let at=0;
-            for(const chunk of chunks){data.set(chunk,at);at+=chunk.length;}
+        function walk(item,path,kind){
+          const type=item.getAttribute('class');
+          const name=prop(item,'Name');
+          if(!name || name==='.' || name==='..' || name.includes('/') || name.includes('\\'))throw new Error('Unsafe or missing Roblox item name.');
+          if(type==='Folder' || type==='Model'){
+            for(const child of children(item,'Item'))walk(child,path.concat(name),kind);
+          }else if(kind==='source' && type==='StringValue'){
+            const value=prop(item,'Value');
+            if(value===null)throw new Error('Source entry has no Value: '+name);
+            if(!name.endsWith('.laua'))return;
+            store(path.concat(name).join('/'),value);
+          }else if(kind==='module' && type==='ModuleScript'){
+            const value=prop(item,'Source');
+            if(value===null)throw new Error('ModuleScript has no Source: '+name);
+            store(path.concat(name.replace(/\.(?:luau|lua|laua)$/,'')+'.laua').join('/'),value);
           }
-          if(data.length!==size)throw new Error("ZIP source size mismatch: "+pathname);
-          let crc=0xffffffff;
-          for(const byte of data){crc^=byte;for(let bit=0;bit<8;bit++)crc=(crc&1)?(0xedb88320^(crc>>>1)):(crc>>>1);}
-          if(((crc^0xffffffff)>>>0)!==checksum)throw new Error("Corrupt ZIP checksum: "+pathname);
-          const filename=normalizeProjectFilename(pathname.slice(7));
-          if(decoded.some(f=>f.name===filename))throw new Error("Duplicate source file: "+filename);
-          decoded.push({name:filename,source:utf8.decode(data)});
         }
-        if(!decoded.length)throw new Error("This ZIP contains no source/*.laua files.");
-        if(decoded.length>100)throw new Error("Laua supports up to 100 project files.");
-        return decoded;
+        const project=roots.find(root=>prop(root,'Name')==='LauaProject');
+        const top=project ? children(project,'Item') : roots;
+        const originalSources=top.find(item=>prop(item,'Name')==='LauaSources');
+        if(originalSources){
+          for(const item of children(originalSources,'Item'))walk(item,[],'source');
+        }
+        // Older Laua exports include source copies, which are preferred over
+        // re-importing the compiled output. Otherwise import the Luau source.
+        if(!decoded.length){
+          const compiled=top.find(item=>prop(item,'Name')==='Modules');
+          for(const item of compiled ? children(compiled,'Item') : top)walk(item,[],'module');
+        }
+        if(!decoded.length)throw new Error('No importable ModuleScripts were found.');
+        return {files:decoded, originalLaua:Boolean(originalSources)};
       }
 
-      async function importProjectZip(blob) {
-        // Parse first, so a corrupt ZIP never erases a working project.
-        const imported=await readLauaProjectZip(blob);
-        if(!confirm(`Replace the current project with ${imported.length} file(s) from this ZIP? This replaces your saved project.`))return false;
-        const main=imported.find(f=>f.name==="main.laua");
-        if(!main)imported.unshift({name:"main.laua",source:STARTER});
+      async function importProjectRbxmx(blob) {
+        const imported=await readLauaProjectRbxmx(blob);
+        const message=imported.originalLaua
+          ? `Replace the current project with ${imported.files.length} original Laua source files from this model?`
+          : `Import ${imported.files.length} compiled Luau ModuleScripts as editable .laua files? Original Laua syntax cannot be recovered from compiled-only models. This replaces your saved project.`;
+        if(!confirm(message))return false;
+        if(!imported.files.some(f=>f.name==='main.laua'))imported.files.unshift({name:'main.laua',source:''});
         for(const file of projectFiles.values()){
           file.disposeChange.dispose();file.model.dispose();file.output.dispose();
         }
         projectFiles.clear();activeFile=null;
-        diffSnapshots.length=0; // Different projects should never share comparison history.
-        for(const entry of imported)createProjectFile(entry.name,entry.source,{silent:true});
-        switchProjectFile("main.laua");
+        diffSnapshots.length=0;
+        for(const entry of imported.files)createProjectFile(entry.name,entry.source,{silent:true});
+        switchProjectFile('main.laua');
         lintAllProjectFiles();rememberProject();
-        projectStatus().textContent=`Imported ${imported.length} Laua files. Previous project replaced.`;
-        projectStatus().className="ok";
+        projectStatus().textContent=`Imported ${imported.files.length} ${imported.originalLaua?'original Laua sources':'compiled Luau modules'}.`;
+        projectStatus().className='ok';
         return true;
       }
       function downloadProjectBlob(filename,blob) {
@@ -6581,16 +6691,13 @@ local part = message[1:7]`;
       async function exportProject() {
         try {
           const all=compileProjectFiles();
-          for(const entry of all){
-            if(!entry.error) entry.sourceMap=JSON.stringify(makeSourceLineMap(entry.source,entry.output,entry.sourceName),null,2);
-          }
-          const {blob,errors}=makeProjectRbxmx(all);
-          downloadProjectBlob("Laua-v3.22-project.rbxmx",blob);
-          projectStatus().textContent=`Exported ${all.length} Laua sources and ${all.length-errors.length} compiled ModuleScripts as a Roblox model.${errors.length?` ${errors.length} file(s) failed compilation; see CompilationErrors inside the model.`:""}`;
-          projectStatus().className=errors.length?"error":"ok";
+          const {blob}=makeProjectRbxmx(all);
+          downloadProjectBlob('Laua-v3.29-project.rbxmx',blob);
+          projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
+          projectStatus().className='ok';
         } catch(error) {
           projectStatus().textContent=error?.message || String(error);
-          projectStatus().className="error";
+          projectStatus().className='error';
         }
       }
 
@@ -6807,12 +6914,12 @@ local part = message[1:7]`;
           const modeInfo = ` · ${result.directives?.mode || "nonstrict"}${result.directives?.nolint ? " · nolint" : ""}${result.directives?.optimize !== null && result.directives?.optimize !== undefined ? ` · optimize ${result.directives.optimize} (Roblox)` : ""}`;
           if (result.errors > 0) {
             status.textContent =
-              `Lint: ${result.errors} error(s), ${result.warnings} warning(s), ${result.hints} hint(s)${modeInfo}`;
+              `Laua preflight (not Studio lint): ${result.errors} error(s), ${result.warnings} warning(s), ${result.hints} hint(s)${modeInfo}`;
 
             status.className = "error";
           } else {
             status.textContent =
-              `Lint: 0 errors, ${result.warnings} warning(s), ${result.hints} hint(s)${modeInfo}`;
+              `Laua preflight (not Studio lint): 0 errors, ${result.warnings} warning(s), ${result.hints} hint(s)${modeInfo}`;
 
             status.className = "ok";
           }
@@ -6830,6 +6937,8 @@ local part = message[1:7]`;
       function runTranspile(recordForDiff = false) {
         try {
           const file = projectFiles.get(activeFile);
+          const preflight=refreshFileMarkers(file);
+          if(preflight.errors>0)throw new Error(`Laua preflight detected ${preflight.errors} error(s). Fix marked source before transpiling.`);
           const importErrors = projectImportMarkers(file);
           if (importErrors.length) throw new Error(importErrors.map(item=>item.message).join("; "));
           const output = transpile(lauaEditor.getValue(), {Mode: document.getElementById("modeSelect").value,OutputStyle:document.getElementById("outputStyleSelect").value});
@@ -6843,17 +6952,24 @@ local part = message[1:7]`;
             if (diffSnapshots.length > 2) diffSnapshots.shift();
           }
           luauEditor.setValue(output);
+          const generatedErrors=generatedLuauPreflight(output);
+          monaco.editor.setModelMarkers(luauEditor.getModel(),'laua-generated',generatedErrors.map(diagnostic=>{
+            const range=makeRangeFromOffsets(luauEditor.getModel(),diagnostic.start,diagnostic.end);
+            return {...range,severity:monaco.MarkerSeverity.Error,message:'Generated Luau preflight: '+diagnostic.message};
+          }));
+          if(generatedErrors.length)throw new Error(`Generated Luau preflight detected ${generatedErrors.length} syntax issue(s).`);
           file.generated=output;
           const directives = readPlaygroundDirectives(lauaEditor.getValue());
           const inputBytes = new TextEncoder().encode(lauaEditor.getValue()).length;
           const outputBytes = new TextEncoder().encode(output).length;
           const savedBytes = Math.max(0, inputBytes-outputBytes);
-          status.textContent = `Transpiled · ${document.getElementById("modeSelect").value} · ${inputBytes.toLocaleString()} → ${outputBytes.toLocaleString()} bytes${savedBytes ? ` · ${savedBytes.toLocaleString()} fewer bytes` : ""} · Roblox optimize ${directives.optimize ?? "default"}${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`;
+          status.textContent = `Transpiled (preflight only; Studio not verified) · ${document.getElementById("modeSelect").value} · ${inputBytes.toLocaleString()} → ${outputBytes.toLocaleString()} bytes${savedBytes ? ` · ${savedBytes.toLocaleString()} fewer bytes` : ""} · Roblox optimize ${directives.optimize ?? "default"}${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`;
           status.className = "ok";
           return output;
         } catch (err) {
           // Never let Copy use stale code from an earlier successful transpilation.
           const failureMessage = err?.message || String(err);
+          monaco.editor.setModelMarkers(luauEditor.getModel(),'laua-generated',[]);
           luauEditor.setValue("-- Transpilation failed. Fix the error in the Laua editor.\n-- " + String(failureMessage).replaceAll("\n", "\n-- "));
           if (activeFile) projectFiles.get(activeFile).generated=null;
           status.textContent = "Transpile error: " + failureMessage;
@@ -6999,7 +7115,7 @@ local part = message[1:7]`;
       document.getElementById("importProjectInput").addEventListener("change",async event=>{
         const file=event.target.files?.[0];event.target.value="";
         if(!file)return;
-        try{await importProjectZip(file);}catch(error){status.textContent="Import failed: "+(error?.message||String(error));status.className="error";}
+        try{await importProjectRbxmx(file);}catch(error){status.textContent="Import failed: "+(error?.message||String(error));status.className="error";}
       });
 
       function jumpToNextProblem() {
