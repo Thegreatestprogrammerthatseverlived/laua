@@ -93,7 +93,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.38 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.39 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -848,6 +848,7 @@ local part = message[1:7]`;
 
     function transpileClass(source) {
       const allocationRequirements = new Map();
+      const hookFreeClasses = new Map();
       let searchFrom = 0;
       while (true) {
         const masked = maskNonCode(source);
@@ -1059,6 +1060,8 @@ local part = message[1:7]`;
         const needsValues = !!(watchers.length || lazyFields.length || (base && (parentAllocation ? parentAllocation.values : true)));
         const needsInitialized = !!(lazyFields.length || (base && (parentAllocation ? parentAllocation.initialized : true)));
         allocationRequirements.set(name, {values: needsValues, initialized: needsInitialized});
+        const hookFree = !getters.length && !setters.length && !lazyFields.length && !watchers.length && (!base || hookFreeClasses.get(base) === true);
+        hookFreeClasses.set(name, hookFree);
         const plainClass = !base && !isAbstract && !isFinal && !getters.length && !setters.length && !lazyFields.length && !watchers.length && !ctor?.attributes && methods.every(member => !member.abstract && !member.final && !member.override);
         if (plainClass) {
           let output = `local ${name}: {[string]: any} = {}\n${name}.__index = ${name}\n`;
@@ -1077,6 +1080,43 @@ local part = message[1:7]`;
             const memberBody = normalizeBlockIndent(transpileCore(member.body), "    ");
             if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw new Error("super(...) can only be called in constructors");
             output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n${memberBody ? memberBody + "\n" : ""}end\n`;
+          }
+          source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
+          continue;
+        }
+        // A known hook-free class hierarchy can use Luau's ordinary __index
+        // table lookup. No getter/setter/lazy/watcher dispatch tables or closure
+        // handlers are allocated. Keep final/abstract contract metadata and
+        // dynamic parent guards: skipping those would change error behavior.
+        if (hookFree) {
+          let output = base
+            ? `if ${base}.__final then error("Cannot extend final class '${base}'") end\nlocal ${name}: any = setmetatable({}, {__index = ${base}})\n`
+            : `local ${name}: {[string]: any} = {}\n`;
+          output += `${name}.__index = ${name}\n${name}.__abstract = ${isAbstract}\n${name}.__final = ${isFinal}\n`;
+          const ownFinals = methods.filter(method => method.final).map(method => `[${JSON.stringify(method.name)}] = true`).join(', ');
+          output += `${name}.__finalMethods = ${base ? `setmetatable({${ownFinals}}, {__index = ${base}.__finalMethods or {}})` : `{${ownFinals}}`}\n`;
+          for (const field of statics) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
+          const arglist = ctor?.params?.trim() ? ', ' + ctor.params : '';
+          output += `function ${name}.__init(self: any${arglist})\n`;
+          if (parentInit) output += `    ${parentInit}\n`;
+          for (const field of fields) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const signal of signals) output += `    self.${signal.name} = __lauaSignal.new(${signal.types.length ? '{' + signal.types.map(t => JSON.stringify(t)).join(', ') + '}' : ''})\n`;
+          const init = normalizeBlockIndent(transpileCore(constructorBody));
+          if (init) output += init + '\n';
+          output += `end\nfunction ${name}.new(...: any): any\n    if ${name}.__abstract then error("Cannot instantiate abstract class '${name}'") end\n    local self: any = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
+          for (const op of operators) {
+            const body = normalizeBlockIndent(transpileCore(base ? replaceSuperReferences(op.body, base) : op.body));
+            output += `function ${name}.${op.name}(self: any${op.params ? ', ' + (/^[A-Za-z_]\w*$/.test(op.params.trim()) ? op.params.trim() + ': any' : op.params) : ''})\n${body ? body + '\n' : ''}end\n`;
+          }
+          for (const member of methods) {
+            if (base) output += `if ${base}.__finalMethods and ${base}.__finalMethods[${JSON.stringify(member.name)}] then error("Cannot override final method '${member.name}'") end\n`;
+            let body = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
+            if (/\bsuper\s*\(/.test(maskNonCode(body))) throw new Error('super(...) can only be called in constructors');
+            body = normalizeBlockIndent(transpileCore(body));
+            output += `${member.attributes ? member.attributes + '\n' : ''}${member.kind === 'async function' ? 'async ' : ''}function ${name}.${member.name}(${member.static ? member.params : 'self: any' + (member.params.trim() ? ', ' + member.params : '')})\n`;
+            if (member.abstract) output += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
+            else if (body) output += body + '\n';
+            output += 'end\n';
           }
           source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
           continue;
@@ -2253,7 +2293,7 @@ local part = message[1:7]`;
     // untouched so changing formatting cannot change literal string contents.
     function compactGeneratedOutput(output) {
       if (/\[(?:=*)\[|`/.test(output)) return output;
-      return output.split('\n').filter(row=>row.trim()!=='' && (!/^\s*--/.test(row) || /^\s*--[!#]/.test(row))).join('\n');
+      return output.split('\n').filter(row=>row.trim()!=='' && (!/^\s*--/.test(row) || /^\s*--[!#]/.test(row))).map(row => row.trimStart()).join('\n');
     }
     // v3.37 syntax preflight: token-aware and conservative. Strings, long strings
     // and comments are never interpreted as source expressions.
@@ -2389,6 +2429,86 @@ local part = message[1:7]`;
       }
     }
 
+    // Structured declaration pass for known classes. Inspect only direct class
+    // members, not nested function/constructor bodies. This is intentionally
+    // separate from expression lowering until a complete AST is available.
+    function validateClassContracts(source) {
+      if (!/\bclass\b/.test(source)) return;
+      const masked = maskNonCode(source), lines = splitLinesWithOffsets(source);
+      const blockIndex = {lines, masked}, classes = new Map();
+      const fail = (message, offset) => {
+        const line = source.slice(0, offset).split('\n').length;
+        const column = offset - source.lastIndexOf('\n', offset - 1);
+        const err = new Error(`Laua class error (line ${line}, column ${column}): ${message}`);
+        err.offset = offset; err.line = line; err.column = column; err.code = 'LAUA_CLASS_CONTRACT';
+        throw err;
+      };
+      for (let i = 0; i < lines.length; i++) {
+        const row = lines[i], code = masked.slice(row.start, row.end).trim();
+        const header = /^(?:(final|abstract)\s+)?class\s+([A-Za-z_]\w*)(?:\s+extends\s+([A-Za-z_][\w.]*))?$/.exec(code);
+        if (!header) continue;
+        const offset = row.start + masked.slice(row.start, row.end).indexOf('class');
+        let end;
+        try { end = findMatchingEndByLines(source, offset, blockIndex); }
+        catch { continue; } // The primary compiler reports malformed bodies.
+        const methods = new Map();
+        const body = source.slice(row.end + 1, end.start);
+        const bodyLines = splitLinesWithOffsets(body), bodyMasked = maskNonCode(body);
+        const memberIndex = {lines:bodyLines, masked:bodyMasked};
+        for (let j = 0; j < bodyLines.length; j++) {
+          const part = bodyLines[j];
+          const line = bodyMasked.slice(part.start, part.end).trim();
+          const method = /^((?:(?:public|private|protected|static|override|abstract|final)\s+)*)((?:async\s+)?function)\s+([A-Za-z_]\w*)\s*\(/.exec(line);
+          if (method) {
+            const modifiers = new Set(method[1].trim().split(/\s+/).filter(Boolean));
+            methods.set(method[3], {final:modifiers.has('final'), override:modifiers.has('override'), static:modifiers.has('static'), offset:row.end + 1 + part.start});
+          }
+          if (/^(?:(?:public|private|protected|static|override|abstract|final)\s+)*(?:(?:async\s+)?function\b|constructor\s*\(|watch\s+\w+\s*\(|get\s+\w+\s*\(|set\s+\w+\s*\(|operator\s+|if\b|while\b|for\b|repeat\b|do\b|match\b)/.test(line)) {
+            const at = part.start + bodyMasked.slice(part.start,part.end).search(/\S/);
+            try {
+              const closing = findMatchingEndByLines(body, at, memberIndex);
+              const following = lineIndexAfter(bodyLines, closing.end);
+              j = following < 0 ? bodyLines.length : following - 1;
+            } catch { /* malformed body handled later */ }
+          }
+        }
+        if (classes.has(header[2])) fail(`Duplicate class '${header[2]}'.`, offset);
+        classes.set(header[2], {base:header[3] || null, final:header[1] === 'final', methods, offset});
+        const following = lineIndexAfter(lines, end.end);
+        i = following < 0 ? lines.length : following - 1;
+      }
+      for (const [name, cls] of classes) {
+        const directParent = classes.get(cls.base);
+        if (directParent?.final) fail(`Cannot extend final class '${cls.base}'.`, cls.offset);
+        const chain = new Set([name]);
+        let ancestor = cls.base;
+        while (ancestor && classes.has(ancestor)) {
+          if (chain.has(ancestor)) fail(`Circular class inheritance involving '${name}'.`, cls.offset);
+          chain.add(ancestor);
+          ancestor = classes.get(ancestor).base;
+        }
+        for (const [methodName, method] of cls.methods) {
+          let parentName = cls.base, inherited = null;
+          const seen = new Set();
+          while (parentName && classes.has(parentName) && !seen.has(parentName)) {
+            seen.add(parentName);
+            const parent = classes.get(parentName);
+            if (parent.methods.has(methodName)) {inherited = parent.methods.get(methodName);break;}
+            parentName = parent.base;
+          }
+          if (inherited?.final) fail(`Cannot override final method '${methodName}' in class '${name}'.`, method.offset);
+          // External/imported bases cannot be analyzed statically: keep the
+          // runtime guard and do not guess whether an override exists.
+          if (method.override && !inherited && (!cls.base || classes.has(cls.base))) {
+            fail(`Method '${name}.${methodName}' is marked override but no ancestor defines it.`, method.offset);
+          }
+          if (method.override && inherited && method.static !== inherited.static) {
+            fail(`Override '${name}.${methodName}' changes static/instance method kind.`, method.offset);
+          }
+        }
+      }
+    }
+
     // Laua compiler semantic preflight. Reject only references whose meaning can
     // be resolved from this file; dynamic/imported/engine values stay dynamic.
     function validateLauaSemantics(source) {
@@ -2416,15 +2536,25 @@ local part = message[1:7]`;
       };
       const checkCall = (label, params, argumentText, offset) => {
         if(!params) return;
-        let depth=0,count=argumentText.trim()?1:0;
-        for(const ch of argumentText){if('([{'.includes(ch))depth++;else if(')]}'.includes(ch))depth--;else if(ch===','&&depth===0)count++;}
+        // Token-masked argument splitting: commas inside strings, long strings,
+        // nested calls, tables, or comments do not count as separators.
+        const code = maskNonCode(argumentText), parts=[];
+        let depth=0, start=0;
+        for(let i=0;i<=code.length;i++) {
+          const ch=code[i];
+          if(i<code.length) {
+            if('([{'.includes(ch)) depth++;
+            else if(')]}'.includes(ch)) depth--;
+          }
+          if(i===code.length || (ch===',' && depth===0)) {
+            const part=argumentText.slice(start,i).trim();
+            if(part || i < code.length || parts.length) parts.push(part);
+            start=i+1;
+          }
+        }
+        const count=parts.length;
         const required=params.filter(p=>!p.optional&&!p.rest).length;
         if(count<required || (!params.some(p=>p.rest)&&count>params.length))fail(`'${label}' expects ${required}${required!==params.length?`-${params.length}`:''} argument(s), received ${count}.`,offset);
-        const parts=[];depth=0;let start=0;
-        for(let i=0;i<=argumentText.length;i++){
-          const ch=argumentText[i];if(i<argumentText.length){if('([{'.includes(ch))depth++;else if(')]}'.includes(ch))depth--;}
-          if(i===argumentText.length||(ch===','&&depth===0)){parts.push(argumentText.slice(start,i).trim());start=i+1;}
-        }
         for(let i=0;i<Math.min(parts.length,params.length);i++){
           const expected=params[i].type, value=parts[i];if(!expected||!value)continue;
           const actual=/^\d+(?:\.\d+)?$/.test(value)?'number':/^(?:true|false)$/.test(value)?'boolean':/^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`)$/.test(value)?'string':/^\{/.test(value)?'table':null;
@@ -2477,10 +2607,53 @@ local part = message[1:7]`;
         knownVariables.set(m[1],m[3]);checkCall(`${m[3]} constructor`,classes.get(m[3]).ctor||[],m[4]===undefined?'':source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index);
       }
       for(const m of masked.matchAll(/\blocal\s+(\w+)\s*:\s*(\w+)\b/g)){if(classes.has(m[2])&&!knownVariables.has(m[1])) knownVariables.set(m[1],m[2]);}
+      // Lexically scoped class inference: a nested `local p = new Child()` must
+      // not change the type of the outer `p` after the inner block closes.
+      // This is a conservative declaration index, not full Luau flow typing.
+      const typeBindings = new Map();
+      const addBinding = (name, cls, at, frame) => {
+        const item = {cls, start:at, end:Infinity};
+        if(!typeBindings.has(name)) typeBindings.set(name,[]);
+        typeBindings.get(name).push(item);
+        frame.push(item);
+      };
+      const closeFrame = (frames, at) => {
+        if(frames.length < 2) return;
+        for(const binding of frames.pop()) binding.end = at;
+      };
+      const frames=[[]];
+      for(const row of lines) {
+        const code = masked.slice(row.start,row.end).trim();
+        if(!code || /^--/.test(code)) continue;
+        if(/^(?:end|until)\b/.test(code)) {closeFrame(frames,row.start);continue;}
+        if(/^(?:else|elseif)\b/.test(code)) {closeFrame(frames,row.start);frames.push([]);}
+        const opens = /^(?:(?:local\s+)?(?:async\s+)?function\b|(?:(?:abstract|final)\s+)?class\b|(?:return\s+)?namespace\b|enum\b|constructor\s*\(|watch\s+\w+\s*\(|get\s+\w+\s*\(|set\s+\w+\s*\(|match\b|repeat\b|do\b|if\b.*\bthen\s*$|for\b.*\bdo\s*$|while\b.*\bdo\s*$)/.test(code);
+        if(opens) frames.push([]);
+        const frame=frames[frames.length-1];
+        const fn=/^(?:(?:local\s+)?(?:async\s+)?function\s+[\w.:]+|constructor|watch\s+\w+|get\s+\w+|set\s+\w+)\s*\(([^)]*)\)/.exec(code);
+        if(fn) for(const raw of fn[1].split(',')) {
+          const pname=/^\s*([A-Za-z_]\w*)/.exec(raw)?.[1];
+          if(pname) addBinding(pname,null,row.start,frame);
+        }
+        for(const found of masked.slice(row.start,row.end).matchAll(/\b(?:local|const)\s+(?!function\b)([A-Za-z_]\w*)(?:\s*:\s*([A-Za-z_]\w*))?(?:\s*=\s*new\s+([A-Za-z_]\w*)\b)?/g)) {
+          const cls = classes.has(found[3]) ? found[3] : classes.has(found[2]) ? found[2] : null;
+          addBinding(found[1],cls,row.start+found.index,frame);
+        }
+        if(opens && /\bend\s*$/.test(code) && !/^end\b/.test(code))closeFrame(frames,row.end);
+      }
+      const resolveTypedOwner = (name,at) => {
+        const candidates = typeBindings.get(name);
+        if(!candidates) return knownVariables.get(name);
+        let best = null;
+        for(const binding of candidates) {
+          if(binding.start <= at && at < binding.end && (!best || binding.start > best.start))best = binding;
+        }
+        return best?.cls || null;
+      };
       const checkMember=(owner,delimiter,member,args,offset)=>{
         if(enums.has(owner)){if(!enums.get(owner).has(member))fail(`Enum '${owner}' has no member '${member}'.`,offset);return;}
         if(namespaces.has(owner)){if(!namespaces.get(owner).has(member))fail(`Namespace '${owner}' has no exported member '${member}'.`,offset);return;}
-        let cls=knownVariables.get(owner),isStatic=false;
+        let cls=resolveTypedOwner(owner,offset),isStatic=false;
         if(classes.has(owner)){cls=owner;isStatic=true;}
         if(owner==='self'&&!cls){const surrounding=[...classes.entries()].find(([,c])=>offset>c.start&&offset<c.end);if(surrounding)cls=surrounding[0];}
         if(!cls)return;
@@ -2493,13 +2666,14 @@ local part = message[1:7]`;
         if(delimiter===':'&&found.kind!=='method')fail(`'${cls}.${member}' is a property, not a method.`,offset);
         if(args!==undefined){if(found.kind!=='method')fail(`'${cls}.${member}' is not callable.`,offset);checkCall(`${cls}.${member}`,found.params,args,offset);}
       };
-      const memberCalls=/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\s*\(([^\n()]*)\)/g;
-      let safeMasked=masked;
-      for(const m of safeMasked.matchAll(memberCalls)){
-        // Ignore method declarations and definitions such as function X:Foo(...).
+      const memberCalls=/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\s*\(/g;
+      const safeMasked=masked;
+      for(const m of safeMasked.matchAll(memberCalls)) {
         const lineStart=masked.lastIndexOf('\n',m.index-1)+1, prefix=masked.slice(lineStart,m.index);
-        if(/\bfunction\s*$/.test(prefix))continue;
-        checkMember(m[1],m[2],m[3],source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index);
+        if(/\bfunction\s*$/.test(prefix)) continue;
+        const openAt=m.index+m[0].lastIndexOf('(');
+        const closeAt=findMatchingParen(source,openAt,masked);
+        checkMember(m[1],m[2],m[3],source.slice(openAt+1,closeAt),m.index);
       }
       for(const m of safeMasked.matchAll(/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\b/g)){
         const prefix=masked.slice(masked.lastIndexOf('\n',m.index-1)+1,m.index);
@@ -2581,7 +2755,7 @@ local part = message[1:7]`;
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
       validateExpressionSyntax(source);
-      if (options?.SemanticCheck !== false) {validateScopedReferences(source);validateLauaSemantics(source);}
+      if (options?.SemanticCheck !== false) {validateClassContracts(source);validateScopedReferences(source);validateLauaSemantics(source);}
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact'].includes(style))throw new Error('Invalid Laua output style');
 
@@ -2622,6 +2796,7 @@ local part = message[1:7]`;
       }
       return style==='Compact' ? compactGeneratedOutput(output) : output;
     }
+
     function buildLauaSymbolIndex(source) {
       const symbols = {
         namespaces: {},
@@ -7726,7 +7901,7 @@ local part = message[1:7]`;
       function exportStudioSourceProject() {
         try {
           const blob=makeStudioSourceRbxmx();
-          downloadProjectBlob('Laua-v3.38-editable-studio.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.39-editable-studio.rbxmx',blob);
           projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -7824,7 +7999,7 @@ local part = message[1:7]`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.38-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.39-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
