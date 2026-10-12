@@ -93,7 +93,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.39 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.40 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -2391,7 +2391,7 @@ local part = message[1:7]`;
       if (!locals.size) return;
       const stack = [new Set()];
       const known = name => stack.some(s => s.has(name));
-      const fail = (name, line) => {throw new Error(`Laua semantic error (line ${line}): Unknown variable '${name}' (not in scope).`);};
+      const fail = (name, line) => {const lineStart=source.split('\n').slice(0,line-1).reduce((n,part)=>n+part.length+1,0); const lineCode=masked.split('\n')[line-1]||''; const pos=lineCode.lastIndexOf(name); const offset=lineStart+Math.max(0,pos); const column=offset-lineStart+1; const error=new Error(`Laua semantic error (line ${line}, column ${column}): Unknown variable '${name}' (not in scope).`); Object.assign(error,{code:'LAUA_SCOPE',offset,line,column});throw error;};
       const rows = masked.split('\n');
       for (let n=0;n<rows.length;n++) {
         const row=rows[n], code=row.trim();
@@ -2511,6 +2511,296 @@ local part = message[1:7]`;
 
     // Laua compiler semantic preflight. Reject only references whose meaning can
     // be resolved from this file; dynamic/imported/engine values stay dynamic.
+    // v3.40: conservative typed semantic checks with source-site diagnostics.
+    // Unknown/dynamic values are intentionally not assigned invented types.
+    function validateTypedSemantics(source) {
+      if (source.includes('local __laua')) return;
+      const masked=maskNonCode(source), lines=splitLinesWithOffsets(source);
+      const aliases=new Map(), classes=new Map(), functions=new Map(), namespaces=new Map();
+      const locals=new Map(), frames=[[]], scopes=[];
+      const unknown='any';
+      const fail=(code,message,at)=>{
+        const line=source.slice(0,at).split('\n').length;
+        const column=at-source.lastIndexOf('\n',at-1);
+        const error=new Error(`Laua semantic error (line ${line}, column ${column}): ${message}`);
+        Object.assign(error,{code,offset:at,line,column});throw error;
+      };
+      const split=(raw)=>{
+        const code=maskNonCode(raw), out=[];let start=0,stack=[];
+        const closing={')':'(',']':'[','}':'{'};
+        for(let i=0;i<=code.length;i++){
+          const c=code[i];
+          if(i<code.length){if('([{'.includes(c))stack.push(c);else if(closing[c] && stack.at(-1)===closing[c])stack.pop();}
+          if(i===code.length || (c===','&&!stack.length)){out.push({text:raw.slice(start,i).trim(),start});start=i+1;}
+        }
+        return out.length===1&&!out[0].text?[]:out;
+      };
+      const type=(raw)=>{
+        if(!raw)return unknown;
+        let s=raw.trim();
+        if(aliases.has(s))return aliases.get(s);
+        if(s.endsWith('?'))return `${type(s.slice(0,-1))}|nil`;
+        if(/^[A-Z]$/.test(s))return unknown; // Unbound generic type variable.
+        if(/^\{[\s\S]*\}$/.test(s)){
+          const inner=s.slice(1,-1).trim();
+          if(!inner)return 'table';
+          const parts=split(inner);
+          if(parts.length && parts.every(p=>/^\s*[\w]+\s*:/.test(p.text))){
+            const properties={};for(const part of parts){const m=/^([A-Za-z_]\w*)\s*:\s*([\s\S]+)$/.exec(part.text);if(m)properties[m[1]]=type(m[2]);}
+            return {kind:'record',properties};
+          }
+          if(parts.length===1 && !inner.includes(':'))return {kind:'array',element:type(inner)};
+          return 'table';
+        }
+        if(classes.has(s))return `class:${s}`;
+        return s;
+      };
+      const format=t=>typeof t==='string'?t:(t?.kind==='array'?`{${format(t.element)}}`:t?.kind==='record'?'{'+Object.entries(t.properties).map(([k,v])=>`${k}: ${format(v)}`).join(', ')+'}':unknown);
+      const assignable=(got,expected)=>{
+        if(!got||!expected||got===unknown||expected===unknown||got==='any'||expected==='any')return true;
+        if(got==='table' && typeof expected==='object')return true; // Initializer structure may require full Luau checking.
+        if(typeof got==='string'&&typeof expected==='string'){
+          if(got===expected)return true;
+          if(expected.includes('|'))return expected.split('|').some(item=>assignable(got,item.trim()));
+          if(got.startsWith('class:') && expected.startsWith('class:')){
+            let name=got.slice(6),seen=new Set();while(name&&!seen.has(name)){if(name===expected.slice(6))return true;seen.add(name);name=classes.get(name)?.base;}return false;
+          }
+          return false;
+        }
+        if(typeof got!=='object'||typeof expected!=='object')return expected==='table' && typeof got==='object';
+        if(expected.kind==='array'&&got.kind==='array')return assignable(got.element,expected.element);
+        if(expected.kind==='record'&&got.kind==='record')return Object.entries(expected.properties).every(([k,v])=>Object.hasOwn(got.properties,k)&&assignable(got.properties[k],v));
+        return false;
+      };
+      const params=(raw)=>split(raw).map(p=>{const m=/^(\.\.\.|[A-Za-z_]\w*)(?:\s*:\s*([^=]+?))?(?:\s*=\s*([\s\S]+))?$/.exec(p.text);return {name:m?.[1]||p.text,type:m?.[2]?type(m[2]):unknown,optional:!!m?.[3]||m?.[2]?.trim().endsWith('?')||p.text.startsWith('...'),rest:p.text.startsWith('...')};});
+      // Collect aliases first so class field and function annotations resolve.
+      for(const m of masked.matchAll(/\btype\s+([A-Za-z_]\w*)\s*=\s*/g)){
+        if(masked.slice(m.index,m.index+4)!=='type')continue;
+        const start=m.index+m[0].length;
+        if(source[start]==='{'){
+          let depth=0,end=start;
+          for(;end<source.length;end++){if(masked[end]==='{')depth++;else if(masked[end]==='}'&&!--depth){end++;break;}}
+          if(depth===0)aliases.set(m[1],source.slice(start,end));
+        }else{
+          const match=/^[A-Za-z_]\w*\??/.exec(source.slice(start));
+          if(match)aliases.set(m[1],match[0]);
+        }
+      }
+      for(const [key,value] of aliases)aliases.set(key,type(value));
+      // Index classes, methods, constructors and fields, scanning only direct members.
+      for(const row of lines){
+        const code=masked.slice(row.start,row.end).trim();
+        const cls=/^(?:(?:final|abstract)\s+)?class\s+([A-Za-z_]\w*)(?:\s+extends\s+([A-Za-z_]\w*))?\s*$/.exec(code);
+        if(!cls)continue;
+        const open=row.start+masked.slice(row.start,row.end).indexOf('class');let close;
+        try{close=findMatchingEndByLines(source,open).end;}catch{continue;}
+        classes.set(cls[1],{base:cls[2],start:row.start,end:close,fields:new Map(),methods:new Map(),ctor:null});
+      }
+      // Type aliases are now re-resolved with class names known.
+      for(const [key,val] of aliases)if(typeof val==='string' && classes.has(val))aliases.set(key,`class:${val}`);
+      for(const [name,info] of classes){
+        const body=source.slice(info.start,info.end), bm=masked.slice(info.start,info.end);
+        const offset=info.start;
+        const rows=splitLinesWithOffsets(body);let depth=0;
+        for(const row of rows){
+          const code=bm.slice(row.start,row.end).trim();
+          if(/^end\b/.test(code)){if(depth)depth--;continue;}
+          if(depth){if(/^(?:function|constructor\s*\(|get\s+|set\s+|watch\s+|if\b|for\b|while\b|do\b|repeat\b)/.test(code))depth++;continue;}
+          const member=/^(?:(?:public|private|protected|static|final|override|abstract)\s+)*(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)(?:\s*:\s*([^\n]+))?/.exec(code);
+          if(member){info.methods.set(member[1],{params:params(member[2]),result:type(member[3]?.trim()||unknown)});depth++;continue;}
+          const ctor=/^constructor\s*\(([^)]*)\)/.exec(code);
+          if(ctor){info.ctor=params(ctor[1]);depth++;continue;}
+          const prop=/^(?:(?:public|private|protected|static|final|override|abstract)\s+)*([A-Za-z_]\w*)\s*:\s*([^=\n]+?)(?:\s*=|\s*$)/.exec(code);
+          if(prop){info.fields.set(prop[1],type(prop[2]));continue;}
+          const special=/^(?:get|set|watch)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/.exec(code);
+          if(special){depth++;continue;}
+          if(/^(?:signal|lazy)\s+/.test(code))continue;
+          if(/^(?:if|for|while|do|repeat|match)\b/.test(code))depth++;
+        }
+      }
+      for(const [name,info] of classes)for(const [field,t] of info.fields)if(typeof t==='string'&&classes.has(t))info.fields.set(field,`class:${t}`);
+      const memberType=(owner,key)=>{
+        if(typeof owner==='string'&&owner.startsWith('class:')){
+          let name=owner.slice(6),seen=new Set();while(name&&!seen.has(name)){
+            seen.add(name);const cls=classes.get(name);if(!cls)break;
+            if(cls.fields.has(key))return cls.fields.get(key);
+            if(cls.methods.has(key))return {kind:'callable',signature:{...cls.methods.get(key),params:[{name:'self',type:`class:${name}`,optional:false,rest:false},...cls.methods.get(key).params]},receiver:true};
+            name=cls.base;
+          }
+        }
+        if(typeof owner==='object'&&owner.kind==='record')return owner.properties[key]||unknown;
+        return unknown;
+      };
+      const lookup=(name,at)=>{
+        const bindings=locals.get(name)||[];let best;
+        for(const binding of bindings)if(binding.start<=at && at<binding.end&&(!best||binding.start>best.start))best=binding;
+        if(best)return best.value;
+        if(functions.has(name))return {kind:'callable',signature:functions.get(name)};
+        return unknown;
+      };
+      const setBinding=(name,value,at)=>{
+        const binding={value,start:at,end:Infinity};
+        if(!locals.has(name))locals.set(name,[]);
+        locals.get(name).push(binding);
+        frames.at(-1).push(binding);
+      };
+      const endFrame=(at)=>{if(frames.length>1)for(const b of frames.pop())b.end=at;};
+      // Function signatures indexed independently of declaration order.
+      const funDecl=/\b(?:local\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)(?:\s*<[^>\n]+>)?\s*\(([^\n)]*)\)\s*(?::\s*([^\n]+?))?(?=\s*(?:\n|$|return\b|local\b|end\b))/g;
+      for(const m of source.matchAll(funDecl)){
+        if(masked[m.index]===' ')continue;
+        if([...classes.values()].some(c=>m.index>=c.start&&m.index<c.end))continue;
+        functions.set(m[1],{params:params(m[2]),result:type(m[3]?.trim()||unknown)});
+      }
+      const getSimpleType=(expression,at,level=0)=>{
+        if(level>14)return unknown;
+        let expr=expression.trim();if(!expr)return 'nil';
+        const numeric=/^-?(?:0x[\da-fA-F_]+|0b[01_]+|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?)$/;
+        if(numeric.test(expr))return 'number';
+        if(/^(?:true|false)$/.test(expr))return 'boolean';
+        if(expr==='nil')return 'nil';
+        if(/^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\[(=*)\[[\s\S]*\]\1\])$/.test(expr))return 'string';
+        if(/^new\s+([A-Za-z_]\w*)\s*\(/.test(expr))return `class:${/^new\s+([A-Za-z_]\w*)/.exec(expr)[1]}`;
+        if(expr.startsWith('{')&&expr.endsWith('}'))return 'table';
+        if(expr.startsWith('(')&&expr.endsWith(')'))return getSimpleType(expr.slice(1,-1),at,level+1);
+        const call=/^([A-Za-z_]\w*)\s*\(/.exec(expr);
+        if(call){const binding=lookup(call[1],at);if(binding?.kind==='callable')return binding.signature?.result||unknown;}
+        const path=/^([A-Za-z_]\w*)((?:\.[A-Za-z_]\w*|\[[^\]]+\])*)$/.exec(expr);
+        if(path){let t=lookup(path[1],at);const tail=path[2];
+          for(const segment of tail.matchAll(/\.([A-Za-z_]\w*)|\[([^\]]+)\]/g)){
+            if(segment[1])t=memberType(t,segment[1]);
+            else if(typeof t==='object'&&t.kind==='array')t=t.element;
+            else if(typeof t==='object'&&t.kind==='record'&&/^["'][^"']+["']$/.test(segment[2].trim()))t=t.properties[segment[2].trim().slice(1,-1)]||unknown;
+            else t=unknown;
+          }
+          return t;
+        }
+        const unary=/^(-|#|not\b)\s*(.*)$/.exec(expr);
+        if(unary){const arg=getSimpleType(unary[2],at,level+1),op=unary[1];
+          if(op==='not')return 'boolean';
+          if(op==='-'&&arg!=='any'&&!assignable(arg,'number'))fail('LAUA_OPERATOR',`Unary '-' expects number, received ${format(arg)}.`,at);
+          if(op==='#'&&arg!=='any'&&arg!=='string'&&arg!=='table'&&typeof arg!=='object')fail('LAUA_OPERATOR',`Unary '#' expects string or table, received ${format(arg)}.`,at);
+          return 'number';
+        }
+        // Only check unambiguous binary expressions; dynamic operands retain any.
+        const bin=/^([A-Za-z_]\w*|\d+(?:\.\d+)?|true|false|"[^"\n]*"|'[^'\n]*')\s*(\+|\-|\*|\/|\/\/|%|\^|<=|>=|<|>)\s*([A-Za-z_]\w*|\d+(?:\.\d+)?|true|false|"[^"\n]*"|'[^'\n]*')$/.exec(expr);
+        if(bin){const left=getSimpleType(bin[1],at,level+1),right=getSimpleType(bin[3],at,level+1),ordered=/^(?:<=|>=|<|>)$/.test(bin[2]);
+          if(ordered){if(left!=='any'&&right!=='any'&&!(left===right&&['number','string'].includes(left)))fail('LAUA_OPERATOR',`Ordered comparison '${bin[2]}' is not valid for ${format(left)} and ${format(right)}.`,at);return 'boolean';}
+          if((left!=='any'&&!assignable(left,'number'))||(right!=='any'&&!assignable(right,'number')))fail('LAUA_OPERATOR',`Arithmetic '${bin[2]}' expects numbers, received ${format(left)} and ${format(right)}.`,at);
+          return 'number';
+        }
+        return unknown;
+      };
+      const check=(actual,expected,at,label='Assignment')=>{if(!assignable(actual,expected))fail('LAUA_TYPE',`${label} expects ${format(expected)}, received ${format(actual)}.`,at);};
+      const checkArguments=(label,signature,raw,at)=>{
+        if(!signature)return;
+        const actual=split(raw), expected=signature.params||[],required=expected.filter(p=>!p.optional&&!p.rest).length;
+        if(actual.length<required||(!expected.some(p=>p.rest)&&actual.length>expected.length))fail('LAUA_CALL_ARITY',`'${label}' expects ${required}${required!==expected.length?`-${expected.length}`:''} argument(s), received ${actual.length}.`,at);
+        for(let i=0;i<actual.length;i++){
+          const p=expected[Math.min(i,expected.length-1)];if(!p||i>=expected.length&&!p.rest)break;
+          const got=getSimpleType(actual[i].text,at+actual[i].start);
+          check(got,p.type,at+actual[i].start,`Argument ${i+1} of '${label}'`);
+        }
+      };
+      // Record functions as callable bindings and collect a scope-aware type index.
+      for(const [name,sig] of functions)setBinding(name,{kind:'callable',signature:sig},0);
+      let activeFunction=null;const returnFrames=[];
+      for(const row of lines){
+        const raw=source.slice(row.start,row.end),code=masked.slice(row.start,row.end),trimmed=code.trim();
+        if(!trimmed)continue;
+        if(/^(?:end|until)\b/.test(trimmed)){
+          if(activeFunction&&frames.length===activeFunction.depth){
+            if(activeFunction.signature.result!=='any'&&activeFunction.signature.result!=='nil'&&!activeFunction.sawDirectReturn && !(activeFunction.sawReturn && activeFunction.hasElse) && !activeFunction.inlineEnd){
+              fail('LAUA_MISSING_RETURN',`Function '${activeFunction.name}' may finish without returning ${format(activeFunction.signature.result)}.`,row.start);
+            }
+            activeFunction=returnFrames.pop()||null;
+          }
+          endFrame(row.start);continue;
+        }
+        if(/^(?:else|elseif)\b/.test(trimmed)){endFrame(row.start);frames.push([]);}
+        if(activeFunction && /\belse\b/.test(trimmed) && !/\belseif\b/.test(trimmed))activeFunction.hasElse=true;
+        const classStart=/^(?:(?:final|abstract)\s+)?class\b/.test(trimmed);
+        const functionStart=/^(?:(?:local|async)\s+)?function\s+([A-Za-z_]\w*)(?:\s*<[^>\n]+>)?\s*\(([^)]*)\)(?:\s*:\s*(\w+\??))?/.exec(trimmed);
+        const methodStart=/^(?:(?:public|private|protected|static|final|override|abstract|async)\s+)*function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)(?:\s*:\s*(\w+\??))?/.exec(trimmed);
+        const constructor=/^constructor\s*\(([^)]*)\)/.exec(trimmed);
+        const starts=/^(?:if\b.*\bthen\s*$|for\b.*\bdo\s*$|while\b.*\bdo\s*$|do\s*$|repeat\b|namespace\b|enum\b|match\b)/.test(trimmed);
+        const opens=classStart||!!functionStart||!!constructor||starts||/^(?:get|set|watch)\s+\w+\s*\(/.test(trimmed);
+        if(opens)frames.push([]);
+        if(functionStart||constructor){
+          let sig=functionStart?functions.get(functionStart[1]):null;
+          let cname;
+          if(constructor||!sig){for(const [name,info] of classes)if(row.start>info.start&&row.start<info.end){cname=name;break;}}
+          if(constructor&&cname)sig={params:params(constructor[1]),result:'nil'};
+          if(!sig&&cname&&methodStart)sig=classes.get(cname).methods.get(methodStart[1]);
+          if(sig){returnFrames.push(activeFunction);activeFunction={name:functionStart?.[1]||'constructor',signature:sig,sawReturn:false,sawDirectReturn:false,hasElse:false,depth:frames.length,inlineEnd:/\bend\s*$/.test(trimmed)};}
+          const argumentsText=functionStart?.[2]||constructor?.[1];
+          if(argumentsText)for(const p of params(argumentsText))if(p.name!=='...')setBinding(p.name,p.type,row.start);
+          if(cname)setBinding('self',`class:${cname}`,row.start);
+        }
+        // Bind local declaration types (including inferred class and callable values).
+        const declaration=/\b(?:local|const)\s+(?!function\b)([A-Za-z_]\w*)(?:\s*:\s*(\{[^}]+\}|\w+\??))?\s*=\s*(.+?)\s*(?:;|$)/.exec(raw);
+        if(declaration && /\b(?:local|const)\b/.test(code.slice(declaration.index,declaration.index+8))){
+          const at=row.start+declaration.index, valueAt=row.start+raw.indexOf(declaration[3],declaration.index);
+          const annotated=declaration[2]?type(declaration[2]):null;
+          const inferred=getSimpleType(declaration[3],valueAt);
+          if(annotated)check(inferred,annotated,valueAt);
+          setBinding(declaration[1],annotated||inferred,at);
+        }
+        // Known assignment targets: parameter/local/member/array/record paths.
+        const assignment=/^\s*([A-Za-z_]\w*(?:(?:\.[A-Za-z_]\w*|\[[^\]\n]+\])*))\s*(\+=|-=|\*=|\/=|\^=|%=|\/=|\.\.=|=(?!=))\s*([^\n;]+)/.exec(raw);
+        if(assignment && !/^(?:local|const)\b/.test(trimmed)){
+          const lhs=assignment[1],op=assignment[2],expr=assignment[3],valueAt=row.start+raw.indexOf(expr,assignment.index),base=/^[A-Za-z_]\w*/.exec(lhs)?.[0];
+          let want=lookup(base,row.start);
+          const path=lhs.slice(base.length);
+          for(const m of path.matchAll(/\.([A-Za-z_]\w*)|\[([^\]]+)\]/g)){
+            if(m[1])want=memberType(want,m[1]);
+            else if(typeof want==='object'&&want.kind==='array')want=want.element;
+            else if(typeof want==='object'&&want.kind==='record'&&/^["'][^"']+["']$/.test(m[2].trim()))want=want.properties[m[2].trim().slice(1,-1)]||unknown;
+            else want=unknown;
+          }
+          const got=getSimpleType(expr,valueAt);
+          if(op!=='=' && want!=='any'){
+            const expected=op==='..='?'string':'number';
+            check(want,expected,row.start,`Left operand of '${op}'`);
+            check(got,expected,valueAt,`Right operand of '${op}'`);
+          }else check(got,want,valueAt);
+        }
+        // Source-based return check; preserve nested declared function results.
+        const ret=/\breturn\s+([^;\n]+?)(?:\s+end\b|\s*$)/.exec(raw);
+        if(ret && activeFunction && activeFunction.signature.result!=='any'){
+          const value=ret[1].trim(),at=row.start+raw.indexOf(value,ret.index);
+          if(value)check(getSimpleType(value,at),activeFunction.signature.result,at,`Return from '${activeFunction.name}'`);
+          activeFunction.sawReturn=true;
+          if(frames.length===activeFunction.depth && !/\bif\b[^]*\bthen\b/.test(raw.slice(0,ret.index)))activeFunction.sawDirectReturn=true;
+        }
+        // Callable aliases and returns from functions (including aliases of aliases).
+        for(const call of code.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)){
+          const at=row.start+call.index,name=call[1],before=code.slice(Math.max(0,call.index-20),call.index);
+          if(/(?:\bfunction\s+|\bconstructor\s*|\bget\s+|\bset\s+|\bwatch\s+|[.:])\s*$/.test(before))continue;
+          const callable=lookup(name,at);
+          if(callable?.kind!=='callable')continue;
+          const open=at+call[0].lastIndexOf('(');let close;
+          try{close=findMatchingParen(source,open,masked);}catch{continue;}
+          checkArguments(name,callable.signature,source.slice(open+1,close),at);
+        }
+        // Constructor-form super: bind to the immediate base constructor.
+        if(activeFunction?.name==='constructor'){
+          const superCall=/\bsuper\s*\(/.exec(code);
+          if(superCall){const selfType=lookup('self',row.start),cls=classes.get(typeof selfType==='string'?selfType.slice(6):'');
+            const base=classes.get(cls?.base);
+            if(base){const at=row.start+superCall.index,open=at+superCall[0].lastIndexOf('(');
+              let close;try{close=findMatchingParen(source,open,masked);}catch{close=open+1;}
+              checkArguments(`${cls.base} constructor`,{params:base.ctor||[]},source.slice(open+1,close),at);
+            }
+          }
+        }
+        if(opens&&/\bend\s*$/.test(trimmed)&&!/^end\b/.test(trimmed)){
+          if(activeFunction&&activeFunction.depth===frames.length)activeFunction=returnFrames.pop()||null;
+          endFrame(row.end);
+        }
+      }
+    }
+
     function validateLauaSemantics(source) {
       if (source.includes('local __laua')) return; // Already-generated runtime code is not source Laua.
       const masked = maskNonCode(source);
@@ -2518,7 +2808,7 @@ local part = message[1:7]`;
       const knownVariables = new Map(), functions = new Map();
       const builtins = new Set(('assert error getfenv getmetatable ipairs loadstring newproxy next pairs pcall print rawequal rawget rawlen rawset select setfenv setmetatable tonumber tostring type typeof unpack xpcall require warn tick time elapsedTime gcinfo settings UserSettings plugin delay spawn wait collectgarbage debug vector _G _VERSION shared game workspace script Enum Instance CFrame Vector2 Vector3 UDim UDim2 Color3 BrickColor NumberRange NumberSequence ColorSequence Rect Ray Region3 PhysicalProperties Random DateTime TweenInfo OverlapParams RaycastParams Axes Faces Font Vector3int16 Vector2int16 NumberSequenceKeypoint ColorSequenceKeypoint math table string task coroutine utf8 os bit32 buffer').split(' '));
       const lines = splitLinesWithOffsets(source);
-      const fail = (message, at) => { const line = source.slice(0, at).split('\n').length; throw new Error(`Laua semantic error (line ${line}): ${message}`); };
+      const fail = (message, at) => { const line = source.slice(0, at).split('\n').length, column = at-source.lastIndexOf('\n',at-1); const error=new Error(`Laua semantic error (line ${line}, column ${column}): ${message}`); Object.assign(error,{code:'LAUA_SEMANTIC',offset:at,line,column});throw error; };
       const signature = (raw) => {
         const args = [];
         let depth=0, from=0;
@@ -2582,7 +2872,7 @@ local part = message[1:7]`;
         const en=/^enum\s+(\w+)\s*$/.exec(clean);
         if(en){try{const end=findMatchingEndByLines(source,line.start).end;const members=new Set();for(const row of masked.slice(line.end+1,end).split('\n')){const m=/^\s*(\w+)\s*(?:=|,|$)/.exec(row);if(m&&m[1]!=='end')members.add(m[1]);}enums.set(en[1],members);}catch{}}
         const ns=/^namespace\s+(\w+)\s*$/.exec(clean);
-        if(ns){try{const end=findMatchingEndByLines(source,line.start).end;const members=new Set();for(const row of masked.slice(line.end+1,end).split('\n')){const m=/^\s*(?:export\s+)?(?:function\s+|(?:local|const)\s+)?(\w+)\s*(?:\(|=)/.exec(row);if(m)members.add(m[1]);}namespaces.set(ns[1],members);}catch{}}
+        if(ns){try{const end=findMatchingEndByLines(source,line.start).end;const members=new Map();for(const row of masked.slice(line.end+1,end).split('\n')){const m=/^\s*(?:export\s+)?(?:function\s+|(?:local|const)\s+)?(\w+)\s*(?:\(|=)/.exec(row);if(m){const fn=/^\s*(?:export\s+)?function\s+(\w+)\s*\(([^)]*)\)/.exec(row);members.set(m[1],fn?{kind:'function',params:signature(fn[2])}:{kind:'value'});}}namespaces.set(ns[1],members);}catch{}}
         const fn=/^(?:local\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)/.exec(clean);
         if(fn && !source.slice(0,line.start).match(/\bclass\b[^]*$/)) { /* Function lookup added in second pass. */ }
       }
@@ -2604,7 +2894,7 @@ local part = message[1:7]`;
       };
       for(const m of masked.matchAll(/\b(?:local\s+|const\s+)?([A-Za-z_]\w*)\s*(?::\s*([A-Za-z_]\w*))?\s*=\s*new\s+([A-Za-z_]\w*)\s*(?:\(([^\n)]*)\))?/g)){
         if(!classes.has(m[3])){if(!m[3].includes('.'))fail(`Unknown class '${m[3]}'.`,m.index);continue;}
-        knownVariables.set(m[1],m[3]);checkCall(`${m[3]} constructor`,classes.get(m[3]).ctor||[],m[4]===undefined?'':source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index);
+        knownVariables.set(m[1],m[3]);checkCall(`${m[3]} constructor`,classes.get(m[3]).ctor||[],m[4]===undefined?'':source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index+m[0].indexOf('new'));
       }
       for(const m of masked.matchAll(/\blocal\s+(\w+)\s*:\s*(\w+)\b/g)){if(classes.has(m[2])&&!knownVariables.has(m[1])) knownVariables.set(m[1],m[2]);}
       // Lexically scoped class inference: a nested `local p = new Child()` must
@@ -2652,14 +2942,14 @@ local part = message[1:7]`;
       };
       const checkMember=(owner,delimiter,member,args,offset)=>{
         if(enums.has(owner)){if(!enums.get(owner).has(member))fail(`Enum '${owner}' has no member '${member}'.`,offset);return;}
-        if(namespaces.has(owner)){if(!namespaces.get(owner).has(member))fail(`Namespace '${owner}' has no exported member '${member}'.`,offset);return;}
+        if(namespaces.has(owner)){const item=namespaces.get(owner).get(member);if(!item)fail(`Namespace '${owner}' has no exported member '${member}'.`,offset);if(args!==undefined && item.kind==='function')checkCall(`${owner}.${member}`,item.params,args,offset);return;}
         let cls=resolveTypedOwner(owner,offset),isStatic=false;
         if(classes.has(owner)){cls=owner;isStatic=true;}
         if(owner==='self'&&!cls){const surrounding=[...classes.entries()].find(([,c])=>offset>c.start&&offset<c.end);if(surrounding)cls=surrounding[0];}
         if(!cls)return;
         const found=findMember(cls,member,isStatic);
         if(!found){
-          const tail=masked.slice(offset + owner.length).match(/^\s*[.:]\s*[A-Za-z_]\w*\s*(=|\+=|-=)/);
+          const tail=masked.slice(offset + member.length).match(/^\s*(=|\+=|-=)/);
           if(owner==='self' && tail)return;
           fail(`${isStatic?'Class':'Instance'} '${cls}' has no ${delimiter===':'?'method':'member'} '${member}'.`,offset);
         }
@@ -2673,12 +2963,12 @@ local part = message[1:7]`;
         if(/\bfunction\s*$/.test(prefix)) continue;
         const openAt=m.index+m[0].lastIndexOf('(');
         const closeAt=findMatchingParen(source,openAt,masked);
-        checkMember(m[1],m[2],m[3],source.slice(openAt+1,closeAt),m.index);
+        checkMember(m[1],m[2],m[3],source.slice(openAt+1,closeAt),m.index+m[0].lastIndexOf(m[3]));
       }
       for(const m of safeMasked.matchAll(/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\b/g)){
         const prefix=masked.slice(masked.lastIndexOf('\n',m.index-1)+1,m.index);
         if(/\bfunction\s*$/.test(prefix))continue;
-        checkMember(m[1],m[2],m[3],undefined,m.index);
+        checkMember(m[1],m[2],m[3],undefined,m.index+m[0].lastIndexOf(m[3]));
       }
       for(const m of safeMasked.matchAll(/\b([A-Za-z_]\w*)\s*\(([^\n()]*)\)/g)){
         const name=m[1], offset=m.index;const before=masked.slice(Math.max(0,offset-32),offset);
@@ -2755,7 +3045,7 @@ local part = message[1:7]`;
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
       validateExpressionSyntax(source);
-      if (options?.SemanticCheck !== false) {validateClassContracts(source);validateScopedReferences(source);validateLauaSemantics(source);}
+      if (options?.SemanticCheck !== false) {validateClassContracts(source);validateScopedReferences(source);validateLauaSemantics(source);validateTypedSemantics(source);}
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact'].includes(style))throw new Error('Invalid Laua output style');
 
@@ -2796,7 +3086,6 @@ local part = message[1:7]`;
       }
       return style==='Compact' ? compactGeneratedOutput(output) : output;
     }
-
     function buildLauaSymbolIndex(source) {
       const symbols = {
         namespaces: {},
@@ -6242,7 +6531,12 @@ local part = message[1:7]`;
         }
       } catch (error) {
         const message=error?.message || String(error);
-        pushMarker(0,Math.min(Math.max(1,source.length),5),monaco.MarkerSeverity.Error,message,'syntax');
+        const reportedLine=Number(error?.line || /line (\d+)/.exec(message)?.[1] || 1);
+        const lineStart=source.split('\n').slice(0,reportedLine-1).reduce((n,row)=>n+row.length+1,0);
+        const at=Number.isInteger(error?.offset)?error.offset:lineStart;
+        const token=/^(?:[A-Za-z_]\w*|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d+|\S)/.exec(source.slice(at))?.[0] || '';
+        const end=Number.isInteger(error?.endOffset)?error.endOffset:Math.min(source.length,at+Math.max(1,token.length));
+        pushMarker(at,end,monaco.MarkerSeverity.Error,message,'syntax',error?.code || 'CompilerPreflight');
       }
       for (const classInfo of Object.values(symbols.classes)) {
         const parent = classInfo.base && symbols.classes[classInfo.base];
@@ -7901,7 +8195,7 @@ local part = message[1:7]`;
       function exportStudioSourceProject() {
         try {
           const blob=makeStudioSourceRbxmx();
-          downloadProjectBlob('Laua-v3.39-editable-studio.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.40-editable-studio.rbxmx',blob);
           projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -7999,7 +8293,7 @@ local part = message[1:7]`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.39-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.40-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
