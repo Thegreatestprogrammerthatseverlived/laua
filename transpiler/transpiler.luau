@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.39"}
+local Transpiler = {Version = "3.40"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -3291,6 +3291,193 @@ local function validateLauaSemantics(source: string)
     end
 end
 
+-- v3.40 conservative native checks. Do not invent types for dynamic expressions.
+local function validateTypedSemantics(source: string)
+    if source:find("local __laua", 1, true) then return end
+    local masked = maskNonCode(source)
+    local lines = splitLines(masked)
+    local types: {[string]: string} = {}
+    local instances: {[string]: string} = {}
+    local classFields: {[string]: {[string]: string}} = {}
+    local classBases: {[string]: string} = {}
+    local parameters: {[string]: string} = {}
+    local functions: {[string]: {Params: string, Result: string}} = {}
+    local aliases: {[string]: string} = {}
+    local function fail(message: string, at: number)
+        local line = 1
+        local column = 1
+        for index = 1, math.max(0, at - 1) do
+            if source:sub(index, index) == "\n" then line += 1; column = 1 else column += 1 end
+        end
+        error(`Laua semantic error (line {line}, column {column}): {message}`, 2)
+    end
+    local function normalType(raw: string?): string
+        if not raw then return "any" end
+        local clean = trim(raw)
+        if aliases[clean] then return aliases[clean] end
+        if clean:match("^{[%a_][%w_]*}$") then return clean end
+        return clean
+    end
+    local function infer(raw: string): string
+        local clean = trim(raw)
+        if clean:match("^%-?%d[%d_]*%.?[%d_]*$") then return "number" end
+        if clean == "true" or clean == "false" then return "boolean" end
+        if clean == "nil" then return "nil" end
+        if clean:match("^[\"'`]") then return "string" end
+        if clean:match("^new%s+[%a_][%w_]*%s*%(") then return clean:match("^new%s+([%a_][%w_]*)") or "any" end
+        if clean:match("^%b{}$") then return "table" end
+        if clean:match("^[%a_][%w_]*$") then return types[clean] or parameters[clean] or instances[clean] or "any" end
+        local fname = clean:match("^([%a_][%w_]*)%s*%(")
+        if fname and functions[fname] then return functions[fname].Result end
+        local owner, field = clean:match("^([%a_][%w_]*)%.([%a_][%w_]*)$")
+        if owner and field then
+            local className = instances[owner]
+            local seen = {}
+            while className and not seen[className] do
+                seen[className] = true
+                if classFields[className] and classFields[className][field] then return classFields[className][field] end
+                className = classBases[className]
+            end
+        end
+        return "any"
+    end
+    local function compatible(actual: string, expected: string): boolean
+        if actual == "any" or expected == "any" or actual == expected then return true end
+        if expected:sub(-1) == "?" and (actual == "nil" or actual == expected:sub(1, -2)) then return true end
+        if actual == "table" and expected:sub(1, 1) == "{" then return true end
+        return false
+    end
+    local function check(actual: string, expected: string, at: number, context: string)
+        if compatible(actual, expected) then return end
+        fail(`{context} expects {expected}, received {actual}.`, at)
+    end
+    -- Register type names, class fields, and return signatures before checking uses.
+    for _, line in lines do
+        local code = trim(line.Text)
+        local alias, primitive = code:match("^type%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*%??)%s*$")
+        if alias and primitive then aliases[alias] = primitive end
+        local classname, base = code:match("^class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_]*)%s*$")
+        if not classname then classname, base = code:match("^final%s+class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_]*)%s*$") end
+        if not classname then classname, base = code:match("^abstract%s+class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_]*)%s*$") end
+        if not classname then classname = code:match("^class%s+([%a_][%w_]*)%s*$") end
+        if not classname then classname = code:match("^final%s+class%s+([%a_][%w_]*)%s*$") end
+        if not classname then classname = code:match("^abstract%s+class%s+([%a_][%w_]*)%s*$") end
+        if classname then
+            classFields[classname] = classFields[classname] or {}
+            if base then classBases[classname] = base end
+            local ending = findBlock(source, line.Start, lines)
+            for _, child in lines do
+                if child.Start <= line.Start or child.Start >= ending.Start then continue end
+                local row = trim(child.Text)
+                local field, annotation = row:match("^([%a_][%w_]*)%s*:%s*([%a_][%w_]*%??)%s*=")
+                if field and annotation then classFields[classname][field] = normalType(annotation) end
+            end
+        end
+        local fn, args, result = code:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*([%a_][%w_]*%??)")
+        if not fn then fn, args = code:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+        if not fn then fn, args, result = code:match("^local%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*([%a_][%w_]*%??)") end
+        if not fn then fn, args = code:match("^local%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+        if fn and args then functions[fn] = {Params = args, Result = normalType(result)} end
+    end
+    local activeReturn: string? = nil
+    local activeName: string? = nil
+    local activeStart = 0
+    local returned = false
+    local sawReturnAny = false
+    local hasElse = false
+    local nested = 0
+    local functionStack: {any} = {}
+    for _, line in lines do
+        local code = trim(line.Text)
+        if code == "" then continue end
+        local fn, args, result = code:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*([%a_][%w_]*%??)")
+        if not fn then fn, args, result = code:match("^local%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*([%a_][%w_]*%??)") end
+        if not fn then fn, args = code:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+        if not fn then fn, args = code:match("^local%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+        if fn and args then
+            table.insert(functionStack, {Result = activeReturn, Name = activeName, Start = activeStart, Returned = returned, SawReturn = sawReturnAny, HasElse = hasElse, Depth = nested, Parameters = parameters})
+            activeReturn = normalType(result)
+            activeName = fn
+            activeStart = line.Start
+            returned = false
+            sawReturnAny = false
+            hasElse = false
+            nested = 0
+            parameters = {}
+            for param, annotation in args:gmatch("([%a_][%w_]*)%s*:%s*([%a_][%w_]*%??)") do parameters[param] = normalType(annotation) end
+        elseif activeReturn and code:match("^end%s*$") then
+            if nested > 0 then
+                nested -= 1
+            else
+                if not returned and not (sawReturnAny and hasElse) and activeReturn ~= "any" and activeReturn ~= "nil" then
+                    fail(`Function '{activeName}' may finish without returning {activeReturn}.`, line.Start)
+                end
+                local previous = table.remove(functionStack)
+                if previous then
+                    activeReturn, activeName, activeStart, returned, sawReturnAny, hasElse, nested, parameters = previous.Result, previous.Name, previous.Start, previous.Returned, previous.SawReturn, previous.HasElse, previous.Depth, previous.Parameters
+                else
+                    activeReturn = nil
+                end
+            end
+        elseif activeReturn and code:match("^if%s+.+%sthen%s+return%s+.+%selse%s+return%s+.+%send%s*$") then
+            returned = true; sawReturnAny = true; hasElse = true
+        elseif activeReturn and (code:match("^if%s+.*%sthen%s*$") or code:match("^for%s+.*%sdo%s*$") or code:match("^while%s+.*%sdo%s*$")) then
+            nested += 1
+        end
+        if activeReturn and code:match("^else%s*$") then hasElse = true end
+        local localName, annotation, initial = code:match("^local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*%??)%s*=%s*(.+)$")
+        if localName and annotation then
+            local typed = normalType(annotation)
+            local actual = infer(source:sub(line.Start, line.Finish):match("=%s*(.-)%s*$") or initial)
+            check(actual, typed, line.Start, "Assignment")
+            types[localName] = typed
+            if classFields[typed] then instances[localName] = typed end
+        else
+            local inferredName, inferredClass = code:match("^local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)")
+            if inferredName and inferredClass and classFields[inferredClass] then instances[inferredName] = inferredClass end
+            local name, expression = code:match("^local%s+([%a_][%w_]*)%s*=%s*(.+)$")
+            if name and expression then types[name] = infer(source:sub(line.Start, line.Finish):match("=%s*(.-)%s*$") or expression) end
+        end
+        local owner, member, value = code:match("^([%a_][%w_]*)%.([%a_][%w_]*)%s*=%s*(.+)$")
+        if owner and member and value then
+            local className = instances[owner]
+            local seen = {}
+            while className and not seen[className] do
+                seen[className] = true
+                local fieldType = classFields[className] and classFields[className][member]
+                if fieldType then
+                    local actual = source:sub(line.Start, line.Finish):match("=%s*(.-)%s*$") or value
+                    check(infer(actual), fieldType, line.Start, "Assignment")
+                    break
+                end
+                className = classBases[className]
+            end
+        end
+        local assigned, operator, rhs = code:match("^([%a_][%w_]*)%s*([%+%-%*/])=%s*(.+)$")
+        if assigned and operator and rhs then
+            check(types[assigned] or parameters[assigned] or "any", "number", line.Start, "Left operand")
+            local actual = source:sub(line.Start, line.Finish):match("=%s*(.-)%s*$") or rhs
+            check(infer(actual), "number", line.Start, "Right operand")
+        else
+            local assignedName, assignedValue = code:match("^([%a_][%w_]*)%s*=%s*(.+)$")
+            if assignedName and assignedValue then
+                local expected = parameters[assignedName] or types[assignedName]
+                if expected then
+                    local actual = source:sub(line.Start, line.Finish):match("=%s*(.-)%s*$") or assignedValue
+                    check(infer(actual), expected, line.Start, "Assignment")
+                end
+            end
+        end
+        local ret = code:match("^return%s+(.+)$")
+        if activeReturn and ret then
+            local original = trim(source:sub(line.Start, line.Finish):match("return%s+(.+)$") or ret)
+            check(infer(original), activeReturn, line.Start, "Return")
+            sawReturnAny = true
+            if nested == 0 then returned = true end
+        end
+    end
+end
+
 function Transpiler.Transpile(source: string, options: any?): string
     assert(type(source) == "string", "Expected Laua source string")
     local mode = type(options) == "table" and options.Mode or "Development"
@@ -3302,6 +3489,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     if type(options) ~= "table" or options.SemanticCheck ~= false then
         validateClassContracts(source)
         validateLauaSemantics(source)
+        validateTypedSemantics(source)
     end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
