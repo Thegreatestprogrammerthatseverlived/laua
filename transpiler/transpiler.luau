@@ -1,5 +1,4 @@
---!native
-local Transpiler = {Version = "3.32"}
+local Transpiler = {Version = "3.34"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -661,7 +660,8 @@ local function transpileNew(source: string): string
         if not start then break end
         local rest = source:sub(start + 3)
         local whitespace, className = rest:match("^(%s+)([%a_][%w_%.]*)")
-        if not className then error("Expected class name after 'new'") end
+        -- `new` may be a normal table key or variable; transform only `new Class`.
+        if not className then cursor = start + 3; continue end
         local after = start + 3 + #whitespace + #className
         local suffix = source:sub(after)
         table.insert(output, source:sub(last, start - 1))
@@ -1514,7 +1514,7 @@ end
 
 local function expressionLeft(masked: string, endAt: number): number?
     local cursor = endAt
-    while cursor > 0 and masked:sub(cursor, cursor):match("[ \t]") do cursor -= 1 end
+    while cursor > 0 and masked:sub(cursor, cursor):match("%s") do cursor -= 1 end
     if cursor == 0 then return nil end
     local endChar = masked:sub(cursor, cursor)
     if endChar == ")" or endChar == "]" then
@@ -1721,7 +1721,9 @@ local function transpileCoalescing(source: string): (string, boolean)
         local lines = splitLines(source)
         local eligible = true
         for _, line in lines do
-            if line.Text:find("??", 1, true) and not line.Text:match("^[ \t]*local%s+[%a_][%w_]*%s*=%s*[%a_][%w_]*%s*%?%?%s*[%a_][%w_]*[ \t]*$") then
+            if line.Text:find("??", 1, true)
+               and not line.Text:match("^[ \t]*local%s+[%a_][%w_]*%s*=%s*[%a_][%w_]*%s*%?%?%s*[%a_][%w_]*[ \t]*$")
+               and not line.Text:match("^[ \t]*local%s+[%a_][%w_]*%s*=%s*[%a_][%w_]*%s*%?%?%s*%d+%.?%d*[ \t]*$") then
                 eligible = false
                 break
             end
@@ -1748,6 +1750,14 @@ local function transpileCoalescing(source: string): (string, boolean)
         if not pos then return source, changed end
         local left = expressionLeft(masked, pos - 1)
         local right = expressionRight(source, pos + 2)
+        local preceding = masked:sub(1, pos - 1)
+        local lineStart = (preceding:match(".*()\n") or 0) + 1
+        local continuation = trim(masked:sub(lineStart, pos - 1)) == ""
+        if continuation and right then
+            local endAt = masked:find("\n", pos + 2, true) or (#masked + 1)
+            local visible = masked:sub(pos + 2, endAt - 1):gsub("%s+$", "")
+            if visible ~= "" then right = pos + 1 + #visible end
+        end
         if not left or not right then error("Nil coalescing expects value ?? fallback") end
         local before = trim(masked:sub(math.max(1, left - 8), left - 1))
         local after = trim(masked:sub(right + 1):match("^[^\n]*") or "")
@@ -1759,7 +1769,17 @@ local function transpileCoalescing(source: string): (string, boolean)
         end
         local a = trim(source:sub(left, pos - 1))
         local b = trim(source:sub(pos + 2, right))
-        local replacement = `__lauaCore.coalesce({a}, function() return {b} end)`
+        -- Simple identifiers can use a lazy Luau if-expression without
+        -- allocating a closure or loading the coalesce runtime helper.
+        -- Keep the helper for complex left operands to evaluate them once.
+        local replacement: string
+        if b == "nil" and a:match("^[%a_][%w_]*$") then
+            replacement = a
+        elseif a:match("^[%a_][%w_]*$") and (b:match("^[%a_][%w_]*$") or (b:match("^%d[%d_]*$") or b:match("^%d[%d_]*%.%d[%d_]*$")) or b:match("^0[xX][%da-fA-F_]+$") or b:match("^0[bB][01_]+$")) and a ~= "true" and a ~= "false" and a ~= "nil" then
+            replacement = `(if {a} ~= nil then {a} else {b})`
+        else
+            replacement = `__lauaCore.coalesce({a}, function() return {b} end)`
+        end
         source = replaceRange(source, left, right, replacement)
         masked = replaceRange(masked, left, right, maskNonCode(replacement))
         changed = true
@@ -1776,11 +1796,12 @@ local function transpileIsOperator(source: string): string
         if not first then return source end
         local before = masked:sub(first - 1, first - 1)
         local linePrefix = masked:sub((masked:sub(1,first-1):match('.*()\n') or 0) + 1, first-1)
-        if before == '.' or before == ':' or linePrefix:match('function%s+$') then position = last + 1; continue end
-        local left = expressionLeft(masked, first - 1)
+        if before == '.' or before == ':' or linePrefix:match('function%s+$') or linePrefix:match('local%s+$') or linePrefix:match('const%s+$') then position = last + 1; continue end
         local rightText = masked:sub(last + 1)
         local spacing, className = rightText:match('^([ \t]+)([%a_][%w_]*)')
-        if not left or not className then error('is expects: value is ClassName') end
+        if not className or className == "then" or className == "and" or className == "or" or className == "end" then position = last + 1; continue end
+        local left = expressionLeft(masked, first - 1)
+        if not left then position = last + 1; continue end
         local after = last + #spacing + #className
         local beforeValue = trim(source:sub(left, first - 1))
         source = replaceRange(source, left, after, '__lauaCore.is(' .. beforeValue .. ', ' .. className .. ')')
@@ -1826,75 +1847,109 @@ end
 
 -- Memoized functions use the bundled LauaCore runtime.
 local function transpileMemo(source: string): string
+    local position = 1
     while true do
         local masked = maskNonCode(source)
-        local first = masked:find('%f[%w]memo%f[%W]')
-        while first and (masked:sub(first-1,first-1) == '.' or masked:sub(first-1,first-1) == ':') do
-            first = masked:find('%f[%w]memo%f[%W]', first+4)
-        end
+        local first = masked:find('%f[%w]memo%f[%W]', position)
         if not first then return source end
         local lineStart = (source:sub(1, first-1):match('.*()\n') or 0) + 1
-        if trim(source:sub(lineStart, first-1)) ~= '' then error('memo must start a declaration') end
+        local previous = masked:sub(first-1, first-1)
         local headerEnd = source:find('\n', first, true)
-        if not headerEnd then error('memo requires a function body') end
+        if previous == '.' or previous == ':' or trim(source:sub(lineStart, first-1)) ~= '' or not headerEnd then
+            position = first + 4
+            continue
+        end
         local header = trim(source:sub(first, headerEnd-1))
         local funcName = header:match('^memo%s+function%s+([%a_][%w_]*)%s*%(')
-        local isLocal = false
-        if not funcName then
-            funcName = header:match('^memo%s+local%s+function%s+([%a_][%w_]*)%s*%(')
-            isLocal = true
-        end
-        if not funcName then error('memo supports named functions only: memo function Name(...)') end
+            or header:match('^memo%s+local%s+function%s+([%a_][%w_]*)%s*%(')
+        if not funcName then position = first + 4; continue end
         local standardHeader = header:gsub('^memo%s+', '', 1)
         local rewritten = source:sub(1, first-1) .. standardHeader .. source:sub(headerEnd)
         local finish = findBlock(rewritten, first)
         local indent = source:sub(lineStart, first-1)
         local wrapper = '\n' .. indent .. funcName .. ' = __lauaCore.memo(' .. funcName .. ')'
         source = rewritten:sub(1, finish.Finish) .. wrapper .. rewritten:sub(finish.Finish + 1)
+        position = first + #funcName
     end
 end
 
--- Default parameters: nil triggers the default, false is retained.
+-- Parameter defaults must split only on top-level commas, not table/call/type commas.
+local function splitDefaultParameters(params: string): {string}
+    local masked = maskNonCode(params)
+    local pieces = {}
+    local stack = {}
+    local start = 1
+    local typeArguments = 0
+    local inType = false
+    for i = 1, #masked do
+        local char = masked:sub(i, i)
+        if char == "(" then table.insert(stack, ")")
+        elseif char == "{" then table.insert(stack, "}")
+        elseif char == "[" then table.insert(stack, "]")
+        elseif char == ")" or char == "}" or char == "]" then
+            if table.remove(stack) ~= char then error("Unbalanced default parameter expression") end
+        elseif #stack == 0 then
+            if char == ":" and typeArguments == 0 then inType = true
+            elseif char == "=" and typeArguments == 0 then inType = false
+            elseif char == "<" and inType then typeArguments += 1
+            elseif char == ">" and typeArguments > 0 then typeArguments -= 1
+            elseif char == "," and typeArguments == 0 then
+                table.insert(pieces, params:sub(start, i - 1))
+                start = i + 1
+                inType = false
+            end
+        end
+    end
+    if #stack > 0 or typeArguments ~= 0 then error("Unclosed default parameter expression") end
+    table.insert(pieces, params:sub(start))
+    return pieces
+end
+
 local function transpileParameterDefaults(source: string): string
     local rows = {}
     for _, row in splitLines(source) do
         local raw = row.Text
-        if not raw:find("function", 1, true) or not raw:find("=", 1, true) then
-            table.insert(rows, raw)
-            continue
-        end
+        if not raw:find("function", 1, true) or not raw:find("=", 1, true) then table.insert(rows, raw); continue end
         local masked = maskNonCode(raw)
         local openAt = masked:find('%f[%w]function%f[%W]')
-        if openAt then
-            local parenAt = masked:find('(', openAt, true)
-            local closeAt = parenAt and masked:find(')', parenAt, true)
-            if parenAt and closeAt then
-                local params = raw:sub(parenAt+1,closeAt-1)
-                if params:find('=',1,true) then
-                    local parsed, initializers = {}, {}
-                    for piece in (params .. ','):gmatch('(.-),') do
-                        local left, default = piece:match('^%s*(.-)%s*=%s*(.-)%s*$')
-                        if left then
-                            local var = left:match('^([%a_][%w_]*)')
-                            if not var then error('Invalid default parameter') end
-                            local inferred = default:match("^%-?%d+%.?%d*$") and "number?" or default:match('^".*"$') and "string?" or (default == "true" or default == "false") and "boolean?" or "any"
-                            table.insert(parsed, left:find(":", 1, true) and trim(left) or (var .. ": " .. inferred))
-                            table.insert(initializers, ('if %s == nil then %s = %s end'):format(var,var,default))
-                        else
-                            table.insert(parsed, trim(piece))
-                        end
-                    end
-                    raw = raw:sub(1,parenAt) .. table.concat(parsed, ', ') .. raw:sub(closeAt)
-                    table.insert(rows,raw)
-                    local indent = (raw:match('^[ \t]*') or '') .. '    '
-                    for _, statement in initializers do table.insert(rows,indent .. statement) end
-                    continue
-                end
+        if not openAt then table.insert(rows, raw); continue end
+        local parenAt = masked:find('(', openAt, true)
+        if not parenAt then table.insert(rows, raw); continue end
+        local closeAt = nil
+        local depth = 0
+        for i = parenAt, #masked do
+            local char = masked:sub(i, i)
+            if char == "(" then depth += 1
+            elseif char == ")" then
+                depth -= 1
+                if depth == 0 then closeAt = i; break end
             end
         end
-        table.insert(rows,raw)
+        if not closeAt then error("Unclosed function parameter list") end
+        local params = raw:sub(parenAt + 1, closeAt - 1)
+        if not params:find('=', 1, true) then table.insert(rows, raw); continue end
+        local parsed, initializers = {}, {}
+        for _, part in splitDefaultParameters(params) do
+            local code = maskNonCode(part)
+            local equals = code:find("=", 1, true)
+            if not equals then table.insert(parsed, trim(part)); continue end
+            local original = trim(part:sub(1, equals - 1))
+            local default = trim(part:sub(equals + 1))
+            local name, annotation = original:match('^([%a_][%w_]*)%s*:%s*(.+)$')
+            if not name then name = original:match('^([%a_][%w_]*)$') end
+            if not name or default == "" then error('Invalid default parameter') end
+            local inferred = default:match("^%-?%d+%.?%d*$") and "number?"
+                or (default:match('^".*"$') or default:match("^'.*'$") or default:match('^`.*`$')) and "string?"
+                or (default == "true" or default == "false") and "boolean?" or "any"
+            table.insert(parsed, annotation and original or (name .. ": " .. inferred))
+            table.insert(initializers, (`if {name} == nil then {name} = {default} end`))
+        end
+        if #initializers == 0 then table.insert(rows, raw); continue end
+        table.insert(rows, raw:sub(1, parenAt) .. table.concat(parsed, ', ') .. raw:sub(closeAt))
+        local indent = (raw:match('^[ \t]*') or '') .. '    '
+        for _, statement in initializers do table.insert(rows, indent .. statement) end
     end
-    return table.concat(rows,'\n')
+    return table.concat(rows, "\n")
 end
 
 -- Compile-time branch selection; only these explicit directives have special meaning.
@@ -2233,7 +2288,11 @@ local function transpileAwaits(source: string): (string, number)
         local before = masked:sub(pos - 1, pos - 1)
         local after = masked:sub(pos + 5, pos + 5)
         if not before:match("[%w_%.:]") and not after:match("[%w_]") then
-            table.insert(occurrences, pos)
+            local rest = masked:sub(pos + 5)
+            local candidate = rest:match("^[ \t]*([%a_][%w_]*)")
+            if rest:match("^[ \t]*%(") or (candidate and candidate ~= "local" and candidate ~= "const" and candidate ~= "if" and candidate ~= "then" and candidate ~= "end" and candidate ~= "else" and candidate ~= "return") then
+                table.insert(occurrences, pos)
+            end
         end
         from = pos + 5
     end
