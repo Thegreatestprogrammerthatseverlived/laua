@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.34"}
+local Transpiler = {Version = "3.38"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -463,77 +463,218 @@ local function trim(value: string): string
     return (value:match("^%s*(.-)%s*$") or "")
 end
 
-local function maskNonCode(source: string): string
-    if not source:find('"', 1, true) and not source:find("'", 1, true) and not source:find("`", 1, true) and not source:find("[", 1, true) and not source:find("--", 1, true) then return source end
-    local output = table.create(#source)
-    local position = 1
-    local quote = nil
-    local longClose = nil
-    local lineComment = false
-
-    while position <= #source do
-        local char = source:sub(position, position)
-        local nextChar = source:sub(position + 1, position + 1)
-
-        if longClose then
-            local closing = source:sub(position, position + #longClose - 1) == longClose
-            if closing then
-                for _ = 1, #longClose do output[#output + 1] = " " end
-                position += #longClose
-                longClose = nil
-            else
-                output[#output + 1] = char == "\n" and "\n" or " "
-                position += 1
-            end
-        elseif lineComment then
-            output[#output + 1] = char == "\n" and "\n" or " "
-            if char == "\n" then lineComment = false end
-            position += 1
-        elseif quote then
-            if char == "\\" and position < #source then
-                output[#output + 1] = " "
-                output[#output + 1] = " "
-                position += 2
-            else
-                output[#output + 1] = char == "\n" and "\n" or " "
-                if char == quote then quote = nil end
-                position += 1
-            end
-        elseif char == "-" and nextChar == "-" then
-            local equals = source:sub(position + 2, position + 2) == "[" and source:sub(position + 3):match("^(=*)%[") or nil
-            if equals then
-                local opening = 4 + #equals
-                for _ = 1, opening do output[#output + 1] = " " end
-                position += opening
-                longClose = "]" .. equals .. "]"
-            else
-                output[#output + 1] = " "
-                output[#output + 1] = " "
-                lineComment = true
-                position += 2
-            end
-        elseif char == '"' or char == "'" or char == "`" then
-            quote = char
-            output[#output + 1] = " "
-            position += 1
-        elseif char == "[" then
-            local equals = (nextChar == "[" or nextChar == "=") and source:sub(position + 1):match("^(=*)%[") or nil
-            if equals then
-                local opening = 2 + #equals
-                for _ = 1, opening do output[#output + 1] = " " end
-                position += opening
-                longClose = "]" .. equals .. "]"
-            else
-                output[#output + 1] = char
-                position += 1
-            end
-        else
-            output[#output + 1] = char
-            position += 1
+local function scanLauaSource(source: string, strict: boolean?, collectTokens: boolean?)
+    local tokens = {}
+    local literals = {}
+    local pieces = {}
+    local index = 1
+    local line = 1
+    local copied = 1
+    local length = #source
+    local function fail(message: string, at: number, tokenLine: number)
+        if not strict then return end
+        error("Laua syntax error (line " .. tostring(tokenLine) .. "): " .. message, 0)
+    end
+    local function char(at: number): string
+        return source:sub(at, at)
+    end
+    local function advance()
+        if char(index) == "\n" then line += 1 end
+        index += 1
+    end
+    local function jump(finish: number)
+        while index < finish do
+            local nextLine = source:find("\n", index, true)
+            if not nextLine or nextLine >= finish then break end
+            line += 1
+            index = nextLine + 1
+        end
+        index = finish
+    end
+    local function longOpening(at: number)
+        if char(at) ~= "[" then return nil end
+        local finish = at + 1
+        while char(finish) == "=" do finish += 1 end
+        if char(finish) ~= "[" then return nil end
+        return {finish = finish + 1, close = "]" .. string.rep("=", finish - at - 1) .. "]"}
+    end
+    local function readLong(opening, at: number, tokenLine: number, comment: boolean)
+        local closing = source:find(opening.close, opening.finish, true)
+        if not closing then fail(comment and "Unterminated long comment." or "Unterminated long string.", at, tokenLine) end
+        jump(closing and closing + #opening.close or length + 1)
+    end
+    local function escape()
+        advance()
+        if index > length then return end
+        local ch = char(index)
+        advance()
+        if ch == "z" then
+            while index <= length and char(index):match("%s") do advance() end
+        elseif ch == "\r" and char(index) == "\n" then
+            advance()
+        elseif ch == "u" and char(index) == "{" then
+            advance()
+            while index <= length and char(index):match("[%da-fA-F]") do advance() end
+            if char(index) == "}" then advance() end
         end
     end
+    local function readQuoted()
+        local at = index
+        local tokenLine = line
+        local quote = char(index)
+        advance()
+        while index <= length do
+            local ch = char(index)
+            if ch == "\\" then escape() continue end
+            if ch == quote then advance() return end
+            if ch == "\n" or ch == "\r" then fail("Unescaped newline in string literal.", at, tokenLine) end
+            advance()
+        end
+        fail("Unterminated string literal.", at, tokenLine)
+    end
+    local function readComment()
+        local at = index
+        local tokenLine = line
+        local opening = longOpening(index + 2)
+        if opening then
+            readLong(opening, at, tokenLine, true)
+        else
+            jump(source:find("\n", index, true) or length + 1)
+        end
+    end
+    local function readTemplate()
+        local stack = {{kind = "text", at = index, line = line, depth = 0}}
+        advance()
+        while index <= length and #stack > 0 do
+            local frame = stack[#stack]
+            local ch = char(index)
+            if frame.kind == "text" then
+                if ch == "\n" or ch == "\r" then fail("Unescaped newline in interpolated string.", frame.at, frame.line) end
+                if ch == "\\" then escape() continue end
+                if ch == "`" then table.remove(stack) advance() continue end
+                if ch == "{" then
+                    if char(index + 1) == "{" then fail("Double braces are not permitted in interpolated strings.", index, line) end
+                    table.insert(stack, {kind = "expression", depth = 1, at = index, line = line})
+                end
+                advance()
+            elseif source:sub(index, index + 1) == "--" then
+                readComment()
+            elseif ch == '"' or ch == "'" then
+                readQuoted()
+            elseif ch == "`" then
+                table.insert(stack, {kind = "text", at = index, line = line, depth = 0})
+                advance()
+            elseif ch == "[" and longOpening(index) then
+                readLong(longOpening(index), index, line, false)
+            else
+                if ch == "{" then frame.depth += 1 end
+                if ch == "}" then
+                    frame.depth -= 1
+                    if frame.depth == 0 then table.remove(stack) end
+                end
+                advance()
+            end
+        end
+        if #stack > 0 then
+            local frame = stack[#stack]
+            fail(frame.kind == "text" and "Unterminated interpolated string." or "Unclosed interpolation.", frame.at, frame.line)
+        end
+    end
+    local function readNumber()
+        local prefix = source:sub(index, index + 1):lower()
+        if prefix == "0x" and char(index + 2):match("[%da-fA-F_]") then
+            index += 2
+            while index <= length and char(index):match("[%da-fA-F_]") do index += 1 end
+        elseif prefix == "0b" and char(index + 2):match("[01_]") then
+            index += 2
+            while index <= length and char(index):match("[01_]") do index += 1 end
+        else
+            while index <= length and char(index):match("[%d_]") do index += 1 end
+            if char(index) == "." and char(index + 1) ~= "." then
+                index += 1
+                while index <= length and char(index):match("[%d_]") do index += 1 end
+            end
+            if char(index):lower() == "e" then
+                local finish = index + 1
+                if char(finish) == "+" or char(finish) == "-" then finish += 1 end
+                if char(finish):match("%d") then
+                    index = finish + 1
+                    while index <= length and char(index):match("[%d_]") do index += 1 end
+                end
+            end
+        end
+    end
+    local multiOperators = {"...", "??=", "..=", "//=", "??", "?.", "|>", "!=", "==", "~=", "<=", ">=", "=>", "->", "::", "+=", "-=", "*=", "/=", "%=", "^=", "..", "//"}
+    while index <= length do
+        local at = index
+        local tokenLine = line
+        local ch = char(index)
+        local kind = nil
+        if source:sub(index, index + 1) == "--" then
+            readComment()
+            kind = "comment"
+        elseif ch == '"' or ch == "'" then
+            readQuoted()
+            kind = "literal"
+        elseif ch == "`" then
+            readTemplate()
+            kind = "literal"
+        elseif ch == "[" then
+            local opening = longOpening(index)
+            if opening then
+                readLong(opening, at, tokenLine, false)
+                kind = "literal"
+            end
+        end
+        if kind then
+            table.insert(pieces, source:sub(copied, at - 1))
+            local masked = source:sub(at, index - 1):gsub("[^\r\n]", " ")
+            table.insert(pieces, masked)
+            copied = index
+            if kind == "literal" then
+                local token = {kind = kind, value = "<string>", at = at, finish = index, line = tokenLine, endLine = line, quote = ch}
+                table.insert(literals, token)
+                if collectTokens then table.insert(tokens, token) end
+            end
+            continue
+        end
+        if not collectTokens or ch:match("%s") then advance() continue end
+        if ch:match("[A-Za-z_]") then
+            kind = "word"
+            repeat index += 1 until index > length or not char(index):match("[A-Za-z0-9_]")
+        elseif ch:match("%d") or ch == "." and char(index + 1):match("%d") then
+            kind = "number"
+            readNumber()
+        else
+            kind = "symbol"
+            local operator = nil
+            for _, candidate in multiOperators do
+                if source:sub(index, index + #candidate - 1) == candidate then operator = candidate break end
+            end
+            index += operator and #operator or 1
+        end
+        table.insert(tokens, {kind = kind, value = source:sub(at, index - 1), at = at, finish = index, line = tokenLine, endLine = line})
+    end
+    table.insert(pieces, source:sub(copied))
+    return {masked = table.concat(pieces), tokens = tokens, literals = literals}
+end
 
-    return table.concat(output)
+local function maskNonCode(source: string): string
+    if not source:find('["\'`%[]') and not source:find("--", 1, true) then return source end
+    return scanLauaSource(source).masked
+end
+
+local function trimGeneratedWhitespace(source: string): string
+    if not source:find("[ \t]\n") and not source:find("[ \t]$") then return source end
+    local literals = scanLauaSource(source).literals
+    local cursor = 1
+    local result = source:gsub("()([ \t]+)(\n?)", function(at, space, newline)
+        if newline == "" and at + #space <= #source then return space end
+        while cursor <= #literals and literals[cursor].finish <= at do cursor += 1 end
+        if cursor <= #literals and literals[cursor].at <= at then return space .. newline end
+        return newline
+    end)
+    return result
 end
 
 local function splitLines(source: string)
@@ -618,7 +759,17 @@ local function findKeyword(source: string, keyword: string, precomputedMask: str
         if not first then return nil end
         local before = masked:sub(first - 1, first - 1)
         local after = masked:sub(last + 1, last + 1)
-        if not before:match("[%w_%.:]") and not after:match("[%w_]") then return first end
+        if not before:match("[%w_%.:]") and not after:match("[%w_]") then
+            if keyword == "enum" or keyword == "namespace" then
+                local lineStart = (masked:sub(1, first - 1):match(".*()\n") or 0) + 1
+                local prefix = trim(masked:sub(lineStart, first - 1))
+                local following = masked:sub(last + 1):match("^%s+([%a_][%w_]*)%s*\n")
+                if not following then following = masked:sub(last + 1):match("^%s+([%a_][%w_]*)%s*$") end
+                if following and (prefix == "" or keyword == "namespace" and prefix == "return") then return first end
+            else
+                return first
+            end
+        end
         start = last + 1
     end
 end
@@ -1197,11 +1348,20 @@ local function transpileNamespaces(source: string): string
         local body = source:sub(headerEnd + 1, closing.Start - 1)
         local output = {}
         local depth = 0
+        local view = scanLauaSource(body, false, true)
+        local tokenCursor = 1
         for _, line in splitLines(body) do
             local raw = line.Text
-            local code = trim(maskNonCode(raw))
-            local fn = depth == 0 and (code:match("^function%s+([%a_][%w_]*)%s*%b()%s*$") or code:match("^function%s+([%a_][%w_]*)%s*%b()%s*:%s*[%a_][%w_]*%s*$") or code:match("^async%s+function%s+([%a_][%w_]*)%s*%b()%s*$") or code:match("^async%s+function%s+([%a_][%w_]*)%s*%b()%s*:%s*[%a_][%w_]*%s*$")) or nil
-            local field = depth == 0 and code:match("^([%a_][%w_]*)%s*=%s*.+$") or nil
+            local code = trim(view.masked:sub(line.Start, line.Finish))
+            while tokenCursor <= #view.tokens and view.tokens[tokenCursor].at < line.Start do tokenCursor += 1 end
+            local head = view.tokens[tokenCursor]
+            local async = head and head.value == "async"
+            local fnToken = view.tokens[tokenCursor + (async and 1 or 0)]
+            local nameToken = view.tokens[tokenCursor + (async and 2 or 1)]
+            local afterName = view.tokens[tokenCursor + (async and 3 or 2)]
+            local fn = depth == 0 and head and head.at <= line.Finish and fnToken and fnToken.value == "function" and nameToken and nameToken.kind == "word" and afterName and (afterName.value == "(" or afterName.value == "<") and nameToken.value or nil
+            local nextToken = view.tokens[tokenCursor + 1]
+            local field = depth == 0 and head and head.at <= line.Finish and head.kind == "word" and nextToken and nextToken.value == "=" and head.value or nil
             if fn then
                 local newLine
                 if code:match("^async%s+function%s+") then
@@ -1220,13 +1380,15 @@ local function transpileNamespaces(source: string): string
             if code:match("^end%s*;?%s*$") or code:match("^until%s+") then depth -= 1 end
         end
         local transformed = normalized(transpileSource(table.concat(output, "\n")), "    ")
-        local expression = "(function()\n    local " .. name .. " = {}\n" .. transformed .. "\n    return " .. name .. "\nend)()"
         local lineStart = (source:sub(1, start - 1):match(".*()\n") or 0) + 1
         local prefix = trim(source:sub(lineStart, start - 1))
         if prefix == "return" then
-            source = source:sub(1, start - 1) .. expression .. source:sub(closing.Finish + 1)
+            local indentation = source:sub(lineStart, start - 1):match("^([ \t]*)") or ""
+            local block = "do\n    local " .. name .. " = {}\n" .. transformed .. "\n    return " .. name .. "\nend"
+            source = source:sub(1, lineStart - 1) .. indentation .. block .. source:sub(closing.Finish + 1)
         elseif prefix == "" then
-            source = source:sub(1, start - 1) .. `local {name} = {expression}` .. source:sub(closing.Finish + 1)
+            local block = "local " .. name .. " = {}\ndo\n" .. transformed .. "\nend"
+            source = source:sub(1, start - 1) .. block .. source:sub(closing.Finish + 1)
         else
             error("namespace must be standalone or directly returned")
         end
@@ -2634,6 +2796,363 @@ local function transpileEarlyReturn(source: string): string
     return table.concat(lines, "\n")
 end
 
+-- Semantic checks for statically known Laua declarations. Dynamic Roblox values,
+-- external imports and untyped tables remain governed by Luau at runtime.
+-- Token-based syntax validation. This guards source-level token relationships
+-- before the transformation passes; it does not replace Roblox's Luau parser.
+local function validateExpressionSyntax(source: string)
+    local tokens = scanLauaSource(source, true, true).tokens
+    local openers = {["("] = ")", ["["] = "]", ["{"] = "}"}
+    local stack = {}
+    local binary = {["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["//"] = true, ["%"] = true, ["^"] = true, [".."] = true, ["??"] = true, ["and"] = true, ["or"] = true, ["=="] = true, ["~="] = true, ["<"] = true, [">"] = true, ["<="] = true, [">="] = true}
+    local badAfter = {["*"] = true, ["/"] = true, ["//"] = true, ["%"] = true, ["^"] = true, [".."] = true, ["??"] = true, ["and"] = true, ["or"] = true, ["=="] = true, ["~="] = true, ["<"] = true, [">"] = true, ["<="] = true, [">="] = true, [","] = true, [";"] = true, [")"] = true, ["]"] = true, ["}"] = true, ["then"] = true, ["else"] = true, ["elseif"] = true, ["end"] = true}
+    local assignments = {["="] = true, ["+="] = true, ["-="] = true, ["*="] = true, ["/="] = true, ["//="] = true, ["%="] = true, ["^="] = true, ["..="] = true, ["??="] = true}
+    local function fail(message: string, token: any)
+        error("Laua syntax error (line " .. tostring(token.line) .. "): " .. message, 0)
+    end
+    for position, token in tokens do
+        local prev = tokens[position - 1]
+        local nextToken = tokens[position + 1]
+        local word = token.value
+        if openers[word] then
+            table.insert(stack, {closing = openers[word], opener = token})
+        elseif word == ")" or word == "]" or word == "}" then
+            local top = stack[#stack]
+            if not top or top.closing ~= word then fail("Unexpected '" .. word .. "'.", token) end
+            table.remove(stack)
+        end
+        if prev then
+            if word == "," and prev.value == "," then fail("Missing expression between commas.", token) end
+            if assignments[prev.value] and (word == "," or word == ";" or word == ")" or word == "]" or word == "}" or word == "end" or word == "else" or word == "elseif") then
+                fail("Missing expression after '" .. prev.value .. "'.", token)
+            end
+            if binary[prev.value] and badAfter[word] then fail("Missing operand after '" .. prev.value .. "'.", token) end
+            if assignments[word] and (prev.kind == "number" or prev.kind == "literal" or prev.value == "true" or prev.value == "false" or prev.value == "nil") then
+                fail("Assignment requires a variable or property.", token)
+            end
+            if (prev.value == ")" or prev.value == "]" or prev.value == "}") and (token.kind == "number" or token.kind == "literal" and (prev.value == "}" or token.quote == "`")) and prev.endLine == token.line then
+                fail("Missing separator after '" .. prev.value .. "'.", token)
+            end
+            if prev.kind == "number" and (token.kind == "number" or token.kind == "literal") and prev.endLine == token.line then
+                fail("Missing operator between values.", token)
+            end
+            if prev.kind == "literal" and (token.kind == "number" or token.kind == "literal") and prev.endLine == token.line then fail("Missing separator after string literal.", token) end
+            if prev.value == "=" and word == "*" then fail("Unexpected '*' after '='.", token) end
+        end
+        if word == "do" and prev and prev.value == "," then
+            for n = math.max(1, position - 12), position - 1 do
+                if tokens[n].value == "for" then fail("Missing range value before do.", token) end
+            end
+        end
+        if prev and prev.value == "then" and word == "else" then
+            local depth = 0
+            for n = position - 2, 1, -1 do
+                local value = tokens[n].value
+                if value == ")" or value == "]" or value == "}" then depth += 1 end
+                if value == "(" or value == "[" or value == "{" then depth -= 1 end
+                if depth == 0 and value == "if" then
+                    local before = tokens[n - 1] and tokens[n - 1].value
+                    if before == "=" or before == "return" or before == "(" or before == "," or before == "[" or before == "=>" or binary[before] then fail("Conditional expression is missing its then value.", token) end
+                    break
+                end
+            end
+        end
+    end
+    local top = stack[#stack]
+    if top then fail("Unclosed '" .. top.opener.value .. "'.", top.opener) end
+    local last = tokens[#tokens]
+    if last and (assignments[last.value] or binary[last.value]) then fail("Missing expression after '" .. last.value .. "'.", last) end
+end
+
+local function validateLauaSemantics(source: string)
+    if source:find("local __laua", 1, true) then return end
+    local masked = maskNonCode(source)
+    local classes: {[string]: any} = {}
+    local enums: {[string]: {[string]: boolean}} = {}
+    local namespaces: {[string]: {[string]: boolean}} = {}
+    local knownVariables: {[string]: string} = {}
+    local functions: {[string]: string} = {}
+    local globals = {}
+    for word in ("assert error getfenv getmetatable ipairs loadstring newproxy next pairs pcall print rawequal rawget rawlen rawset select setfenv setmetatable tonumber tostring type typeof unpack xpcall require warn tick time elapsedTime gcinfo settings UserSettings plugin delay spawn wait collectgarbage debug vector _G _VERSION shared game workspace script Enum Instance CFrame Vector2 Vector3 UDim UDim2 Color3 BrickColor NumberRange NumberSequence ColorSequence Rect Ray Region3 PhysicalProperties Random DateTime TweenInfo OverlapParams RaycastParams Axes Faces Font math table string task coroutine utf8 os bit32 buffer nil true false"):gmatch("[%a_][%w_]*") do
+        globals[word] = true
+    end
+    local function fail(message: string, at: number)
+        local line = 1
+        for _ in source:sub(1, at - 1):gmatch("\n") do line += 1 end
+        error(`Laua semantic error (line {line}): {message}`, 2)
+    end
+    local function paramParts(raw: string): {string}
+        local result = {}
+        local start, depth = 1, 0
+        for i = 1, #raw + 1 do
+            local ch = raw:sub(i, i)
+            if i > #raw or (ch == "," and depth == 0) then
+                local part = trim(raw:sub(start, i - 1))
+                if part ~= "" then table.insert(result, part) end
+                start = i + 1
+            elseif ch == "(" or ch == "{" or ch == "[" or ch == "<" then
+                depth += 1
+            elseif ch == ")" or ch == "}" or ch == "]" or ch == ">" then
+                depth = math.max(0, depth - 1)
+            end
+        end
+        return result
+    end
+    local function checkCall(label: string, params: string?, arguments: string, at: number)
+        if not params then return end
+        local declarations = paramParts(params)
+        local passed = paramParts(arguments)
+        local required, rest = 0, false
+        for _, part in declarations do
+            if part:find("...", 1, true) then rest = true end
+            if not part:find("=", 1, true) and not part:find("...", 1, true) then required += 1 end
+        end
+        if #passed < required or (not rest and #passed > #declarations) then
+            fail(`'{label}' expects {required} argument(s), received {#passed}.`, at)
+        end
+        for i, value in passed do
+            local annotation = declarations[i] and declarations[i]:match("^%s*[%a_][%w_]*%s*:%s*([%a_][%w_]*%??)")
+            if annotation then
+                local actual = value:match("^%d+%.?%d*$") and "number" or (value == "true" or value == "false") and "boolean" or value:match("^[\"'`]") and "string" or nil
+                if actual and (annotation == "number" or annotation == "string" or annotation == "boolean") and annotation ~= actual then
+                    fail(`Argument {i} of '{label}' expects {annotation}, received {actual}.`, at)
+                end
+            end
+        end
+    end
+    local lines = splitLines(masked)
+    for _, line in lines do
+        local code = trim(line.Text)
+        local name, base = code:match("^class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$")
+        if not name then name = code:match("^class%s+([%a_][%w_]*)%s*$") end
+        if name then
+            local ending = findBlock(source, line.Start, lines)
+            local info = {Base = base, Start = line.Start, Finish = ending.Finish, Instance = {}, Static = {}, Constructor = nil}
+            classes[name] = info
+            for _, row in lines do
+                if row.Start <= line.Start or row.Start >= ending.Start then continue end
+                local body = trim(row.Text)
+                local isStatic = body:match("^static%s+") ~= nil
+                local clean = body
+                for _ = 1, 7 do
+                    local prefix = clean:match("^([%a_]+)%s+")
+                    if prefix ~= "public" and prefix ~= "private" and prefix ~= "protected" and prefix ~= "static" and prefix ~= "override" and prefix ~= "abstract" and prefix ~= "final" then break end
+                    if prefix == "static" then isStatic = true end
+                    clean = trim(clean:sub(#prefix + 1))
+                end
+                for dynamicField in body:gmatch("self%.([%a_][%w_]*)%s*=") do
+                    if not info.Instance[dynamicField] then info.Instance[dynamicField] = {Kind = "field"} end
+                end
+                local ctor = clean:match("^constructor%s*%(([^)]*)%)")
+                if ctor then info.Constructor = ctor end
+                local methodName, params = clean:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)")
+                if not methodName then methodName, params = clean:match("^async%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+                if methodName then
+                    local target = isStatic and info.Static or info.Instance
+                    target[methodName] = {Kind = "method", Params = params}
+                else
+                    local signal, signalParams = clean:match("^signal%s+([%a_][%w_]*)%s*%(([^)]*)%)")
+                    if not signal then signal = clean:match("^signal%s+([%a_][%w_]*)") end
+                    local field = clean:match("^([%a_][%w_]*)%s*:%s*.+%s*=") or clean:match("^([%a_][%w_]*)%s*=")
+                    local member = signal or field
+                    if member then
+                        local target = isStatic and info.Static or info.Instance
+                        target[member] = {Kind = signal and "signal" or "field", Params = signal and signalParams or nil}
+                    end
+                end
+            end
+        end
+        local enumName = code:match("^enum%s+([%a_][%w_]*)%s*$")
+        if enumName then
+            local ending = findBlock(source, line.Start, lines)
+            local members = {}
+            for _, row in lines do
+                if row.Start > line.Start and row.Start < ending.Start then
+                    local member = trim(row.Text):match("^([%a_][%w_]*)%s*[=,]?")
+                    if member then members[member] = true end
+                end
+            end
+            enums[enumName] = members
+        end
+        local namespaceName = code:match("^namespace%s+([%a_][%w_]*)%s*$")
+        if namespaceName then
+            local ending = findBlock(source, line.Start, lines)
+            local members = {}
+            for _, row in lines do
+                if row.Start > line.Start and row.Start < ending.Start then
+                    local member = trim(row.Text):match("^function%s+([%a_][%w_]*)") or trim(row.Text):match("^([%a_][%w_]*)%s*=")
+                    if member then members[member] = true end
+                end
+            end
+            namespaces[namespaceName] = members
+        end
+        local func, params = code:match("^local%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)")
+        if not func then func, params = code:match("^local%s+function%s+([%a_][%w_]*)%s*%b<>%s*%(([^)]*)%)") end
+        if not func then func, params = code:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+        if not func then func, params = code:match("^function%s+([%a_][%w_]*)%s*%b<>%s*%(([^)]*)%)") end
+        if func then functions[func] = params end
+    end
+    local function memberOf(name: string, member: string, isStatic: boolean): any
+        local seen = {}
+        while name and not seen[name] do
+            seen[name] = true
+            local info = classes[name]
+            if not info then return nil end
+            local result = (isStatic and info.Static or info.Instance)[member]
+            if result then return result end
+            name = info.Base
+        end
+        return nil
+    end
+    for _, line in lines do
+        local code = line.Text
+        local name, className, arguments = code:match("local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)%s*%(([^)]*)%)")
+        if not name then name, className, arguments = code:match("local%s+([%a_][%w_]*)%s*:%s*[%a_][%w_]*%s*=%s*new%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
+        if name and className then
+            if not classes[className] then fail(`Unknown class '{className}'.`, line.Start) end
+            knownVariables[name] = className
+            local raw = source:sub(line.Start, line.Finish)
+            local open = code:find("new%s+[%a_][%w_]*%s*%(")
+            local rawArguments = arguments
+            if open then
+                local startAt = code:find("%(", open)
+                local closeAt = code:find("%)", startAt or open)
+                if startAt and closeAt then rawArguments = raw:sub(startAt + 1, closeAt - 1) end
+            end
+            checkCall(className .. " constructor", classes[className].Constructor or "", rawArguments, line.Start)
+        end
+        local typedName, typedClass = code:match("local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)")
+        if typedName and classes[typedClass] then knownVariables[typedName] = typedClass end
+        local var, reference = code:match("local%s+([%a_][%w_]*)%s*=%s*([%a_][%w_]*)%s*$")
+        if var and reference and not globals[reference] and not classes[reference] and not enums[reference] and not namespaces[reference] and not functions[reference] and not knownVariables[reference] then
+            local declaredBefore = masked:sub(1, line.Start - 1):find("local%s+" .. reference .. "%f[%W]") or masked:sub(1, line.Start - 1):find("function%s+" .. reference .. "%f[%W]")
+            if not declaredBefore then fail(`Unknown variable '{reference}'.`, line.Start) end
+        end
+    end
+    local knownCalls = {}
+    for word in ("if while for until repeat return function constructor signal get set new super async await select continue else elseif then do end not and or"):gmatch("[%a_][%w_]*") do knownCalls[word] = true end
+    for name in globals do knownCalls[name] = true end
+    for name in functions do knownCalls[name] = true end
+    for name in classes do knownCalls[name] = true end
+    for name in namespaces do knownCalls[name] = true end
+    for name in enums do knownCalls[name] = true end
+    for name in knownVariables do knownCalls[name] = true end
+    for _, line in lines do
+        for name in line.Text:gmatch("%f[%w_]local%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        for name in line.Text:gmatch("%f[%w_]const%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        for name in line.Text:gmatch("%f[%w_]for%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        for name in line.Text:gmatch("%f[%w_]function%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        for name in line.Text:gmatch("%f[%w_]import%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        for _, pattern in {"function%s+[%a_][%w_]*%s*%(([^)]*)%)", "function%s+[%a_][%w_]*%s*%b<>%s*%(([^)]*)%)", "function%s*%(([^)]*)%)"} do
+            for params in line.Text:gmatch(pattern) do
+                for _, part in paramParts(params) do
+                    local name = part:match("^([%a_][%w_]*)")
+                    if name then knownCalls[name] = true end
+                end
+            end
+        end
+        for params in line.Text:gmatch("constructor%s*%(([^)]*)%)") do
+            for _, part in paramParts(params) do
+                local name = part:match("^([%a_][%w_]*)")
+                if name then knownCalls[name] = true end
+            end
+        end
+    end
+    for _, line in lines do
+        local code = line.Text
+        for startPos, name in code:gmatch("()([%a_][%w_]*)%s*%(") do
+            local before = code:sub(1, startPos - 1)
+            local prev = before:match("(%S)%s*$")
+            if prev ~= "." and prev ~= ":" and not before:match("function%s*$") and not before:match("new%s*$") and not before:match("constructor%s*$") and not before:match("signal%s*$") and not before:match("get%s*$") and not before:match("set%s*$") then
+                if not knownCalls[name] then fail(`Unknown function '{name}'.`, line.Start + startPos - 1) end
+            end
+        end
+        local declaredType, declaredValue = code:match("local%s+[%a_][%w_]*%s*:%s*(number)%s*=%s*(.+)$")
+        if not declaredType then declaredType, declaredValue = code:match("local%s+[%a_][%w_]*%s*:%s*(string)%s*=%s*(.+)$") end
+        if not declaredType then declaredType, declaredValue = code:match("local%s+[%a_][%w_]*%s*:%s*(boolean)%s*=%s*(.+)$") end
+        if declaredType then
+            local raw = trim(source:sub(line.Start, line.Finish):match("=%s*(.-)%s*$") or "")
+            local actual = raw:match("^%d+%.?%d*$") and "number" or (raw == "true" or raw == "false") and "boolean" or raw:match("^[\"'`]") and "string" or nil
+            if actual and actual ~= declaredType then fail(`Expected {declaredType}, received {actual}.`, line.Start) end
+        end
+    end
+    for _, line in lines do
+        local code = line.Text
+        for className in code:gmatch("%f[%w_]new%s+([%a_][%w_]*)%s*%(") do
+            if not classes[className] and not knownCalls[className] then fail(`Unknown class '{className}'.`, line.Start) end
+        end
+        for _, pattern in {
+            "^%s*return%s+([%a_][%w_]*)%s*$",
+            "^%s*if%s+([%a_][%w_]*)%s+then%s*$",
+            "^%s*while%s+([%a_][%w_]*)%s+do%s*$",
+            "local%s+[%a_][%w_]*%s*=%s*([%a_][%w_]*)%s*[%+%-%*/]",
+            "print%s*%(%s*([%a_][%w_]*)%s*%)",
+            "warn%s*%(%s*([%a_][%w_]*)%s*%)",
+            "assert%s*%(%s*([%a_][%w_]*)%s*%)",
+        } do
+            local ref = code:match(pattern)
+            if ref and not knownCalls[ref] and ref ~= "self" and ref ~= "nil" and ref ~= "true" and ref ~= "false" then
+                fail(`Unknown variable '{ref}'.`, line.Start)
+            end
+        end
+    end
+    for _, line in lines do
+        local code = line.Text
+        for owner, delimiter, member in code:gmatch("([%a_][%w_]*)%s*([%.:])%s*([%a_][%w_]*)") do
+            local className = knownVariables[owner]
+            local isStatic = false
+            if classes[owner] then className = owner; isStatic = true end
+            if owner == "self" then
+                for cls, info in classes do
+                    if line.Start > info.Start and line.Start < info.Finish then className = cls; break end
+                end
+            end
+            if enums[owner] and not enums[owner][member] then fail(`Enum '{owner}' has no member '{member}'.`, line.Start) end
+            if namespaces[owner] and not namespaces[owner][member] then fail(`Namespace '{owner}' has no exported member '{member}'.`, line.Start) end
+            if className then
+                local found = memberOf(className, member, isStatic)
+                if not found and owner == "self" and code:find("self%." .. member .. "%s*=") then continue end
+                if not found then
+                    local ownerKind = isStatic and "Class" or "Instance"
+                    local memberKind = delimiter == ":" and "method" or "member"
+                    fail(`{ownerKind} '{className}' has no {memberKind} '{member}'.`, line.Start)
+                end
+                if delimiter == ":" and found.Kind ~= "method" then fail(`'{className}.{member}' is not a method.`, line.Start) end
+            end
+        end
+        for owner, member, args in code:gmatch("([%a_][%w_]*)%s*:%s*([%a_][%w_]*)%s*%(([^)]*)%)") do
+            local className = knownVariables[owner]
+            if owner == "self" then
+                for cls, info in classes do
+                    if line.Start > info.Start and line.Start < info.Finish then className = cls; break end
+                end
+            end
+            local info = className and memberOf(className, member, false)
+            if info and info.Kind == "method" then checkCall(className .. "." .. member, info.Params, args, line.Start) end
+        end
+        for owner, signalName, args in code:gmatch("([%a_][%w_]*)%.([%a_][%w_]*)%s*:%s*Fire%s*%(([^)]*)%)") do
+            local className = knownVariables[owner]
+            local signal = className and memberOf(className, signalName, false)
+            if signal and signal.Kind == "signal" and signal.Params then
+                local raw = source:sub(line.Start, line.Finish)
+                local open = code:find(owner .. "%s*%.%s*" .. signalName .. "%s*:%s*Fire%s*%(")
+                local rawArgs = args
+                if open then
+                    local startAt = code:find("%(", open)
+                    local closeAt = code:find("%)", startAt or open)
+                    if startAt and closeAt then rawArgs = raw:sub(startAt + 1, closeAt - 1) end
+                end
+                checkCall(className .. "." .. signalName .. " signal", signal.Params, rawArgs, line.Start)
+            end
+        end
+        for fname, args in code:gmatch("([%a_][%w_]*)%s*%(([^)]*)%)") do
+            if functions[fname] and not code:match("^%s*local%s+function%s+" .. fname) and not code:match("^%s*function%s+" .. fname) then
+                checkCall(fname, functions[fname], args, line.Start)
+            end
+        end
+    end
+end
+
 function Transpiler.Transpile(source: string, options: any?): string
     assert(type(source) == "string", "Expected Laua source string")
     local mode = type(options) == "table" and options.Mode or "Development"
@@ -2641,6 +3160,8 @@ function Transpiler.Transpile(source: string, options: any?): string
     local style = type(options) == "table" and options.OutputStyle or "Readable"
     if style ~= "Readable" and style ~= "Compact" then error("Invalid Laua output style") end
 
+    validateExpressionSyntax(source)
+    if type(options) ~= "table" or options.SemanticCheck ~= false then validateLauaSemantics(source) end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     if source:find("inline", 1, true) then source = transpileInlineFunctions(source) end
@@ -2676,7 +3197,7 @@ function Transpiler.Transpile(source: string, options: any?): string
         for _, name in exportedNames do table.insert(values, `{name} = {name}`) end
         source ..= "\nreturn {" .. table.concat(values, ", ") .. "}"
     end
-    source = source:gsub("[ \t]+\n", "\n")
+    source = trimGeneratedWhitespace(source)
     -- Narrow generated-syntax preflight. Roblox Studio remains the final parser.
     if not source:find("[[", 1, true) then
         local masked = maskNonCode(source)
