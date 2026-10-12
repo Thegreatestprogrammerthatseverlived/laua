@@ -93,7 +93,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.34 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.38 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -485,60 +485,141 @@ local part = message[1:7]`;
       return !!ch && /[A-Za-z0-9_]/.test(ch);
     }
 
-    function maskNonCode(source, preserveDirectives = false) {
-      // Preserve length and newlines, and mask every Luau string/comment form.
-      // This prevents source transformers from reading keywords inside user text.
-      if (!/["'`\[]|--/.test(source)) return source;
-      const out = source.split("");
-      const blank = (start, end) => {
-        for (let k = start; k < end; k++) if (source[k] !== "\n" && source[k] !== "\r") out[k] = " ";
+    function scanLauaSource(source, strict = false, collectTokens = false, preserveDirectives = false) {
+      const tokens = [], pieces = [], literals = [];
+      let i = 0, line = 1, copied = 0;
+      const fail = (message, at, tokenLine, end = at + 1) => {
+        if (!strict) return;
+        const error = new Error(`Laua syntax error (line ${tokenLine}): ${message}`);
+        error.offset = at;
+        error.endOffset = Math.min(end, source.length);
+        throw error;
       };
-      let i = 0;
-      while (i < source.length) {
-        if (source.startsWith("--", i)) {
-          if (preserveDirectives && source[i + 2] === "!") {
-            while (i < source.length && source[i] !== "\n") i++;
-            continue;
-          }
-          const long = /^--\[(=*)\[/.exec(source.slice(i));
-          if (long) {
-            const closing = "]" + long[1] + "]";
-            const endAt = source.indexOf(closing, i + long[0].length);
-            const end = endAt < 0 ? source.length : endAt + closing.length;
-            blank(i, end);
-            i = end;
-          } else {
-            let end = source.indexOf("\n", i);
-            if (end < 0) end = source.length;
-            blank(i, end);
-            i = end;
-          }
-          continue;
-        }
+      const advance = () => { if (source[i] === '\n') line++; i++; };
+      const jump = end => { while (i < end) { const next = source.indexOf('\n', i); if (next < 0 || next >= end) break; line++; i = next + 1; } i = end; };
+      const longOpening = at => {
+        if (source[at] !== '[') return null;
+        let end = at + 1;
+        while (source[end] === '=') end++;
+        return source[end] === '[' ? {end: end + 1, close: ']' + '='.repeat(end - at - 1) + ']'} : null;
+      };
+      const readLong = (opening, at, tokenLine, comment) => {
+        const close = source.indexOf(opening.close, opening.end);
+        if (close < 0) fail(comment ? 'Unterminated long comment.' : 'Unterminated long string.', at, tokenLine, opening.end);
+        jump(close < 0 ? source.length : close + opening.close.length);
+      };
+      const escape = () => {
+        advance();
         const ch = source[i];
-        if (ch === "'" || ch === '"' || ch === '`') {
-          const quote = ch, start = i++;
-          while (i < source.length) {
-            if (source[i] === "\\") { i = Math.min(i + 2, source.length); continue; }
-            if (source[i++] === quote) break;
+        if (i >= source.length) return;
+        advance();
+        if (ch === 'z') { while (i < source.length && /\s/.test(source[i])) advance(); }
+        else if (ch === '\r' && source[i] === '\n') advance();
+        else if (ch === 'u' && source[i] === '{') {
+          advance();
+          while (i < source.length && /[\da-fA-F]/.test(source[i])) advance();
+          if (source[i] === '}') advance();
+        }
+      };
+      const readQuoted = () => {
+        const at = i, tokenLine = line, quote = source[i];
+        advance();
+        while (i < source.length) {
+          const ch = source[i];
+          if (ch === '\\') { escape(); continue; }
+          if (ch === quote) { advance(); return; }
+          if (ch === '\n' || ch === '\r') fail('Unescaped newline in string literal.', at, tokenLine);
+          advance();
+        }
+        fail('Unterminated string literal.', at, tokenLine);
+      };
+      const readComment = () => {
+        const at = i, tokenLine = line, opening = longOpening(i + 2);
+        if (opening) readLong(opening, at, tokenLine, true);
+        else { const end = source.indexOf('\n', i); jump(end < 0 ? source.length : end); }
+      };
+      const readTemplate = () => {
+        const stack = [{kind: 'text', at: i, line}];
+        advance();
+        while (i < source.length && stack.length) {
+          const frame = stack[stack.length - 1], ch = source[i];
+          if (frame.kind === 'text') {
+            if (ch === '\n' || ch === '\r') fail('Unescaped newline in interpolated string.', frame.at, frame.line);
+            if (ch === '\\') { escape(); continue; }
+            if (ch === '`') { stack.pop(); advance(); continue; }
+            if (ch === '{') {
+              if (source[i + 1] === '{') fail('Double braces are not permitted in interpolated strings.', i, line, i + 2);
+              stack.push({kind: 'expression', depth: 1, at: i, line});
+            }
+            advance();
+          } else if (source.startsWith('--', i)) readComment();
+          else if (ch === '"' || ch === "'") readQuoted();
+          else if (ch === '`') { stack.push({kind: 'text', at: i, line}); advance(); }
+          else if (ch === '[' && longOpening(i)) readLong(longOpening(i), i, line, false);
+          else {
+            if (ch === '{') frame.depth++;
+            if (ch === '}' && --frame.depth === 0) stack.pop();
+            advance();
           }
-          blank(start, i);
+        }
+        if (stack.length) {
+          const frame = stack[stack.length - 1];
+          fail(frame.kind === 'text' ? 'Unterminated interpolated string.' : 'Unclosed interpolation.', frame.at, frame.line);
+        }
+      };
+      const identifierPattern = /[A-Za-z_]\w*/y;
+      const numberPattern = /(?:0[xX][\da-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.(?!\.)[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?)/y;
+      const operatorPattern = /(?:\.\.\.|\?\?=|\.\.=|\/\/=|\?\?|\?\.|\|>|!=|==|~=|<=|>=|=>|->|::|\+=|-=|\*=|\/=|%=|\^=|\.\.|\/\/)/y;
+      while (i < source.length) {
+        const at = i, tokenLine = line, ch = source[i];
+        let kind = null;
+        if (source.startsWith('--', i)) { readComment(); kind = 'comment'; }
+        else if (ch === '"' || ch === "'") { readQuoted(); kind = 'literal'; }
+        else if (ch === '`') { readTemplate(); kind = 'literal'; }
+        else if (ch === '[') {
+          const opening = longOpening(i);
+          if (opening) { readLong(opening, at, tokenLine, false); kind = 'literal'; }
+        }
+        if (kind) {
+          pieces.push(source.slice(copied, at));
+          const text = source.slice(at, i);
+          pieces.push(kind === 'comment' && preserveDirectives && source[at + 2] === '!' ? text : text.replace(/[^\r\n]/g, ' '));
+          copied = i;
+          if (kind === 'literal') {
+            const token = {kind, value: '<string>', at, end: i, line: tokenLine, endLine: line, quote: ch};
+            literals.push(token);
+            if (collectTokens) tokens.push(token);
+          }
           continue;
         }
-        if (ch === "[") {
-          const long = /^\[(=*)\[/.exec(source.slice(i));
-          if (long) {
-            const closing = "]" + long[1] + "]";
-            const endAt = source.indexOf(closing, i + long[0].length);
-            const end = endAt < 0 ? source.length : endAt + closing.length;
-            blank(i, end);
-            i = end;
-            continue;
-          }
-        }
-        i++;
+        if (!collectTokens || /\s/.test(ch)) { advance(); continue; }
+        let match;
+        identifierPattern.lastIndex = i;
+        numberPattern.lastIndex = i;
+        operatorPattern.lastIndex = i;
+        if ((match = identifierPattern.exec(source))) kind = 'word';
+        else if ((match = numberPattern.exec(source))) kind = 'number';
+        else { match = operatorPattern.exec(source); kind = 'symbol'; }
+        i += match ? match[0].length : 1;
+        tokens.push({kind, value: source.slice(at, i), at, end: i, line: tokenLine, endLine: line});
       }
-      return out.join("");
+      pieces.push(source.slice(copied));
+      return {masked: pieces.join(''), tokens, literals};
+    }
+
+    function maskNonCode(source, preserveDirectives = false) {
+      if (!/["'`\[]|--/.test(source)) return source;
+      return scanLauaSource(source, false, false, preserveDirectives).masked;
+    }
+
+    function trimGeneratedWhitespace(source) {
+      if (!/[\t ]+(?=\n|$)/.test(source)) return source;
+      const {literals} = scanLauaSource(source);
+      let cursor = 0;
+      return source.replace(/[\t ]+(?=\n|$)/g, (space, at) => {
+        while (cursor < literals.length && literals[cursor].end <= at) cursor++;
+        return cursor < literals.length && literals[cursor].at <= at ? space : '';
+      });
     }
 
     function findKeyword(masked, keyword, from = 0) {
@@ -555,7 +636,18 @@ local part = message[1:7]`;
 
         const validAfter = !isIdent(after);
 
-        if (validBefore && validAfter) return i;
+        if (validBefore && validAfter) {
+          if (keyword === 'enum' || keyword === 'namespace') {
+            const lineStart = masked.lastIndexOf('\n', i - 1) + 1;
+            const prefix = masked.slice(lineStart, i).trim();
+            if (prefix || !/^\s+[A-Za-z_]\w*\s*(?:\n|$)/.test(masked.slice(i + keyword.length))) {
+              if (!(keyword === 'namespace' && prefix === 'return' && /^\s+[A-Za-z_]\w*\s*(?:\n|$)/.test(masked.slice(i + keyword.length)))) {
+                i += keyword.length; continue;
+              }
+            }
+          }
+          return i;
+        }
 
         i += keyword.length;
       }
@@ -619,7 +711,7 @@ local part = message[1:7]`;
           const maskedLine = masked.slice(lines[li].start, lines[li].end).trim();
           const opens =
             /^(abstract\s+|final\s+)?class\b/.test(maskedLine) ||
-            /^namespace\b/.test(maskedLine) ||
+            /^(?:return\s+)?namespace\b/.test(maskedLine) ||
             /^enum\b/.test(maskedLine) ||
             /^match\b/.test(maskedLine) ||
             /^operator\s+/.test(maskedLine) ||
@@ -742,18 +834,24 @@ local part = message[1:7]`;
         const endPos = findMatchingEndByLines(source, idx);
         let body = source.slice(headerEnd + 1, endPos.start);
 
-        const lines = body.split("\n");
-        let depth = 0;
+        const view = scanLauaSource(body, false, true);
+        const lines = splitLinesWithOffsets(body);
+        let depth = 0, tokenCursor = 0;
 
-        body = lines.map(line => {
-          const trimmed = line.trim();
+        body = lines.map(row => {
+          const line = row.text, trimmed = view.masked.slice(row.start, row.end).trim();
           const indent = line.match(/^\s*/)[0];
+          while (tokenCursor < view.tokens.length && view.tokens[tokenCursor].at < row.start) tokenCursor++;
+          const head = view.tokens[tokenCursor], async = head?.value === 'async';
+          const fnToken = view.tokens[tokenCursor + (async ? 1 : 0)];
+          const nameToken = view.tokens[tokenCursor + (async ? 2 : 1)];
+          const afterName = view.tokens[tokenCursor + (async ? 3 : 2)];
 
           if (depth === 0) {
-            const fn = trimmed.match(/^function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*(:\s*[A-Za-z_]\w*)?\s*$/);
-            if (fn) {
+            if (head && head.at < row.end && fnToken?.value === 'function' && nameToken?.kind === 'word' && ['(', '<'].includes(afterName?.value)) {
               depth++;
-              return `${indent}${name}.${fn[1]} = function(${fn[2]})${fn[3] || ''}`;
+              const tail = line.slice(nameToken.end - row.start);
+              return async ? `${indent}async function ${name}.${nameToken.value}${tail}` : `${indent}${name}.${nameToken.value} = function${tail}`;
             }
 
             const localFn = /^local\s+function\b/.test(trimmed);
@@ -762,9 +860,8 @@ local part = message[1:7]`;
               return line;
             }
 
-            const field = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/);
-            if (field && !/^local\b/.test(trimmed)) {
-              return `${indent}${name}.${field[1]} = ${field[2]}`;
+            if (head && head.at < row.end && head.kind === 'word' && view.tokens[tokenCursor + 1]?.value === '=') {
+              return line.replace(/^([ \t]*)[A-Za-z_]\w*/, `$1${name}.${head.value}`);
             }
           }
 
@@ -778,12 +875,16 @@ local part = message[1:7]`;
         body = transpileCore(body);
         body = normalizeBlockIndent(body, "    ");
 
-        const generated = `(function()\n    local ${name} = {}\n${body}${body ? "\n" : ""}    return ${name}\nend)()`;
-
+        const generated = returned
+          ? `do\n    local ${name} = {}\n${body}${body ? "\n" : ""}    return ${name}\nend`
+          : `local ${name} = {}\ndo\n${body}${body ? "\n" : ""}end`;
         if (returned) {
-          source = source.slice(0, idx) + generated + source.slice(endPos.end);
+          // Replace the existing 'return namespace' prefix with a scoped
+          // return statement. A 'do' statement cannot be an expression.
+          const from = source.lastIndexOf("\n", idx - 1) + 1;
+          source = source.slice(0, from) + source.slice(from, idx).replace(/\breturn\s*$/, '') + generated + source.slice(endPos.end);
         } else {
-          source = source.slice(0, idx) + `local ${name} = ${generated}` + source.slice(endPos.end);
+          source = source.slice(0, idx) + generated + source.slice(endPos.end);
         }
       }
 
@@ -2229,9 +2330,299 @@ local part = message[1:7]`;
       if (/\[(?:=*)\[|`/.test(output)) return output;
       return output.split('\n').filter(row=>row.trim()!=='' && (!/^\s*--/.test(row) || /^\s*--[!#]/.test(row))).join('\n');
     }
+    // Lexical validation is shared with masking; grammar checks remain conservative.
+    function validateExpressionSyntax(source) {
+      const {tokens} = scanLauaSource(source, true, true);
+      const fail = (message,t) => { const err = new Error(`Laua syntax error (line ${t.line}): ${message}`); err.offset = t.at; err.endOffset = t.end; throw err; };
+      const keyword = new Set('local const function return if then else elseif end do while for in repeat until type export class extends namespace enum constructor signal async await new memo using as from and or not true false nil break continue get set lazy public private protected static final override abstract match case default'.split(' '));
+      const operand = t => t && (t.kind === 'number' || t.kind === 'literal' || (t.kind === 'word' && !keyword.has(t.value)) || ['true','false','nil'].includes(t.value) );
+      const bin = new Set(['+','-','*','/','//','%','^','..','??','|>','and','or','==','~=','!=','<','>','<=','>=']);
+      const badAfter = new Set(['*','/','//','%','^','..','??','|>','and','or','==','~=','!=','<','>','<=','>=',',',';',')',']','}','then','else','elseif','end']);
+      const close = new Map([['(',')'],['[',']'],['{','}']]);
+      const stack=[];
+      for(let k=0;k<tokens.length;k++) {
+        const t=tokens[k],prev=tokens[k-1],next=tokens[k+1];
+        if(close.has(t.value))stack.push({expected:close.get(t.value),token:t});
+        else if ([')',']','}'].includes(t.value)) {
+          if (!stack.length || stack[stack.length-1].expected!==t.value)fail(`Unexpected '${t.value}'.`,t);
+          stack.pop();
+        }
+        if(prev && t.value===',' && prev.value===',')fail('Missing expression between commas.',t);
+        if(t.value==='do' && prev?.value===',' && tokens.slice(Math.max(0,k-12),k).some(x=>x.value==='for'))fail('Missing range value before do.',t);
+        if(['+=','-=','*=','/=','//=','%=','^=','..=','??='].includes(t.value) && prev && (prev.kind==='number'||prev.kind==='literal'||['true','false','nil',')','}'].includes(prev.value)))fail('A compound assignment requires an assignable variable or property.',t);
+        if(prev && ['=','+=','-=','*=','/=','%=','^=','??='].includes(prev.value) && [',',';',')',']','}','end','else','elseif'].includes(t.value))fail(`Missing expression after '${prev.value}'.`,t);
+        if(prev && bin.has(prev.value) && badAfter.has(t.value)) {
+          // A minus can start an operand, e.g. 1 + -2.
+          if(t.value !== '-')fail(`Missing operand after '${prev.value}'.`,t);
+        }
+        if(prev && ['}',')',']'].includes(prev.value) && (t.kind === 'number' || (t.kind === 'literal' && (prev.value === '}' || t.quote === '`'))) && prev.endLine===t.line)fail(`Missing separator after '${prev.value}'.`,t);
+        if(prev && prev.kind==='number' && ['number','literal'].includes(t.kind) && prev.endLine===t.line)fail('Missing operator between values.',t);
+        if(prev && prev.kind==='literal' && (t.kind==='number' || t.kind==='literal') && prev.endLine===t.line)fail('Missing separator after string literal.',t);
+        if(prev && (prev.value==='true'||prev.value==='false'||prev.value==='nil') && operand(t) && prev.line===t.line)fail('Missing operator after literal.',t);
+        if(prev?.value === 'then' && t.value === 'else') {
+          let depth = 0;
+          for (let n = k - 2; n >= 0; n--) {
+            const value = tokens[n].value;
+            if ([')',']','}'].includes(value)) depth++;
+            else if (['(','[','{'].includes(value)) depth--;
+            if (depth === 0 && value === 'if') {
+              if (['=','return','(',',','[','=>'].includes(tokens[n - 1]?.value) || bin.has(tokens[n - 1]?.value)) fail('Conditional expression is missing its then value.',t);
+              break;
+            }
+          }
+        }
+        if(prev && ['=','+','*','/','//','%','^','..','??'].includes(prev.value) && t.value==='*')fail(`Unexpected '*' after '${prev.value}'.`,t);
+        if(prev && prev.value==='=' && t.value==='??')fail('Expected value before nil-coalescing operator.',t);
+        if(prev && prev.value==='=' && t.value==='[' && next?.kind==='number' && tokens[k+2]?.value===',') {
+          // Bare [1,2] is not a Luau table; use {1,2} instead.
+          fail('Use { ... } for a table literal.',t);
+        }
+      }
+      if(stack.length)fail(`Unclosed '${stack[stack.length-1].token.value}'.`,stack[stack.length-1].token);
+      const last=tokens[tokens.length-1];
+      if(last && (['=','+=','-=','*=','/=','%=','^=','??='].includes(last.value) || ['+','*','/','//','%','^','..','??','and','or'].includes(last.value))) fail(`Missing expression after '${last.value}'.`,last);
+    }
+
+    // Conservative lexical-scope validation for names that this source declares.
+    // Unknown external values are still handled by the existing semantic checker.
+    function validateScopedReferences(source) {
+      if (source.includes('local __laua')) return;
+      const masked = maskNonCode(source);
+      const locals = new Set([...masked.matchAll(/\b(?:local|const)\s+(?!function\b)([A-Za-z_]\w*)/g)].map(m => m[1]));
+      if (!locals.size) return;
+      const stack = [new Set()];
+      const known = name => stack.some(s => s.has(name));
+      const fail = (name, line) => {throw new Error(`Laua semantic error (line ${line}): Unknown variable '${name}' (not in scope).`);};
+      const rows = masked.split('\n');
+      for (let n=0;n<rows.length;n++) {
+        const row=rows[n], code=row.trim();
+        if (!code)continue;
+        if (/^(?:end|until)\b/.test(code)) {if(stack.length>1)stack.pop();continue;}
+        if (/^(?:else|elseif)\b/.test(code)) {if(stack.length>1)stack.pop();stack.push(new Set());}
+        const functionStart=/^(?:(?:local|async)\s+)?function\s+([A-Za-z_]\w*)?(?:\s*[.:]\s*[A-Za-z_]\w*)?\s*\(([^)]*)\)/.exec(code);
+        if(functionStart && /^local\s+function/.test(code))stack.at(-1).add(functionStart[1]);
+        if (/^(?:(?:local|async)\s+)?function\b/.test(code) || /^(?:if\b.*\bthen\b|for\b.*\bdo\b|while\b.*\bdo\b|do\b|repeat\b|class\b|namespace\b|enum\b|constructor\s*\()/.test(code)) {
+          stack.push(new Set());
+          if(functionStart)for(const part of functionStart[2].split(',')) {
+            const name=/^\s*([A-Za-z_]\w*)/.exec(part)?.[1];if(name)stack.at(-1).add(name);
+          }
+          const loop=/^for\s+(.+?)\s+(?:in|=)\b/.exec(code);
+          if(loop)for(const part of loop[1].split(',')) {
+            const name=/^\s*([A-Za-z_]\w*)/.exec(part)?.[1];if(name)stack.at(-1).add(name);
+          }
+        }
+        for(const m of code.matchAll(/\b(?:local|const)\s+(?!function\b)([A-Za-z_]\w*)(?:\s*:\s*[A-Za-z_][\w?.<>]*)?\s*=\s*([A-Za-z_]\w*)\s*(?=$|;)/g)) {
+          const name=m[1],ref=m[2];
+          if (locals.has(ref) && !known(ref))fail(ref,n+1);
+          stack.at(-1).add(name);
+        }
+        // The initializer itself was checked above; later expressions on the
+        // same source line can see the new binding.
+        for(const m of code.matchAll(/\b(?:local|const)\s+(?!function\b)([A-Za-z_]\w*)/g))stack.at(-1).add(m[1]);
+        for(const m of code.matchAll(/\b(?:print|warn|assert)\s*\(\s*([A-Za-z_]\w*)\s*\)/g)) {
+          const name=m[1];if(locals.has(name)&&!known(name))fail(name,n+1);
+        }
+        for(const m of code.matchAll(/\b(?:return|if|while)\s+([A-Za-z_]\w*)\s*(?=then\b|do\b|$)/g)) {
+          const name=m[1];if(locals.has(name)&&!known(name))fail(name,n+1);
+        }
+        // Inline single-line blocks close immediately.
+        if(/^.*\bend\s*$/.test(code) && !/^end\b/.test(code) && stack.length>1)stack.pop();
+      }
+    }
+
+    // Laua compiler semantic preflight. Reject only references whose meaning can
+    // be resolved from this file; dynamic/imported/engine values stay dynamic.
+    function validateLauaSemantics(source) {
+      if (source.includes('local __laua')) return; // Already-generated runtime code is not source Laua.
+      const masked = maskNonCode(source);
+      const classes = new Map(), enums = new Map(), namespaces = new Map();
+      const knownVariables = new Map(), functions = new Map();
+      const builtins = new Set(('assert error getfenv getmetatable ipairs loadstring newproxy next pairs pcall print rawequal rawget rawlen rawset select setfenv setmetatable tonumber tostring type typeof unpack xpcall require warn tick time elapsedTime gcinfo settings UserSettings plugin delay spawn wait collectgarbage debug vector _G _VERSION shared game workspace script Enum Instance CFrame Vector2 Vector3 UDim UDim2 Color3 BrickColor NumberRange NumberSequence ColorSequence Rect Ray Region3 PhysicalProperties Random DateTime TweenInfo OverlapParams RaycastParams Axes Faces Font Vector3int16 Vector2int16 NumberSequenceKeypoint ColorSequenceKeypoint math table string task coroutine utf8 os bit32 buffer').split(' '));
+      const lines = splitLinesWithOffsets(source);
+      const fail = (message, at) => { const line = source.slice(0, at).split('\n').length; throw new Error(`Laua semantic error (line ${line}): ${message}`); };
+      const signature = (raw) => {
+        const args = [];
+        let depth=0, from=0;
+        for(let i=0;i<=raw.length;i++){
+          const ch=raw[i];
+          if(i<raw.length){if('([{<'.includes(ch))depth++;else if(')]}>'.includes(ch))depth=Math.max(0,depth-1);}
+          if(i===raw.length || (ch===',' && depth===0)){
+            const part=raw.slice(from,i).trim();
+            if(part){const match=/^([A-Za-z_]\w*|\.\.\.)(?:\s*:\s*([A-Za-z_]\w*\??))?(?:\s*=\s*(.+))?$/.exec(part);
+              args.push({name:match?.[1]||part,type:match?.[2]||null,optional:!!match?.[3]||part.includes('...'),rest:part.startsWith('...')});}
+            from=i+1;
+          }
+        }
+        return args;
+      };
+      const checkCall = (label, params, argumentText, offset) => {
+        if(!params) return;
+        let depth=0,count=argumentText.trim()?1:0;
+        for(const ch of argumentText){if('([{'.includes(ch))depth++;else if(')]}'.includes(ch))depth--;else if(ch===','&&depth===0)count++;}
+        const required=params.filter(p=>!p.optional&&!p.rest).length;
+        if(count<required || (!params.some(p=>p.rest)&&count>params.length))fail(`'${label}' expects ${required}${required!==params.length?`-${params.length}`:''} argument(s), received ${count}.`,offset);
+        const parts=[];depth=0;let start=0;
+        for(let i=0;i<=argumentText.length;i++){
+          const ch=argumentText[i];if(i<argumentText.length){if('([{'.includes(ch))depth++;else if(')]}'.includes(ch))depth--;}
+          if(i===argumentText.length||(ch===','&&depth===0)){parts.push(argumentText.slice(start,i).trim());start=i+1;}
+        }
+        for(let i=0;i<Math.min(parts.length,params.length);i++){
+          const expected=params[i].type, value=parts[i];if(!expected||!value)continue;
+          const actual=/^\d+(?:\.\d+)?$/.test(value)?'number':/^(?:true|false)$/.test(value)?'boolean':/^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`)$/.test(value)?'string':/^\{/.test(value)?'table':null;
+          if(actual && ['number','string','boolean'].includes(expected.replace(/\?$/, '')) && actual!==expected.replace(/\?$/, '') && !(actual==='nil'&&expected.endsWith('?')))fail(`Argument ${i+1} of '${label}' expects ${expected}, received ${actual}.`,offset);
+        }
+      };
+      for(const line of lines){
+        const clean=masked.slice(line.start,line.end).trim();
+        const cls=/^(?:(?:final|abstract)\s+)?class\s+(\w+)(?:\s+extends\s+([\w.]+))?\s*$/.exec(clean);
+        if(cls){
+          let end=line.end;
+          try{end=findMatchingEndByLines(source,line.start+masked.slice(line.start,line.end).indexOf('class')).end;}catch{continue;}
+          const info={base:cls[2]||null,start:line.start,end,instance:new Map(),statics:new Map(),ctor:null};classes.set(cls[1],info);
+          const body=source.slice(line.end+1,end), bodyMasked=maskNonCode(body);
+          const field=/^[ \t]*(?:(?:public|private|protected|static|override|final|abstract)\s+)*(?:(async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)|constructor\s*\(([^\n)]*)\)|(?:signal|lazy|get|set)\s+(\w+)\s*(?:\(([^\n)]*)\))?|([A-Za-z_]\w*)\s*(?::\s*[^=\n]+)?\s*=)/gm;
+          let m;while((m=field.exec(bodyMasked))){
+            const lineEnd=bodyMasked.indexOf('\n',m.index), prefix=bodyMasked.slice(m.index,lineEnd===-1?bodyMasked.length:lineEnd);
+            if(/^\s*(?:local|return|self\.|if\b|for\b)/.test(prefix))continue;
+            const staticMember=/\bstatic\b/.test(prefix.split(/\b(?:function|signal|lazy|get|set)\b/)[0]);
+            if(m[4]){info.ctor=signature(m[4]);continue;}
+            const name=m[2]||m[5]||m[7];if(!name)continue;
+            (staticMember?info.statics:info.instance).set(name,{kind:m[2]?'method':m[5]&&prefix.includes('signal')?'signal':'field',params:m[2]?signature(m[3]):m[5]&&prefix.includes('signal')?signature(m[6]||''):null});
+          }
+        }
+        const en=/^enum\s+(\w+)\s*$/.exec(clean);
+        if(en){try{const end=findMatchingEndByLines(source,line.start).end;const members=new Set();for(const row of masked.slice(line.end+1,end).split('\n')){const m=/^\s*(\w+)\s*(?:=|,|$)/.exec(row);if(m&&m[1]!=='end')members.add(m[1]);}enums.set(en[1],members);}catch{}}
+        const ns=/^namespace\s+(\w+)\s*$/.exec(clean);
+        if(ns){try{const end=findMatchingEndByLines(source,line.start).end;const members=new Set();for(const row of masked.slice(line.end+1,end).split('\n')){const m=/^\s*(?:export\s+)?(?:function\s+|(?:local|const)\s+)?(\w+)\s*(?:\(|<|=)/.exec(row);if(m)members.add(m[1]);}namespaces.set(ns[1],members);}catch{}}
+        const fn=/^(?:local\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)/.exec(clean);
+        if(fn && !source.slice(0,line.start).match(/\bclass\b[^]*$/)) { /* Function lookup added in second pass. */ }
+      }
+      // Top-level and local function signatures, excluding members contained in classes.
+      for(const m of masked.matchAll(/\b(?:local\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)(?:\s*<[^>\n]+>)?\s*\(([^\n)]*)\)/g)){
+        if([...classes.values()].some(c=>m.index>c.start&&m.index<c.end))continue;
+        functions.set(m[1],signature(m[2]));
+      }
+      for(const [name,info] of classes){
+        const visited=new Set();let base=info.base;
+        while(base&&classes.has(base)&&!visited.has(base)){visited.add(base);base=classes.get(base).base;}
+        if(base && visited.has(base)) fail(`Circular class inheritance involving '${name}'.`, info.start);
+      }
+      const findMember = (className,member,isStatic=false) => {
+        const seen=new Set();let current=className;
+        while(current&&!seen.has(current)){seen.add(current);const info=classes.get(current);if(!info)return null;
+          const found=(isStatic?info.statics:info.instance).get(member);if(found)return found;current=info.base;}
+        return null;
+      };
+      for(const m of masked.matchAll(/\b(?:local\s+|const\s+)?([A-Za-z_]\w*)\s*(?::\s*([A-Za-z_]\w*))?\s*=\s*new\s+([A-Za-z_]\w*)\s*(?:\(([^\n)]*)\))?/g)){
+        if(!classes.has(m[3])){if(!m[3].includes('.'))fail(`Unknown class '${m[3]}'.`,m.index);continue;}
+        knownVariables.set(m[1],m[3]);checkCall(`${m[3]} constructor`,classes.get(m[3]).ctor||[],m[4]===undefined?'':source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index);
+      }
+      for(const m of masked.matchAll(/\blocal\s+(\w+)\s*:\s*(\w+)\b/g)){if(classes.has(m[2])&&!knownVariables.has(m[1])) knownVariables.set(m[1],m[2]);}
+      const checkMember=(owner,delimiter,member,args,offset)=>{
+        if(enums.has(owner)){if(!enums.get(owner).has(member))fail(`Enum '${owner}' has no member '${member}'.`,offset);return;}
+        if(namespaces.has(owner)){if(!namespaces.get(owner).has(member))fail(`Namespace '${owner}' has no exported member '${member}'.`,offset);return;}
+        let cls=knownVariables.get(owner),isStatic=false;
+        if(classes.has(owner)){cls=owner;isStatic=true;}
+        if(owner==='self'&&!cls){const surrounding=[...classes.entries()].find(([,c])=>offset>c.start&&offset<c.end);if(surrounding)cls=surrounding[0];}
+        if(!cls)return;
+        const found=findMember(cls,member,isStatic);
+        if(!found){
+          const tail=masked.slice(offset + owner.length).match(/^\s*[.:]\s*[A-Za-z_]\w*\s*(=|\+=|-=)/);
+          if(owner==='self' && tail)return;
+          fail(`${isStatic?'Class':'Instance'} '${cls}' has no ${delimiter===':'?'method':'member'} '${member}'.`,offset);
+        }
+        if(delimiter===':'&&found.kind!=='method')fail(`'${cls}.${member}' is a property, not a method.`,offset);
+        if(args!==undefined){if(found.kind!=='method')fail(`'${cls}.${member}' is not callable.`,offset);checkCall(`${cls}.${member}`,found.params,args,offset);}
+      };
+      const memberCalls=/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\s*\(([^\n()]*)\)/g;
+      let safeMasked=masked;
+      for(const m of safeMasked.matchAll(memberCalls)){
+        // Ignore method declarations and definitions such as function X:Foo(...).
+        const lineStart=masked.lastIndexOf('\n',m.index-1)+1, prefix=masked.slice(lineStart,m.index);
+        if(/\bfunction\s*$/.test(prefix))continue;
+        checkMember(m[1],m[2],m[3],source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index);
+      }
+      for(const m of safeMasked.matchAll(/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\b/g)){
+        const prefix=masked.slice(masked.lastIndexOf('\n',m.index-1)+1,m.index);
+        if(/\bfunction\s*$/.test(prefix))continue;
+        checkMember(m[1],m[2],m[3],undefined,m.index);
+      }
+      for(const m of safeMasked.matchAll(/\b([A-Za-z_]\w*)\s*\(([^\n()]*)\)/g)){
+        const name=m[1], offset=m.index;const before=masked.slice(Math.max(0,offset-32),offset);
+        if(/(?:\.|:|\?\.|\bfunction\s+|\bconstructor\s*|\bsignal\s+|\bget\s+|\bset\s+)\s*$/.test(before))continue;
+        if(functions.has(name))checkCall(name,functions.get(name),source.slice(offset+m[0].indexOf('(')+1,offset+m[0].length-1),offset);
+      }
+      const declarations=new Set([...classes.keys(),...enums.keys(),...namespaces.keys(),...functions.keys(),...knownVariables.keys()]);
+      for(const m of masked.matchAll(/\b(?:local|const|for|using)\s+([A-Za-z_]\w*)/g)) declarations.add(m[1]);
+      for(const m of masked.matchAll(/\b(?:function|constructor|watch|get|set)\s*(?:[A-Za-z_]\w*)?(?:\s*<[^>\n]+>)?\s*\(([^\n)]*)\)/g)) for(const p of signature(m[1])) if(/^[A-Za-z_]\w*$/.test(p.name)) declarations.add(p.name);
+      for(const m of masked.matchAll(/\b(?:function|async\s+function)\s+([A-Za-z_]\w*)/g)) declarations.add(m[1]);
+      for(const m of source.matchAll(/^\s*import\s+([A-Za-z_]\w*)\s+from\s+/gm))declarations.add(m[1]);
+      for(const m of source.matchAll(/^\s*import\s+\{([^{}]+)\}\s+from\s+/gm)){
+        for(const part of m[1].split(',')){const match=/^\s*([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*$/.exec(part);if(match)declarations.add(match[2]||match[1]);}
+      }
+      // Calls to unknown plain names have no valid target. Method calls on
+      // untyped objects remain dynamic and are not rejected here.
+      for(const m of masked.matchAll(/\bnew\s+([A-Za-z_]\w*)\s*\(/g)){
+        const prefix=masked.slice(Math.max(0,m.index-3),m.index);
+        if(/\.\s*$/.test(prefix))continue;
+        if(!classes.has(m[1])&&!declarations.has(m[1]))fail(`Unknown class '${m[1]}'.`,m.index);
+      }
+      for(const m of masked.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)){
+        const name=m[1],before=masked.slice(Math.max(0,m.index-50),m.index);
+        if(/(?:\.|:|\?\.|\bfunction\s+|\bconstructor\s*|\bsignal\s+|\bget\s+|\bset\s+|\bnew\s+|\btype\s+)\s*$/.test(before))continue;
+        if(['if','while','for','until','repeat','return','function','constructor','typeof','new','select','continue','else','elseif','then','do','end','not','and','or','async','await','super'].includes(name))continue;
+        if(builtins.has(name)||declarations.has(name))continue;
+        fail(`Unknown function '${name}'.`,m.index);
+      }
+      const primitive = value => {
+        const text=value.trim();
+        if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(text))return 'number';
+        if (/^(true|false)$/.test(text))return 'boolean';
+        if (/^(?:'[^'\n]*'|"[^"\n]*"|`[^`]*`)$/.test(text))return 'string';
+        if (text === 'nil')return 'nil';
+        return null;
+      };
+      const checkAnnotation=(declared,value,at)=>{
+        const type=declared?.replace(/\?$/,'');if(!['number','string','boolean'].includes(type))return;
+        const actual=primitive(value);if(!actual)return;
+        if(actual==='nil'&&declared.endsWith('?'))return;
+        if(actual!==type)fail(`Expected ${declared}, received ${actual}.`,at);
+      };
+      for(const m of source.matchAll(/\b(?:local|const)\s+[A-Za-z_]\w*\s*:\s*(number|string|boolean)\??\s*=\s*([^\n;]+)/g)){
+        // Ensure declaration actually appears in code, not a literal/comment.
+        if(masked[m.index]!==' '&&masked.slice(m.index,m.index+5).trim().startsWith('local')||masked.slice(m.index,m.index+5).trim().startsWith('const')){
+          const annotation=/:(\s*)(number|string|boolean)(\?)/.exec(m[0]);
+          checkAnnotation(m[1]+(annotation?.[3]||''),m[2],m.index);
+        }
+      }
+      for(const m of masked.matchAll(/\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*:\s*Fire\s*\(([^\n()]*)\)/g)){
+        const cls=knownVariables.get(m[1]);if(!cls)continue;
+        const signal=findMember(cls,m[2],false);
+        if(signal?.kind==='signal')checkCall(`${cls}.${m[2]} signal`,signal.params,source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index);
+      }
+      for(const [name,info] of classes){
+        const body=source.slice(info.start,info.end);
+        for(const m of body.matchAll(/^[ \t]*(?:public|private|protected|static\s+)*([A-Za-z_]\w*)\s*:\s*(number|string|boolean)(\?)?\s*=\s*([^\n]+)/gm)){
+          const index=info.start+m.index; if(!/^[ \t]*[A-Za-z_]/.test(masked.slice(index,index+20)))continue;
+          checkAnnotation(m[2]+(m[3]||''),m[4],index);
+        }
+      }
+      const verifyReference=(ref,at)=>{
+        if(!declarations.has(ref)&&!builtins.has(ref)&&!['nil','true','false','self','super','end','then','do','else','elseif','if','in','while','return','not','or','and','repeat','until','function','local','break','continue','await','new'].includes(ref))fail(`Unknown variable '${ref}'.`,at);
+      };
+      for(const m of masked.matchAll(/\b(?:return|if|while)\s+([A-Za-z_]\w*)\s*(?=\n|;|$|\bthen\b|\bdo\b)/g))verifyReference(m[1],m.index+m[0].lastIndexOf(m[1]));
+      for(const m of masked.matchAll(/\b(?:local|const)\s+[A-Za-z_]\w*(?:\s*:\s*[A-Za-z_]\w*\??)?\s*=\s*([A-Za-z_]\w*)\s*[+*/%-]/g))verifyReference(m[1],m.index+m[0].lastIndexOf(m[1]));
+      for(const m of masked.matchAll(/\b(?:print|warn|assert)\s*\(\s*([A-Za-z_]\w*)\s*\)/g))verifyReference(m[1],m.index+m[0].lastIndexOf(m[1]));
+      for(const m of masked.matchAll(/\b(?:local|const)\s+([A-Za-z_]\w*)(?:\s*:\s*[A-Za-z_]\w*\??)?\s*=\s*([A-Za-z_]\w*)\s*(?=\n|;|$)/g)){
+        const ref=m[2];if(!declarations.has(ref)&&!builtins.has(ref)&&!['nil','true','false'].includes(ref)&&!new RegExp(`\\b(?:local|const|for|function|using)\\s+${ref}\\b`).test(masked.slice(0,m.index)))fail(`Unknown variable '${ref}'.`,m.index+m[0].lastIndexOf(ref));
+      }
+    }
+
     function transpile(source, options = {}) {
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
+      validateExpressionSyntax(source);
+      if (options?.SemanticCheck !== false) {validateScopedReferences(source);validateLauaSemantics(source);}
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact'].includes(style))throw new Error('Invalid Laua output style');
 
@@ -2264,7 +2655,7 @@ local part = message[1:7]`;
       if (/\bfunction[^\n]*\([^\n)]*=/.test(output)) output = transpileParameterDefaults(output);
       if (output.includes('__laua')) output = insertLauaEmbeddedRuntimes(output);
       if (exported.names.length) output += `\nreturn {${exported.names.map(name => `${name} = ${name}`).join(', ')}}`;
-      output = output.replace(/[\t ]+(?=\n|$)/g, '');
+      output = trimGeneratedWhitespace(output);
       // Detect malformed adjacent expression tokens before reporting successful compilation.
       // This is not a full Luau grammar/type checker.
       if(!/\[(?:=*)\[/.test(output) && /[})]\d/.test(maskNonCode(output))){
@@ -4205,7 +4596,7 @@ local part = message[1:7]`;
         //         print(dt)
         //     end)
         // The old checker missed this opener and wrongly flagged 'end)'.
-        const functions = /\bfunction(?:\s+[A-Za-z_][A-Za-z0-9_.:]*\s*)?\s*\(/g;
+        const functions = /\bfunction(?:\s+[A-Za-z_][A-Za-z0-9_.:]*\s*)?(?:<[^>\n]+>)?\s*\(/g;
         let match;
         while ((match = functions.exec(line)) !== null) {
           if (match.index > 0 && /[.:]/.test(line[match.index - 1])) continue;
@@ -4700,6 +5091,11 @@ local part = message[1:7]`;
 
         while ((match = pattern.exec(maskedSource)) !== null) {
           const classInfo = findClassAtOffset(symbols, match.index);
+          const before = maskedSource.slice(Math.max(0, match.index - 12), match.index);
+          const after = maskedSource.slice(match.index + item.word.length);
+          // Keywords used as ordinary table keys or property names are not
+          // declarations. Only bare class modifiers/directives are checked.
+          if (/[.:]\s*$/.test(before) || /^\s*[=:]/.test(after)) continue;
 
           if (!classInfo && !(item.word === "final" && /^final\s+class\b/.test(maskedSource.slice(match.index)))) {
             pushMarker(
@@ -4719,6 +5115,7 @@ local part = message[1:7]`;
         const rest = maskedSource.slice(abstractMatch.index);
 
         if (/^abstract\s+class\b/.test(rest)) continue;
+        if (/[.:]\s*$/.test(maskedSource.slice(Math.max(0, abstractMatch.index - 12), abstractMatch.index)) || /^abstract\s*[=:]/.test(rest)) continue;
 
         if (!findClassAtOffset(symbols, abstractMatch.index)) {
           pushMarker(
@@ -5207,91 +5604,22 @@ local part = message[1:7]`;
     // declaration checks cannot detect. Conservative by design: this does not
     // claim to implement the entire Luau/Laua grammar.
     function lintExpressionTokens(source, pushMarker) {
-      const tokens = [];
-      let cursor = 0;
-      let line = 1;
+      const tokens = scanLauaSource(source, false, true).tokens.map(token => ({kind: token.kind === 'literal' ? 'string' : token.kind, text: source.slice(token.at, token.end), start: token.at, end: token.end, line: token.line, endLine: token.endLine}));
       const keywordBoundaries = new Set(['and', 'or', 'then', 'do', 'end', 'else', 'elseif', 'until', 'in', 'return', 'local', 'function', 'type', 'export', 'break', 'continue', 'if', 'for', 'while', 'is', 'as', 'from', 'extends']);
       const valueWords = new Set(['true', 'false', 'nil']);
       const invalidRhs = new Set([',', ';', '}', ')', ']', '=', 'end', 'else', 'elseif', 'until', 'then', 'do']);
       const expectsRhs = new Set(['=', '+=', '-=', '*=', '/=', '//=', '%=', '^=', '..=', '??=', '+', '-', '*', '/', '//', '%', '^', '..', '??', 'and', 'or']);
-      const push = (kind, text, start, end, tokenLine) => tokens.push({kind, text, start, end, line:tokenLine});
       const issue = (token, message) => pushMarker(token.start, token.end, monaco.MarkerSeverity.Error, message, 'syntax', 'InvalidExpression');
-
-      while (cursor < source.length) {
-        const ch = source[cursor];
-        if (/\s/.test(ch)) { if (ch === '\n') line++; cursor++; continue; }
-        if (source.startsWith('--', cursor)) {
-          const longStart = /^--\[(=*)\[/.exec(source.slice(cursor));
-          if (longStart) {
-            const close = ']' + longStart[1] + ']';
-            const until = source.indexOf(close, cursor + longStart[0].length);
-            const end = until < 0 ? source.length : until + close.length;
-            line += (source.slice(cursor, end).match(/\n/g) || []).length;
-            cursor = end;
-          } else {
-            const until = source.indexOf('\n', cursor);
-            cursor = until < 0 ? source.length : until;
-          }
-          continue;
-        }
-        const start = cursor, tokenLine = line;
-        if (ch === '"' || ch === "'" || ch === '`') {
-          const quote = ch;
-          cursor++;
-          let closed = false;
-          while (cursor < source.length) {
-            if (source[cursor] === '\\') { cursor += Math.min(2, source.length - cursor); continue; }
-            if (source[cursor] === quote) { cursor++; closed = true; break; }
-            if (source[cursor] === '\n') {
-              if (quote !== '`') break;
-              line++;
-            }
-            cursor++;
-          }
-          push('string', source.slice(start, cursor), start, cursor, tokenLine);
-          if (!closed) issue(tokens[tokens.length - 1], 'Unterminated string literal.');
-          continue;
-        }
-        if (ch === '[') {
-          const longStart = /^\[(=*)\[/.exec(source.slice(cursor));
-          if (longStart) {
-            const close = ']' + longStart[1] + ']';
-            const until = source.indexOf(close, cursor + longStart[0].length);
-            const end = until < 0 ? source.length : until + close.length;
-            line += (source.slice(cursor, end).match(/\n/g) || []).length;
-            cursor = end;
-            push('string', source.slice(start, cursor), start, cursor, tokenLine);
-            if (until < 0) issue(tokens[tokens.length - 1], 'Unterminated long string literal.');
-            continue;
-          }
-        }
-        if (/[A-Za-z_]/.test(ch)) {
-          const match = /^[A-Za-z_]\w*/.exec(source.slice(cursor));
-          cursor += match[0].length;
-          push('word', match[0], start, cursor, tokenLine);
-          continue;
-        }
-        if (/\d/.test(ch) || (ch === '.' && /\d/.test(source[cursor + 1] || ''))) {
-          const match = /^(?:0[xX][\da-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.(?!\.)[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?)/.exec(source.slice(cursor));
-          if (match) {
-            cursor += match[0].length;
-            push('number', match[0], start, cursor, tokenLine);
-            continue;
-          }
-        }
-        const op = /^(?:\.\.\.|\.\.=|\?\?=|\?\?|\?\.|\/\/=|\.\.|\/\/|==|~=|!=|<=|>=|=>|->|::|\+=|-=|\*=|\/=|%=|\^=)/.exec(source.slice(cursor));
-        cursor += op ? op[0].length : 1;
-        push('symbol', op ? op[0] : ch, start, cursor, tokenLine);
-      }
 
       for (let i = 0; i < tokens.length; i++) {
         const current = tokens[i];
         const previous = tokens[i - 1];
         const next = tokens[i + 1];
-        if (previous && current.line === previous.line) {
+        if (previous && current.line === previous.endLine) {
           const numberAfterClosed = ['}', ')', ']'].includes(previous.text) && current.kind === 'number';
           const valueAfterTable = previous.text === '}' && (current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
-          const valueAfterNumber = previous.kind === 'number' && (current.kind === 'number' || current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
+          const nextIsStatementCall = current.kind === 'word' && ['print','warn','assert'].includes(current.text) && tokens[i + 1]?.text === '(';
+          const valueAfterNumber = previous.kind === 'number' && (current.kind === 'number' || current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text) && !nextIsStatementCall));
           const valueAfterString = previous.kind === 'string' && (current.kind === 'string' || current.kind === 'number' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
           const valueAfterConstant = valueWords.has(previous.text) && (current.kind === 'number' || current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
           const numberAfterIdentifier = previous.kind === 'word' && !keywordBoundaries.has(previous.text) && current.kind === 'number';
@@ -5307,6 +5635,284 @@ local part = message[1:7]`;
       }
       const last = tokens[tokens.length - 1];
       if (last && expectsRhs.has(last.text)) issue(last, `Expected an expression after '${last.text}'.`);
+    }
+
+    // Scope-aware, conservative unknown-name diagnostics. This is not a substitute
+    // for the Roblox Luau type checker; it only flags resolvable value reads.
+    function lintUndefinedNames(source, maskedSource, symbols, pushMarker) {
+      const tokens = [...maskedSource.matchAll(/[A-Za-z_]\w*|\.\.\.|\?\.|::|->|=>|==|~=|<=|>=|\?\?|[^\s]/g)]
+        .map(match => ({text: match[0], start: match.index, end: match.index + match[0].length, word: /^[A-Za-z_]\w*$/.test(match[0])}));
+      const skipped = new Set();
+      const keywords = new Set([...LUAU_KEYWORDS, ...LAUA_KEYWORDS, 'typeof', 'export', 'continue']);
+      const globals = new Set([...LUAU_GLOBALS, 'require', 'warn', 'tick', 'time', 'elapsedTime', 'gcinfo', 'settings', 'UserSettings', 'plugin', 'delay', 'spawn', 'wait', 'collectgarbage', 'debug', 'vector', 'typeof', 'utf8', 'bit32', 'buffer', 'printidentity', '_ENV']);
+      for (const name of Object.keys(symbols.classes)) globals.add(name);
+      for (const name of Object.keys(symbols.enums)) globals.add(name);
+      for (const name of Object.keys(symbols.namespaces)) globals.add(name);
+      const root = {parent: null, names: new Map()};
+      let scope = root;
+      const at = i => tokens[i]?.text;
+      const mark = i => { if (i >= 0 && i < tokens.length) skipped.add(i); };
+      const declare = (i, target = scope) => {
+        if (!tokens[i]?.word) return;
+        target.names.set(tokens[i].text, tokens[i].start);
+        mark(i);
+      };
+      const enter = () => { scope = {parent: scope, names: new Map()}; };
+      const leave = () => { if (scope.parent) scope = scope.parent; };
+      const visible = (name, offset) => {
+        if (globals.has(name)) return true;
+        for (let s = scope; s; s = s.parent) {
+          if (s.names.has(name) && s.names.get(name) <= offset) return true;
+        }
+        return false;
+      };
+      const lineStart = offset => maskedSource.lastIndexOf('\n', offset - 1) + 1;
+      const isAtStart = (i) => {
+        const before = maskedSource.slice(lineStart(tokens[i].start), tokens[i].start);
+        return /^\s*$/.test(before) || /^\s*(?:export|local|public|private|protected|static|override|abstract|final|async|const)\s+$/.test(before);
+      };
+      // Marks a single typed declaration, handling nested type tables and generics.
+      const skipType = (start, stops) => {
+        let braces = 0, angles = 0, parens = 0;
+        for (let k = start; k < tokens.length; k++) {
+          const t = at(k);
+          if (!braces && !angles && !parens && stops.has(t)) return k;
+          if (t === '{' || t === '[') braces++;
+          else if ((t === '}' || t === ']') && braces) braces--;
+          else if (t === '<') angles++;
+          else if (t === '>' && angles) angles--;
+          else if (t === '(') parens++;
+          else if (t === ')' && parens) parens--;
+          mark(k);
+          if (k + 1 < tokens.length && !braces && !angles && !parens && tokens[k + 1].start > tokens[k].end && /\n/.test(maskedSource.slice(tokens[k].end, tokens[k + 1].start))) return k + 1;
+        }
+        return tokens.length;
+      };
+      // Parse local declarations, with support for multiple names and annotations.
+      const markLocals = (i) => {
+        let k = i + 1;
+        const lineEnd = maskedSource.indexOf('\n', tokens[i].start);
+        const statementEnd = maskedSource.indexOf(';', tokens[i].start);
+        let usableAt = statementEnd >= 0 && (lineEnd < 0 || statementEnd < lineEnd) ? statementEnd + 1 : (lineEnd < 0 ? maskedSource.length + 1 : lineEnd + 1);
+        const tail = maskedSource.slice(tokens[i].end, usableAt);
+        const nextStatement = /=\s*(?:\d+(?:\.\d+)?|true|false|nil)\s+(?:print|warn|assert)\s*\(/.exec(tail);
+        if (nextStatement) {
+          const startNext = /(?:print|warn|assert)\s*\(/.exec(nextStatement[0]);
+          if (startNext) usableAt = Math.min(usableAt, tokens[i].end + nextStatement.index + nextStatement[0].lastIndexOf(startNext[0]));
+        }
+        while (k < tokens.length && tokens[k].word) {
+          declare(k);
+          // A local is not visible inside its own initializer. The outer
+          // binding, if any, remains available until this declaration ends.
+          scope.names.set(tokens[k].text, usableAt);
+          k++;
+          if (at(k) === ':') { mark(k++); k = skipType(k, new Set([',', '='])); }
+          if (at(k) === ',') { mark(k++); continue; }
+          break;
+        }
+      };
+      // Add function parameters to the function scope, while ignoring their types.
+      const markParameters = (open) => {
+        if (at(open) !== '(') return;
+        let depth = 0, segmentStart = open + 1;
+        for (let k = open + 1; k < tokens.length; k++) {
+          const t = at(k);
+          if (t === '(' || t === '{' || t === '[') { depth++; continue; }
+          if (t === ')' && depth === 0) {
+            markParamSegment(segmentStart, k);
+            return;
+          }
+          if ((t === ')' || t === '}' || t === ']') && depth) { depth--; continue; }
+          if (t === ',' && depth === 0) { markParamSegment(segmentStart, k); segmentStart = k + 1; }
+        }
+      };
+      const markParamSegment = (from, to) => {
+        if (from >= to) return;
+        if (at(from) === '...') { mark(from); return; }
+        declare(from);
+        let colon = -1, equal = -1, depth = 0;
+        for (let k = from + 1; k < to; k++) {
+          const t = at(k);
+          if (t === '{' || t === '<' || t === '(') depth++;
+          if (t === '}' || t === '>' || t === ')') depth--;
+          if (!depth && t === ':' && colon < 0) colon = k;
+          if (!depth && t === '=' && equal < 0) equal = k;
+        }
+        if (colon >= 0) {
+          mark(colon);
+          for (let k = colon + 1; k < (equal >= 0 ? equal : to); k++) mark(k);
+        }
+      };
+      let pendingLoop = false;
+      let tableDepth = 0;
+
+      for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i], w = t.text, prev = at(i - 1), next = at(i + 1);
+        if (w === '(') {
+          // Recognize typed and untyped arrow parameter lists before visiting
+          // their identifiers, so their first occurrences aren't false alarms.
+          let depth = 1, close = i + 1;
+          while (close < tokens.length && depth) {
+            if (at(close) === '(') depth++;
+            if (at(close) === ')') depth--;
+            if (depth) close++;
+          }
+          if (at(close + 1) === '=>') markParameters(i);
+        }
+        if (w === '{') { tableDepth++; }
+        if (w === '}') { tableDepth = Math.max(0, tableDepth - 1); }
+        if (w === 'end' || w === 'until') { leave(); continue; }
+        if (w === 'elseif' || w === 'else') { leave(); enter(); continue; }
+        if (w === 'local' || w === 'const') {
+          if (next === 'function') { declare(i + 2); continue; }
+          if (next === '{') {
+            // Laua table destructuring: local {Name, Field: Alias} = value
+            let k = i + 2;
+            while (k < tokens.length && at(k) !== '}') {
+              if (tokens[k].word) {
+                if (at(k + 1) === ':') { mark(k++); mark(k++); declare(k++); continue; }
+                declare(k);
+              }
+              k++;
+            }
+          } else if (next !== 'type' && next !== 'class') markLocals(i);
+          continue;
+        }
+        if (w === 'using') { declare(i + 1); continue; }
+        if (w === 'signal' && findClassAtOffset(symbols, t.start)) {
+          // Signal declarations contain argument types, not expression reads.
+          mark(i + 1);
+          if (at(i + 2) === '(') {
+            for (let k = i + 3; k < tokens.length && at(k) !== ')'; k++) mark(k);
+          }
+          continue;
+        }
+        if (w === 'import') {
+          let k = i + 1;
+          if (at(k) === '{') {
+            k++;
+            while (k < tokens.length && at(k) !== '}') {
+              if (tokens[k].word && at(k) !== 'as') {
+                mark(k);
+                if (at(k + 1) === 'as') { mark(k + 1); declare(k + 2); k += 3; continue; }
+                declare(k);
+              }
+              k++;
+            }
+          } else if (tokens[k]?.word) declare(k);
+          // `from` is syntax, not a variable reference.
+          continue;
+        }
+        if ((w === 'get' || w === 'set' || w === 'watch' || w === 'operator') && findClassAtOffset(symbols, t.start) && isAtStart(i)) {
+          let k = i + 1;
+          if (w === 'operator') { mark(k++); }
+          else { mark(k++); }
+          enter();
+          scope.names.set('self', 0);
+          markParameters(k);
+          continue;
+        }
+        if (w === 'function' || w === 'constructor') {
+          let k = i + 1;
+          let hasReceiver = false;
+          if (w === 'function' && at(k) !== '(') {
+            if (tokens[k]?.word) {
+              if (prev !== 'local' && prev !== 'const' && at(k + 1) !== '.' && at(k + 1) !== ':') {
+                // Functions declared without `local` are globals in Luau.
+                globals.add(at(k));
+              }
+              mark(k++);
+            }
+            while ((at(k) === '.' || at(k) === ':') && tokens[k + 1]?.word) {
+              if (at(k) === ':') hasReceiver = true;
+              mark(k++); mark(k++);
+            }
+          }
+          enter();
+          const isStaticMember = /\bstatic\s+$/.test(maskedSource.slice(lineStart(t.start), t.start));
+          if (hasReceiver || (findClassAtOffset(symbols, t.start) && !isStaticMember)) scope.names.set('self', 0);
+          if (at(k) === '<') { // Function generic parameters.
+            let d = 0;
+            while (k < tokens.length) {
+              if (at(k) === '<') d++;
+              if (at(k) === '>') d--;
+              mark(k++);
+              if (!d) break;
+            }
+          }
+          markParameters(k);
+          continue;
+        }
+        if (w === 'class' || w === 'namespace' || w === 'enum') {
+          if (tokens[i + 1]?.word) mark(i + 1);
+          if (next && at(i + 2) === 'extends') { mark(i + 2); mark(i + 3); }
+          enter();
+          // The receiver is introduced by instance methods, not by the class itself.
+          continue;
+        }
+        if (w === 'type' && isAtStart(i)) {
+          let k = i + 1;
+          while (k < tokens.length && (k === i + 1 || !/\n/.test(maskedSource.slice(tokens[k - 1].end, tokens[k].start)))) {
+            if (at(k) === '=') { k++; break; }
+            mark(k++);
+          }
+          skipType(k, new Set(['end']));
+          continue;
+        }
+        // Arrow function arguments are lexical bindings too.
+        if (w === '=>' && at(i - 1) === ')') {
+          let opening = i - 2, depth = 1;
+          while (opening >= 0 && depth > 0) {
+            if (at(opening) === ')') depth++;
+            if (at(opening) === '(') depth--;
+            opening--;
+          }
+          markParameters(opening + 1);
+          continue;
+        }
+        if (w === 'for' && isAtStart(i)) {
+          enter(); pendingLoop = true;
+          for (let k = i + 1; k < tokens.length; k++) {
+            if (at(k) === 'in' || at(k) === '=') break;
+            if (tokens[k].word) declare(k);
+          }
+          continue;
+        }
+        if ((w === 'if' || w === 'while' || w === 'repeat' || w === 'match') && isAtStart(i)) { enter(); continue; }
+        if (w === 'do') { if (pendingLoop) pendingLoop = false; else enter(); continue; }
+        if (w === 'then') continue;
+        if (!t.word || keywords.has(w) || skipped.has(i)) continue;
+        if (prev === '.' || prev === ':' || prev === '?.' || prev === '::' || next === '::') continue;
+        // Table keys are identifiers even if they do not bind a variable.
+        if (tableDepth > 0 && next === '=' && (prev === '{' || prev === ',' || prev === ';')) continue;
+        if (next === ':' && tableDepth > 0 && (prev === '{' || prev === ',')) continue;
+        // Class and enum members are declarations, not global lookups.
+        const enclosingEnum = Object.values(symbols.enums).find(info => t.start > info.start && t.start < info.end);
+        if (enclosingEnum && isAtStart(i) && (next === '=' || next === 'end' || !next || tokens[i + 1].start > t.end && /\n/.test(maskedSource.slice(t.end, tokens[i + 1].start)))) continue;
+        const enclosing = findClassAtOffset(symbols, t.start);
+        if (enclosing && next === '=' && /^\s*$/.test(maskedSource.slice(lineStart(t.start), t.start))) continue;
+        if (enclosing && next === ':' && /^\s*$/.test(maskedSource.slice(lineStart(t.start), t.start))) {
+          mark(i);
+          mark(i + 1);
+          skipType(i + 2, new Set(['=']));
+          continue;
+        }
+        if (enclosing && (prev === 'private' || prev === 'public' || prev === 'protected') && next === ':' ) {
+          mark(i);
+          mark(i + 1);
+          skipType(i + 2, new Set(['=']));
+          continue;
+        }
+
+        if (enclosing && (next === '=' || next === '(') && (prev === 'public' || prev === 'private' || prev === 'protected' || prev === 'static' || prev === 'override' || prev === 'get' || prev === 'set' || prev === 'signal' || prev === 'watch' || prev === 'lazy' || prev === 'function')) continue;
+        if (visible(w, t.start)) continue;
+        // A plain name on the left of an assignment could intentionally create a global.
+        // Report it separately; accidental new globals are unsafe in strict projects.
+        const assignment = next === '=' || next === '+=' || next === '-=';
+        pushMarker(t.start, t.end, monaco.MarkerSeverity.Warning,
+          assignment ? `Assignment to undeclared variable '${w}'. Declare it with 'local' or 'const' first.` : `Unknown variable '${w}'. Declare it before use or check for a typo.`,
+          'lint', 'UnknownVariable');
+      }
     }
 
     function updateLauaDiagnostics(model) {
@@ -5334,7 +5940,19 @@ local part = message[1:7]`;
       };
 
       let expressionSyntaxErrors = 0;
-      lintExpressionTokens(source, (...args) => {
+      try {
+        validateExpressionSyntax(source);
+      } catch (error) {
+        expressionSyntaxErrors++;
+        const message = String(error.message || error);
+        const lineNumber = Number(/line (\d+)/.exec(message)?.[1] || 1);
+        const lines = source.split("\n");
+        const lineStart = lines.slice(0, lineNumber - 1).reduce((n, line) => n + line.length + 1, 0);
+        const at = Number.isInteger(error.offset) ? error.offset : lineStart;
+        const end = Number.isInteger(error.endOffset) ? Math.max(at + 1, error.endOffset) : lineStart + Math.max(1, (lines[lineNumber - 1] || "").length);
+        pushMarker(at, end, monaco.MarkerSeverity.Error, message, "syntax", "CompilerPreflight");
+      }
+      if (!expressionSyntaxErrors) lintExpressionTokens(source, (...args) => {
         expressionSyntaxErrors++;
         pushMarker(...args);
       });
@@ -5471,6 +6089,7 @@ local part = message[1:7]`;
       lintBalancedDelimiters(masked, pushMarker);
       lintDuplicateParameters(masked, pushMarker);
       lintUnusedLocals(masked, pushMarker);
+      lintUndefinedNames(source, masked, symbols, pushMarker);
       lintNamespaceUsage(source, masked, pushMarker);
       lintClassOnlyKeywords(masked, symbols, pushMarker);
       lintEnumMembers(source, symbols, pushMarker);
@@ -5954,6 +6573,20 @@ local part = message[1:7]`;
           }
 
           const sourceSymbols = getProjectSymbols(model);
+          // Laua instance methods use standard Luau `self`, not a separate
+          // `this` keyword. The member completion path already resolves
+          // `self.` / `self:` through the class and its inherited members.
+          if (model.getLanguageId() === "laua" && findClassAtOffset(sourceSymbols, model.getOffsetAt(position))) {
+            suggestions.unshift({
+              label: "self",
+              kind: monaco.languages.CompletionItemKind.Variable,
+              insertText: "self",
+              detail: "Current Laua class instance",
+              documentation: "Access this instance's fields and methods with self.Field or self:Method(...).",
+              sortText: "0000_self",
+              range
+            });
+          }
           const deprecatedFunctions = indexPlaygroundDeprecatedFunctions(model.getValue(), maskNonCode(model.getValue()));
 
           for (const [localName, localInfo] of Object.entries(sourceSymbols.locals)) {
@@ -7065,7 +7698,7 @@ local part = message[1:7]`;
       function exportStudioSourceProject() {
         try {
           const blob=makeStudioSourceRbxmx();
-          downloadProjectBlob('Laua-v3.34-editable-studio.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.38-editable-studio.rbxmx',blob);
           projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -7163,7 +7796,7 @@ local part = message[1:7]`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.34-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.38-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
