@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.38"}
+local Transpiler = {Version = "3.39"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -795,6 +795,7 @@ local LAUA_METHOD_KINDS = {"async function", "function", "get", "set"}
 
 local function transpileClasses(source: string): string
     local allocationRequirements: {[string]: {Values: boolean, Initialized: boolean}} = {}
+    local hookFreeClasses: {[string]: boolean} = {}
     local searchFrom = 1
     while true do
         local start = findKeyword(source, "class", nil, searchFrom)
@@ -1023,6 +1024,8 @@ local function transpileClasses(source: string): string
         local needsValues = next(watchers) ~= nil or next(lazies) ~= nil or (base ~= nil and (parentAllocation == nil or parentAllocation.Values))
         local needsInitialized = next(lazies) ~= nil or (base ~= nil and (parentAllocation == nil or parentAllocation.Initialized))
         allocationRequirements[name] = {Values = needsValues, Initialized = needsInitialized}
+        local hookFree = #getters == 0 and #setters == 0 and next(lazies) == nil and next(watchers) == nil and (base == nil or hookFreeClasses[base] == true)
+        hookFreeClasses[name] = hookFree
 
         -- A plain class does not need getter, setter, watcher, or lazy-property hooks.
         -- Keep __init so later subclasses can safely call the parent initializer.
@@ -1056,6 +1059,62 @@ local function transpileClasses(source: string): string
                 local code = normalized(transpileSource(method.Body), "    ")
                 table.insert(simple, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")})`)
                 if code ~= "" then table.insert(simple, code) end
+                table.insert(simple, "end")
+            end
+            source = source:sub(1, declarationStart - 1) .. table.concat(simple, "\n") .. source:sub(closing.Finish + 1)
+            continue
+        end
+
+        -- Known hook-free inheritance needs no property lookup closures,
+        -- lazy state, getter/setter tables, or watcher metadata.
+        if hookFree then
+            local simple = {}
+            if base then
+                table.insert(simple, `if {base}.__final then error("Cannot extend final class '{base}'") end`)
+                table.insert(simple, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
+            else
+                table.insert(simple, "local " .. name .. ": {[string]: any} = {}")
+            end
+            table.insert(simple, `{name}.__index = {name}`)
+            table.insert(simple, `{name}.__abstract = {tostring(prefix == "abstract")}`)
+            table.insert(simple, `{name}.__final = {tostring(prefix == "final")}`)
+            local finalEntries = {}
+            for _, method in methods do
+                if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
+            end
+            local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
+            table.insert(simple, `{name}.__finalMethods = {base and "setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})" or finalTable}`)
+            for _, field in statics do table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end
+            table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
+            if parentInit then table.insert(simple, "    " .. parentInit) end
+            for _, field in fields do table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end
+            for _, item in signals do table.insert(simple, `    self.{item.Name} = __lauaSignal.new({item.Types or ""})`) end
+            local init = normalized(transpileSource(ctorBody), "    ")
+            if init ~= "" then table.insert(simple, init) end
+            table.insert(simple, "end")
+            table.insert(simple, `function {name}.new(...: any): any`)
+            table.insert(simple, `    if {name}.__abstract then error("Cannot instantiate abstract class '{name}'") end`)
+            table.insert(simple, `    local self: any = setmetatable({}, {name})`)
+            table.insert(simple, `    {name}.__init(self, ...)`)
+            table.insert(simple, "    return self")
+            table.insert(simple, "end")
+            for _, op in operators do
+                local opBody = normalized(transpileSource(base and replaceSuper(op.Body, base) or op.Body), "    ")
+                table.insert(simple, `function {name}.{op.Name}(self: any{trim(op.Params) ~= "" and ", " .. (op.Params:match("^%s*[%a_][%w_]*%s*$") and trim(op.Params) .. ": any" or op.Params) or ""})`)
+                if opBody ~= "" then table.insert(simple, opBody) end
+                table.insert(simple, "end")
+            end
+            for _, method in methods do
+                if base then table.insert(simple, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
+                local methodBody = base and replaceSuper(method.Body, base, not method.Static) or method.Body
+                if maskNonCode(methodBody):find("super%s*%(") then error("super(...) can only be called in constructors") end
+                methodBody = normalized(transpileSource(methodBody), "    ")
+                table.insert(simple, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")})`)
+                if method.Abstract then
+                    table.insert(simple, `    error("Abstract method '{name}.{method.Name}' must be overridden")`)
+                elseif methodBody ~= "" then
+                    table.insert(simple, methodBody)
+                end
                 table.insert(simple, "end")
             end
             source = source:sub(1, declarationStart - 1) .. table.concat(simple, "\n") .. source:sub(closing.Finish + 1)
@@ -2535,7 +2594,7 @@ local function compactGeneratedOutput(source: string): string
     local result = {}
     for row in source:gmatch("([^\n]*)\n?") do
         local commentOnly = row:match("^%s*%-%-") and not row:match("^%s*%-%-[!#]")
-        if row ~= "" and row:match("%S") and not commentOnly then table.insert(result,row) end
+        if row ~= "" and row:match("%S") and not commentOnly then table.insert(result,trim(row)) end
     end
     return table.concat(result,"\n")
 end
@@ -2800,6 +2859,88 @@ local function validateExpressionSyntax(source: string)
     if last and (assignments[last.value] or binary[last.value]) then fail("Missing expression after '" .. last.value .. "'.", last) end
 end
 
+-- Verify contracts between classes declared in this compilation unit.
+-- Imported/dynamic parents still retain runtime guards in transpileClasses.
+local function validateClassContracts(source: string)
+    if not source:find("class", 1, true) then return end
+    local masked = maskNonCode(source)
+    local lines = splitLines(masked)
+    local classes = {}
+    local function fail(message: string, at: number)
+        local line, column = 1, 1
+        for i = 1, at - 1 do
+            if source:sub(i, i) == "\n" then line += 1; column = 1 else column += 1 end
+        end
+        error(`Laua class error (line {line}, column {column}): {message}`, 2)
+    end
+    for _, row in lines do
+        local header = trim(row.Text)
+        local classModifier, className, base = header:match("^(final)%s+class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$")
+        if not className then classModifier, className, base = header:match("^(abstract)%s+class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$") end
+        if not className then className, base = header:match("^class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$") end
+        if not className then classModifier, className = header:match("^(final)%s+class%s+([%a_][%w_]*)%s*$") end
+        if not className then classModifier, className = header:match("^(abstract)%s+class%s+([%a_][%w_]*)%s*$") end
+        if not className then className = header:match("^class%s+([%a_][%w_]*)%s*$") end
+        if not className then continue end
+        local ending = findBlock(source, row.Start, lines)
+        if classes[className] then fail(`Duplicate class '{className}'.`, row.Start) end
+        local body = source:sub(row.Finish + 1, ending.Start - 1)
+        local bodyLines = splitLines(maskNonCode(body))
+        local members = {}
+        local nextAllowed = 1
+        for _, memberRow in bodyLines do
+            if memberRow.Start < nextAllowed then continue end
+            local text = trim(memberRow.Text)
+            local modifiers = {}
+            for _ = 1, 7 do
+                local prefix = text:match("^([%a_]+)%s+")
+                if prefix ~= "final" and prefix ~= "override" and prefix ~= "static" and prefix ~= "public" and prefix ~= "private" and prefix ~= "protected" and prefix ~= "abstract" then break end
+                modifiers[prefix] = true
+                text = trim(text:sub(#prefix + 1))
+            end
+            local memberName = text:match("^function%s+([%a_][%w_]*)%s*%(") or text:match("^async%s+function%s+([%a_][%w_]*)%s*%(")
+            if memberName then
+                members[memberName] = {Final = modifiers.final == true, Override = modifiers.override == true, Static = modifiers.static == true, At = row.Finish + memberRow.Start}
+            end
+            if memberName or text:match("^constructor%s*%(") or text:match("^watch%s+[%a_][%w_]*%s*%(") or text:match("^get%s+[%a_][%w_]*%s*%(") or text:match("^set%s+[%a_][%w_]*%s*%(") or text:match("^operator%s+") then
+                local at = memberRow.Start + (memberRow.Text:find("%S") or 1) - 1
+                local ok, closing = pcall(findBlock, body, at, bodyLines)
+                if ok then nextAllowed = closing.Finish + 1 end
+            end
+        end
+        classes[className] = {Base = base, Final = classModifier == "final", Methods = members, At = row.Start}
+    end
+    for className, info in classes do
+        local baseInfo = info.Base and classes[info.Base]
+        if baseInfo and baseInfo.Final then fail(`Cannot extend final class '{info.Base}'.`, info.At) end
+        local seen = {[className] = true}
+        local parent = info.Base
+        while parent and classes[parent] do
+            if seen[parent] then fail(`Circular class inheritance involving '{className}'.`, info.At) end
+            seen[parent] = true
+            parent = classes[parent].Base
+        end
+        for memberName, member in info.Methods do
+            local ancestor = info.Base
+            local visited = {}
+            local inherited = nil
+            while ancestor and classes[ancestor] and not visited[ancestor] do
+                visited[ancestor] = true
+                local record = classes[ancestor]
+                if record.Methods[memberName] then inherited = record.Methods[memberName]; break end
+                ancestor = record.Base
+            end
+            if inherited and inherited.Final then fail(`Cannot override final method '{memberName}' in class '{className}'.`, member.At) end
+            if member.Override and not inherited and (not info.Base or classes[info.Base]) then
+                fail(`Method '{className}.{memberName}' is marked override but no ancestor defines it.`, member.At)
+            end
+            if member.Override and inherited and member.Static ~= inherited.Static then
+                fail(`Override '{className}.{memberName}' changes static/instance method kind.`, member.At)
+            end
+        end
+    end
+end
+
 local function validateLauaSemantics(source: string)
     if source:find("local __laua", 1, true) then return end
     local masked = maskNonCode(source)
@@ -2820,8 +2961,9 @@ local function validateLauaSemantics(source: string)
     local function paramParts(raw: string): {string}
         local result = {}
         local start, depth = 1, 0
+        local maskedArguments = maskNonCode(raw)
         for i = 1, #raw + 1 do
-            local ch = raw:sub(i, i)
+            local ch = maskedArguments:sub(i, i)
             if i > #raw or (ch == "," and depth == 0) then
                 local part = trim(raw:sub(start, i - 1))
                 if part ~= "" then table.insert(result, part) end
@@ -2860,7 +3002,11 @@ local function validateLauaSemantics(source: string)
     for _, line in lines do
         local code = trim(line.Text)
         local name, base = code:match("^class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$")
+        if not name then name, base = code:match("^final%s+class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$") end
+        if not name then name, base = code:match("^abstract%s+class%s+([%a_][%w_]*)%s+extends%s+([%a_][%w_%.]*)%s*$") end
         if not name then name = code:match("^class%s+([%a_][%w_]*)%s*$") end
+        if not name then name = code:match("^final%s+class%s+([%a_][%w_]*)%s*$") end
+        if not name then name = code:match("^abstract%s+class%s+([%a_][%w_]*)%s*$") end
         if name then
             local ending = findBlock(source, line.Start, lines)
             local info = {Base = base, Start = line.Start, Finish = ending.Finish, Instance = {}, Static = {}, Constructor = nil}
@@ -2965,6 +3111,59 @@ local function validateLauaSemantics(source: string)
             if not declaredBefore then fail(`Unknown variable '{reference}'.`, line.Start) end
         end
     end
+    -- Lexically scoped instance inference, so a local variable inside a
+    -- do/function/if block does not change an outer class binding.
+    local typedBindings = {}
+    local frames = {{} }
+    local function addBinding(name: string, className: string?, at: number)
+        local slot = {Name = name, Class = className, First = at, Last = math.huge}
+        if not typedBindings[name] then typedBindings[name] = {} end
+        table.insert(typedBindings[name], slot)
+        table.insert(frames[#frames], slot)
+    end
+    local function closeFrame(at: number)
+        if #frames <= 1 then return end
+        local frame = table.remove(frames)
+        for _, slot in frame do slot.Last = at end
+    end
+    for _, line in lines do
+        local code = trim(line.Text)
+        if code == "" then continue end
+        if code:match("^end%f[%W]") or code:match("^until%f[%W]") then
+            closeFrame(line.Start)
+            continue
+        end
+        if code:match("^else%f[%W]") or code:match("^elseif%f[%W]") then
+            closeFrame(line.Start)
+            table.insert(frames, {})
+        end
+        if blockStart(code) then table.insert(frames, {}) end
+        local params = code:match("^%s*function%s+[%w_%.:]+%s*%(([^)]*)%)") or code:match("^local%s+function%s+[%w_%.:]+%s*%(([^)]*)%)") or code:match("^constructor%s*%(([^)]*)%)")
+        if params then
+            for _, part in paramParts(params) do
+                local pname = part:match("^([%a_][%w_]*)")
+                if pname then addBinding(pname, nil, line.Start) end
+            end
+        end
+        local declaration, declaredType, inferredType = code:match("^local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)")
+        if not declaration then declaration, inferredType = code:match("^local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)") end
+        if not declaration then declaration, declaredType = code:match("^local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)") end
+        if not declaration then declaration = code:match("^local%s+([%a_][%w_]*)%f[%W]") end
+        if not declaration then declaration = code:match("^const%s+([%a_][%w_]*)%f[%W]") end
+        if declaration and declaration ~= "function" then
+            local className = inferredType and classes[inferredType] and inferredType or declaredType and classes[declaredType] and declaredType or nil
+            addBinding(declaration, className, line.Start)
+        end
+    end
+    local function resolveTypedOwner(name: string, at: number): string?
+        local bindings = typedBindings[name]
+        if not bindings then return knownVariables[name] end
+        local best = nil
+        for _, record in bindings do
+            if record.First <= at and at < record.Last and (not best or record.First > best.First) then best = record end
+        end
+        return best and best.Class or nil
+    end
     local knownCalls = {}
     for word in ("if while for until repeat return function constructor signal get set new super async await select continue else elseif then do end not and or"):gmatch("[%a_][%w_]*") do knownCalls[word] = true end
     for name in globals do knownCalls[name] = true end
@@ -3035,7 +3234,7 @@ local function validateLauaSemantics(source: string)
     for _, line in lines do
         local code = line.Text
         for owner, delimiter, member in code:gmatch("([%a_][%w_]*)%s*([%.:])%s*([%a_][%w_]*)") do
-            local className = knownVariables[owner]
+            local className = resolveTypedOwner(owner, line.Start)
             local isStatic = false
             if classes[owner] then className = owner; isStatic = true end
             if owner == "self" then
@@ -3052,18 +3251,25 @@ local function validateLauaSemantics(source: string)
                 if delimiter == ":" and found.Kind ~= "method" then fail(`'{className}.{member}' is not a method.`, line.Start) end
             end
         end
-        for owner, member, args in code:gmatch("([%a_][%w_]*)%s*:%s*([%a_][%w_]*)%s*%(([^)]*)%)") do
-            local className = knownVariables[owner]
+        for startAt, owner, member in code:gmatch("()([%a_][%w_]*)%s*:%s*([%a_][%w_]*)%s*%(") do
+            local className = resolveTypedOwner(owner, line.Start)
             if owner == "self" then
                 for cls, info in classes do
                     if line.Start > info.Start and line.Start < info.Finish then className = cls; break end
                 end
             end
             local info = className and memberOf(className, member, false)
-            if info and info.Kind == "method" then checkCall(className .. "." .. member, info.Params, args, line.Start) end
+            if info and info.Kind == "method" then
+                local opening = code:find("%(", startAt)
+                local closing = opening and findCloseParen(code, opening)
+                if opening and closing then
+                    local raw = source:sub(line.Start, line.Finish)
+                    checkCall(className .. "." .. member, info.Params, raw:sub(opening + 1, closing - 1), line.Start + startAt - 1)
+                end
+            end
         end
         for owner, signalName, args in code:gmatch("([%a_][%w_]*)%.([%a_][%w_]*)%s*:%s*Fire%s*%(([^)]*)%)") do
-            local className = knownVariables[owner]
+            local className = resolveTypedOwner(owner, line.Start)
             local signal = className and memberOf(className, signalName, false)
             if signal and signal.Kind == "signal" and signal.Params then
                 local raw = source:sub(line.Start, line.Finish)
@@ -3093,7 +3299,10 @@ function Transpiler.Transpile(source: string, options: any?): string
     if style ~= "Readable" and style ~= "Compact" then error("Invalid Laua output style") end
 
     validateExpressionSyntax(source)
-    if type(options) ~= "table" or options.SemanticCheck ~= false then validateLauaSemantics(source) end
+    if type(options) ~= "table" or options.SemanticCheck ~= false then
+        validateClassContracts(source)
+        validateLauaSemantics(source)
+    end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     if source:find("inline", 1, true) then source = transpileInlineFunctions(source) end
