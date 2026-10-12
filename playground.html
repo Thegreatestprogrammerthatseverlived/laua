@@ -93,7 +93,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.32 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.34 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -486,83 +486,58 @@ local part = message[1:7]`;
     }
 
     function maskNonCode(source, preserveDirectives = false) {
-      if (!source.includes('"') && !source.includes("'") && !source.includes('--')) return source;
+      // Preserve length and newlines, and mask every Luau string/comment form.
+      // This prevents source transformers from reading keywords inside user text.
+      if (!/["'`\[]|--/.test(source)) return source;
       const out = source.split("");
+      const blank = (start, end) => {
+        for (let k = start; k < end; k++) if (source[k] !== "\n" && source[k] !== "\r") out[k] = " ";
+      };
       let i = 0;
-      let quote = null;
-      let lineComment = false;
-      let blockComment = false;
-
       while (i < source.length) {
-        const one = source[i];
-        const two = source[i + 1];
-
-        if (quote) {
-          if (one === "\\") {
-            out[i] = " ";
-            if (i + 1 < out.length) out[i + 1] = " ";
-            i += 2;
+        if (source.startsWith("--", i)) {
+          if (preserveDirectives && source[i + 2] === "!") {
+            while (i < source.length && source[i] !== "\n") i++;
             continue;
           }
-          if (one === quote) quote = null;
-          if (one !== "\n") out[i] = " ";
-          i++;
-          continue;
-        }
-
-        if (lineComment) {
-          if (one === "\n") {
-            lineComment = false;
+          const long = /^--\[(=*)\[/.exec(source.slice(i));
+          if (long) {
+            const closing = "]" + long[1] + "]";
+            const endAt = source.indexOf(closing, i + long[0].length);
+            const end = endAt < 0 ? source.length : endAt + closing.length;
+            blank(i, end);
+            i = end;
           } else {
-            out[i] = " ";
+            let end = source.indexOf("\n", i);
+            if (end < 0) end = source.length;
+            blank(i, end);
+            i = end;
           }
-          i++;
           continue;
         }
-
-        if (blockComment) {
-          if (one === "]" && two === "]") {
-            out[i] = " ";
-            if (i + 1 < out.length) out[i + 1] = " ";
-            blockComment = false;
-            i += 2;
+        const ch = source[i];
+        if (ch === "'" || ch === '"' || ch === '`') {
+          const quote = ch, start = i++;
+          while (i < source.length) {
+            if (source[i] === "\\") { i = Math.min(i + 2, source.length); continue; }
+            if (source[i++] === quote) break;
+          }
+          blank(start, i);
+          continue;
+        }
+        if (ch === "[") {
+          const long = /^\[(=*)\[/.exec(source.slice(i));
+          if (long) {
+            const closing = "]" + long[1] + "]";
+            const endAt = source.indexOf(closing, i + long[0].length);
+            const end = endAt < 0 ? source.length : endAt + closing.length;
+            blank(i, end);
+            i = end;
             continue;
           }
-          if (one !== "\n") out[i] = " ";
-          i++;
-          continue;
         }
-
-        if (one === "-" && two === "-" && source[i + 2] === "[" && source[i + 3] === "[") {
-          for (let j = 0; j < 4; j++) if (i + j < out.length) out[i + j] = " ";
-          blockComment = true;
-          i += 4;
-          continue;
-        }
-
-        if (one === "-" && two === "-" && preserveDirectives && source[i + 2] === "!") {
-          while (i < source.length && source[i] !== "\n") i++;
-          continue;
-        }
-
-        if (one === "-" && two === "-") {
-          out[i] = " ";
-          if (i + 1 < out.length) out[i + 1] = " ";
-          lineComment = true;
-          i += 2;
-          continue;
-        }
-
-        if (one === '"' || one === "'") {
-          quote = one;
-          out[i] = " ";
-          i++;
-          continue;
-        }
-
         i++;
       }
-
       return out.join("");
     }
 
@@ -688,7 +663,8 @@ local part = message[1:7]`;
         const start = i;
         while (/[A-Za-z0-9_.]/.test(source[i] || "")) i++;
         const name = source.slice(start, i);
-        if (!name) throw new Error("Expected class name after 'new'");
+        // `new` is also a legal identifier and table field (e.g. {new = 5}).
+        if (!name) { cursor = idx + 3; continue; }
         let p = i;
         while (/\s/.test(source[p] || "")) p++;
         pieces.push(source.slice(last, idx), name, source[p] === '(' ? '.new' : '.new()');
@@ -1561,7 +1537,7 @@ local part = message[1:7]`;
 
     function lauLeft(masked, end) {
       let i = end;
-      while (i >= 0 && /[ \t]/.test(masked[i])) i--;
+      while (i >= 0 && /\s/.test(masked[i])) i--;
       if (i < 0) return -1;
       if (masked[i] === ')' || masked[i] === ']') {
         const close = masked[i], open = close === ')' ? '(' : '[';
@@ -1726,7 +1702,7 @@ local part = message[1:7]`;
       // separately without repeatedly copying the entire source document.
       if (source.includes('\n') && source.includes('??') && !/["'`]/.test(source) && !source.includes('--') && !source.includes('\r')) {
         const lines = source.split('\n');
-        const eligible = /^[ \t]*local\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\?\?\s*[A-Za-z_]\w*[ \t]*$/;
+        const eligible = /^[ \t]*local\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\?\?\s*(?:[A-Za-z_]\w*|\d+(?:\.\d+)?)[ \t]*$/;
         if (lines.every(line => !line.includes('??') || eligible.test(line))) {
           return lines.map(line => line.includes('??') ? transpileCoalescing(line) : line).join('\n');
         }
@@ -1735,14 +1711,35 @@ local part = message[1:7]`;
       while (true) {
         const pos = masked.lastIndexOf('??');
         if (pos < 0) return source;
-        const left = lauLeft(masked, pos - 1), right = lauRight(source, pos + 2);
+        const left = lauLeft(masked, pos - 1);
+        let right = lauRight(source, pos + 2);
+        // When ?? begins a continuation line, the full expression to the
+        // end of that line is its lazy fallback (not only its first token).
+        const lineStart = masked.lastIndexOf('\n', pos - 1) + 1;
+        const continuation = !masked.slice(lineStart, pos).trim();
+        if (continuation && right >= 0) {
+          const lineEnd = masked.indexOf('\n', pos + 2);
+          const limit = lineEnd < 0 ? masked.length : lineEnd;
+          const visible = masked.slice(pos + 2, limit).trimEnd();
+          if (visible) right = pos + 2 + visible.length - 1;
+        }
         if (left < 0 || right < 0) throw new Error('Nil coalescing expects left ?? fallback');
         const before = masked.slice(Math.max(0, left - 8), left).trim();
         const after = (masked.slice(right + 1).split('\n')[0] || '').trim();
         if (/[+\-*/%^<>~&|]$/.test(before) || /\b(?:and|or)$/.test(before)) throw new Error('Wrap compound ?? left operands in parentheses');
         if (/^[+\-*/%^<>=~&|]/.test(after) || /^\.\./.test(after) || /^(?:and|or)\b/.test(after)) throw new Error('Wrap compound ?? fallbacks in parentheses');
         const a = source.slice(left, pos).trim(), b = source.slice(pos + 2, right + 1).trim();
-        const replacement = `__lauaCore.coalesce(${a}, function() return ${b} end)`;
+        // A simple identifier is safe to read twice without reevaluating a
+        // property lookup/call. Luau if-expressions are lazy and preserve false.
+        // Other expressions still use the exactly-once runtime helper.
+        const simpleIdentifier = /^[A-Za-z_]\w*$/.test(a);
+        // Limit this rewrite to fallbacks with one result. A function call can
+        // produce multiple values; the original helper preserves that tuple.
+        const singleResultFallback = /^[A-Za-z_]\w*$/.test(b) || /^(?:0[xX][\da-fA-F_]+|0[bB][01_]+|\d[\d_]*(?:\.\d[\d_]*)?)$/.test(b);
+        const replacement = b === 'nil' && simpleIdentifier ? a
+          : simpleIdentifier && singleResultFallback && !/^(?:true|false|nil)$/.test(a)
+            ? `(if ${a} ~= nil then ${a} else ${b})`
+            : `__lauaCore.coalesce(${a}, function() return ${b} end)`;
         source = source.slice(0, left) + replacement + source.slice(right + 1);
         masked = masked.slice(0, left) + maskNonCode(replacement) + masked.slice(right + 1);
       }
@@ -1840,6 +1837,10 @@ local part = message[1:7]`;
       let match;
       while ((match = pattern.exec(masked)) !== null) {
         if (/[.:\w]/.test(masked[match.index - 1] || "")) continue;
+        const rest = masked.slice(match.index + 5);
+        const operand = /^[ \t]*(?:\(|[A-Za-z_]\w*)/.exec(rest);
+        // A bare `await` can also be a table key or identifier.
+        if (!operand || /^(?:local|const|if|then|end|else|return)\b/.test(rest.trimStart())) continue;
         positions.push(match.index);
       }
       for (let n = positions.length - 1; n >= 0; n--) {
@@ -2019,15 +2020,18 @@ local part = message[1:7]`;
         const match = pattern.exec(masked);
         if (!match) return source;
         const pos = match.index;
-        const linePrefix=masked.slice(masked.lastIndexOf('\n',pos-1)+1,pos);
-        if (['.',':'].includes(masked[pos-1]) || /function\s+$/.test(linePrefix)) {from=pos+2;continue;}
-        const left = lauLeft(masked,pos-1);
-        const right = /^([ \t]+)([A-Za-z_]\w*)/.exec(masked.slice(pos+2));
-        if (left < 0 || !right) throw new Error('is expects: value is ClassName');
-        const end = pos+2+right[0].length;
-        const expression = source.slice(left,pos).trim();
-        source = source.slice(0,left)+`__lauaCore.is(${expression}, ${right[2]})`+source.slice(end);
-        from = left+15;
+        const linePrefix = masked.slice(masked.lastIndexOf('\n', pos - 1) + 1, pos);
+        // `is` can legally be a table key, field name, parameter, or variable.
+        if (/[.:]/.test(masked[pos - 1] || '') || /\b(?:function|local|const|type)\s+$/.test(linePrefix)) { from = pos + 2; continue; }
+        const right = /^([ \t]+)([A-Za-z_]\w*)/.exec(masked.slice(pos + 2));
+        if (!right || /^(?:and|or|then|do|end|else|in)$/.test(right[2])) { from = pos + 2; continue; }
+        const left = lauLeft(masked, pos - 1);
+        if (left < 0) { from = pos + 2; continue; }
+        const expression = source.slice(left, pos).trim();
+        if (!expression || /^(?:local|const|return|if|then|and|or)$/.test(expression)) { from = pos + 2; continue; }
+        const end = pos + 2 + right[0].length;
+        source = source.slice(0, left) + `__lauaCore.is(${expression}, ${right[2]})` + source.slice(end);
+        from = left + 14;
       }
     }
 
@@ -2053,47 +2057,87 @@ local part = message[1:7]`;
     }
 
     function transpileMemo(source) {
+      let from = 0;
       while (true) {
-        const masked=maskNonCode(source),find=/\bmemo\b/g;
-        let match=find.exec(masked);
-        while (match && ['.',':'].includes(masked[match.index-1])) match=find.exec(masked);
+        const masked = maskNonCode(source), find = /\bmemo\b/g;
+        find.lastIndex = from;
+        const match = find.exec(masked);
         if (!match) return source;
-        const start=match.index,lineStart=source.lastIndexOf('\n',start-1)+1;
-        if (source.slice(lineStart,start).trim()) throw new Error('memo must start a declaration');
-        const endOfHeader=source.indexOf('\n',start);
-        if (endOfHeader<0) throw new Error('memo requires a function body');
-        const header=source.slice(start,endOfHeader).trim();
-        const declaration=/^memo\s+(?:local\s+)?function\s+([A-Za-z_]\w*)\s*\(/.exec(header);
-        if (!declaration) throw new Error('memo supports named functions only');
-        const fixed=source.slice(0,start)+header.replace(/^memo\s+/,'')+source.slice(endOfHeader);
-        const end=findMatchingEndByLines(fixed,start);
-        const indent=source.slice(lineStart,start);
-        source=fixed.slice(0,end.end+1)+`\n${indent}${declaration[1]} = __lauaCore.memo(${declaration[1]})`+fixed.slice(end.end+1);
+        const start = match.index, lineStart = source.lastIndexOf('\n', start - 1) + 1;
+        // A normal field or variable called `memo` is not a declaration.
+        if (/[.:]/.test(masked[start - 1] || '') || source.slice(lineStart, start).trim()) {from = start + 4; continue;}
+        const endOfHeader = source.indexOf('\n', start);
+        if (endOfHeader < 0) {from = start + 4; continue;}
+        const header = source.slice(start, endOfHeader).trim();
+        const declaration = /^memo\s+(?:local\s+)?function\s+([A-Za-z_]\w*)\s*\(/.exec(header);
+        if (!declaration) {from = start + 4; continue;}
+        const fixed = source.slice(0, start) + header.replace(/^memo\s+/, '') + source.slice(endOfHeader);
+        const end = findMatchingEndByLines(fixed, start);
+        const indent = source.slice(lineStart, start);
+        source = fixed.slice(0, end.end + 1) + `\n${indent}${declaration[1]} = __lauaCore.memo(${declaration[1]})` + fixed.slice(end.end + 1);
+        from = start + declaration[1].length;
       }
     }
 
-    function transpileParameterDefaults(source) {
-      return source.split('\n').map(raw=>{
-        if (!raw.includes('function') || !raw.includes('=')) return raw;
-        const masked=maskNonCode(raw);
-        const at=/\bfunction\b/.exec(masked);
-        if (!at) return raw;
-        const open=masked.indexOf('(',at.index),close=masked.indexOf(')',open+1);
-        if(open<0||close<0)return raw;
-        const params=raw.slice(open+1,close);
-        if(!params.includes('='))return raw;
-        const parsed=[],initializers=[];
-        for(const piece of params.split(',')) {
-          const m=/^\s*(.*?)\s*=\s*(.*?)\s*$/.exec(piece);
-          if(!m){parsed.push(piece.trim());continue;}
-          const name=/^[A-Za-z_]\w*/.exec(m[1]);
-          if(!name)throw new Error('Invalid default parameter');
-          const original=m[1].trim();
-          const inferred=/^-?\d+(?:\.\d+)?$/.test(m[2].trim()) ? 'number?' : /^(["']).*\1$/.test(m[2].trim()) ? 'string?' : /^(?:true|false)$/.test(m[2].trim()) ? 'boolean?' : 'any';
-          parsed.push(/:\s*/.test(original) ? original : `${name[0]}: ${inferred}`);
-          initializers.push(`if ${name[0]} == nil then ${name[0]} = ${m[2]} end`);
+    function splitDefaultParameters(params) {
+      const code = maskNonCode(params);
+      const pieces = [];
+      const closers = [];
+      let start = 0, typeArguments = 0, inType = false;
+      for (let i = 0; i < code.length; i++) {
+        const ch = code[i];
+        if (ch === '(') closers.push(')');
+        else if (ch === '{') closers.push('}');
+        else if (ch === '[') closers.push(']');
+        else if (ch === ')' || ch === '}' || ch === ']') {
+          if (closers.pop() !== ch) throw new Error('Unbalanced default parameter expression');
+        } else if (closers.length === 0) {
+          if (ch === ':' && typeArguments === 0) inType = true;
+          else if (ch === '=' && typeArguments === 0) inType = false;
+          else if (ch === '<' && inType) typeArguments++;
+          else if (ch === '>' && typeArguments > 0) typeArguments--;
+          else if (ch === ',' && typeArguments === 0) {
+            pieces.push(params.slice(start, i));
+            start = i + 1;
+            inType = false;
+          }
         }
-        return raw.slice(0,open+1)+parsed.join(', ')+raw.slice(close)+'\n'+initializers.map(s=>(raw.match(/^[ \t]*/)[0]+'    '+s)).join('\n');
+      }
+      if (closers.length || typeArguments) throw new Error('Unclosed default parameter expression');
+      pieces.push(params.slice(start));
+      return pieces;
+    }
+
+    function transpileParameterDefaults(source) {
+      return source.split('\n').map(raw => {
+        if (!raw.includes('function') || !raw.includes('=')) return raw;
+        const masked = maskNonCode(raw);
+        const found = /\bfunction\b/.exec(masked);
+        if (!found) return raw;
+        const open = masked.indexOf('(', found.index);
+        if (open < 0) return raw;
+        const close = findMatchingParen(raw, open, masked);
+        const params = raw.slice(open + 1, close);
+        if (!params.includes('=')) return raw;
+        const parsed = [], initializers = [];
+        for (const part of splitDefaultParameters(params)) {
+          const code = maskNonCode(part);
+          const equals = code.indexOf('=');
+          if (equals < 0) { parsed.push(part.trim()); continue; }
+          const original = part.slice(0, equals).trim();
+          const value = part.slice(equals + 1).trim();
+          const name = /^([A-Za-z_]\w*)(?:\s*:\s*(.+))?$/.exec(original);
+          if (!name || !value) throw new Error('Invalid default parameter');
+          const inferred = /^-?\d+(?:\.\d+)?$/.test(value) ? 'number?'
+            : /^(?:['"`])[\s\S]*(?:['"`])$/.test(value) ? 'string?'
+            : /^(?:true|false)$/.test(value) ? 'boolean?' : 'any';
+          parsed.push(name[2] ? original : `${name[1]}: ${inferred}`);
+          initializers.push(`if ${name[1]} == nil then ${name[1]} = ${value} end`);
+        }
+        if (!initializers.length) return raw;
+        const indent = (raw.match(/^[ \t]*/) || [''])[0];
+        return raw.slice(0, open + 1) + parsed.join(', ') + raw.slice(close) + '\n'
+          + initializers.map(s => indent + '    ' + s).join('\n');
       }).join('\n');
     }
 
@@ -2228,8 +2272,6 @@ local part = message[1:7]`;
       }
       return style==='Compact' ? compactGeneratedOutput(output) : output;
     }
-
-
 
     function buildLauaSymbolIndex(source) {
       const symbols = {
@@ -5161,6 +5203,112 @@ local part = message[1:7]`;
       return errors;
     }
 
+    // Token-level checks for Luau expression errors that balanced-bracket and
+    // declaration checks cannot detect. Conservative by design: this does not
+    // claim to implement the entire Luau/Laua grammar.
+    function lintExpressionTokens(source, pushMarker) {
+      const tokens = [];
+      let cursor = 0;
+      let line = 1;
+      const keywordBoundaries = new Set(['and', 'or', 'then', 'do', 'end', 'else', 'elseif', 'until', 'in', 'return', 'local', 'function', 'type', 'export', 'break', 'continue', 'if', 'for', 'while', 'is', 'as', 'from', 'extends']);
+      const valueWords = new Set(['true', 'false', 'nil']);
+      const invalidRhs = new Set([',', ';', '}', ')', ']', '=', 'end', 'else', 'elseif', 'until', 'then', 'do']);
+      const expectsRhs = new Set(['=', '+=', '-=', '*=', '/=', '//=', '%=', '^=', '..=', '??=', '+', '-', '*', '/', '//', '%', '^', '..', '??', 'and', 'or']);
+      const push = (kind, text, start, end, tokenLine) => tokens.push({kind, text, start, end, line:tokenLine});
+      const issue = (token, message) => pushMarker(token.start, token.end, monaco.MarkerSeverity.Error, message, 'syntax', 'InvalidExpression');
+
+      while (cursor < source.length) {
+        const ch = source[cursor];
+        if (/\s/.test(ch)) { if (ch === '\n') line++; cursor++; continue; }
+        if (source.startsWith('--', cursor)) {
+          const longStart = /^--\[(=*)\[/.exec(source.slice(cursor));
+          if (longStart) {
+            const close = ']' + longStart[1] + ']';
+            const until = source.indexOf(close, cursor + longStart[0].length);
+            const end = until < 0 ? source.length : until + close.length;
+            line += (source.slice(cursor, end).match(/\n/g) || []).length;
+            cursor = end;
+          } else {
+            const until = source.indexOf('\n', cursor);
+            cursor = until < 0 ? source.length : until;
+          }
+          continue;
+        }
+        const start = cursor, tokenLine = line;
+        if (ch === '"' || ch === "'" || ch === '`') {
+          const quote = ch;
+          cursor++;
+          let closed = false;
+          while (cursor < source.length) {
+            if (source[cursor] === '\\') { cursor += Math.min(2, source.length - cursor); continue; }
+            if (source[cursor] === quote) { cursor++; closed = true; break; }
+            if (source[cursor] === '\n') {
+              if (quote !== '`') break;
+              line++;
+            }
+            cursor++;
+          }
+          push('string', source.slice(start, cursor), start, cursor, tokenLine);
+          if (!closed) issue(tokens[tokens.length - 1], 'Unterminated string literal.');
+          continue;
+        }
+        if (ch === '[') {
+          const longStart = /^\[(=*)\[/.exec(source.slice(cursor));
+          if (longStart) {
+            const close = ']' + longStart[1] + ']';
+            const until = source.indexOf(close, cursor + longStart[0].length);
+            const end = until < 0 ? source.length : until + close.length;
+            line += (source.slice(cursor, end).match(/\n/g) || []).length;
+            cursor = end;
+            push('string', source.slice(start, cursor), start, cursor, tokenLine);
+            if (until < 0) issue(tokens[tokens.length - 1], 'Unterminated long string literal.');
+            continue;
+          }
+        }
+        if (/[A-Za-z_]/.test(ch)) {
+          const match = /^[A-Za-z_]\w*/.exec(source.slice(cursor));
+          cursor += match[0].length;
+          push('word', match[0], start, cursor, tokenLine);
+          continue;
+        }
+        if (/\d/.test(ch) || (ch === '.' && /\d/.test(source[cursor + 1] || ''))) {
+          const match = /^(?:0[xX][\da-fA-F_]+|0[bB][01_]+|(?:\d[\d_]*(?:\.(?!\.)[\d_]*)?|\.\d[\d_]*)(?:[eE][+-]?\d[\d_]*)?)/.exec(source.slice(cursor));
+          if (match) {
+            cursor += match[0].length;
+            push('number', match[0], start, cursor, tokenLine);
+            continue;
+          }
+        }
+        const op = /^(?:\.\.\.|\.\.=|\?\?=|\?\?|\?\.|\/\/=|\.\.|\/\/|==|~=|!=|<=|>=|=>|->|::|\+=|-=|\*=|\/=|%=|\^=)/.exec(source.slice(cursor));
+        cursor += op ? op[0].length : 1;
+        push('symbol', op ? op[0] : ch, start, cursor, tokenLine);
+      }
+
+      for (let i = 0; i < tokens.length; i++) {
+        const current = tokens[i];
+        const previous = tokens[i - 1];
+        const next = tokens[i + 1];
+        if (previous && current.line === previous.line) {
+          const numberAfterClosed = ['}', ')', ']'].includes(previous.text) && current.kind === 'number';
+          const valueAfterTable = previous.text === '}' && (current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
+          const valueAfterNumber = previous.kind === 'number' && (current.kind === 'number' || current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
+          const valueAfterString = previous.kind === 'string' && (current.kind === 'string' || current.kind === 'number' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
+          const valueAfterConstant = valueWords.has(previous.text) && (current.kind === 'number' || current.kind === 'string' || (current.kind === 'word' && !keywordBoundaries.has(current.text)));
+          const numberAfterIdentifier = previous.kind === 'word' && !keywordBoundaries.has(previous.text) && current.kind === 'number';
+          if (numberAfterClosed || valueAfterTable || valueAfterNumber || valueAfterString || valueAfterConstant || numberAfterIdentifier) {
+            issue(current, `Unexpected ${current.kind === 'number' ? 'number' : 'expression'} after '${previous.text.length > 16 ? previous.text.slice(0, 13) + '...' : previous.text}'. Insert an operator or separator.`);
+          }
+        }
+        if (current.text === ',' && previous?.text === ',') issue(current, 'Missing expression between commas.');
+        if (previous && expectsRhs.has(previous.text) && invalidRhs.has(current.text)) {
+          if (previous.text === '=' || previous.text.endsWith('=')) issue(current, `Expected an expression after '${previous.text}'.`);
+          else issue(current, `Missing operand after '${previous.text}'.`);
+        }
+      }
+      const last = tokens[tokens.length - 1];
+      if (last && expectsRhs.has(last.text)) issue(last, `Expected an expression after '${last.text}'.`);
+    }
+
     function updateLauaDiagnostics(model) {
       if (model.getLanguageId() !== "laua") return;
 
@@ -5184,6 +5332,12 @@ local part = message[1:7]`;
           endColumn: range.endColumn
         });
       };
+
+      let expressionSyntaxErrors = 0;
+      lintExpressionTokens(source, (...args) => {
+        expressionSyntaxErrors++;
+        pushMarker(...args);
+      });
 
       const newPattern = /\bnew\s+([A-Za-z_][A-Za-z0-9_]*)/g;
       let match;
@@ -5260,7 +5414,7 @@ local part = message[1:7]`;
       }
 
       // New class features use transpiler validation as a second syntax pass.
-      try {
+      if (!expressionSyntaxErrors) try {
         const output=transpile(source);
         for(const diagnostic of generatedLuauPreflight(output)){
           pushMarker(0,Math.min(Math.max(1,source.length),5),monaco.MarkerSeverity.Error,'Generated Luau preflight: '+diagnostic.message,'syntax');
@@ -6911,7 +7065,7 @@ local part = message[1:7]`;
       function exportStudioSourceProject() {
         try {
           const blob=makeStudioSourceRbxmx();
-          downloadProjectBlob('Laua-v3.32-editable-studio.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.34-editable-studio.rbxmx',blob);
           projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -7009,7 +7163,7 @@ local part = message[1:7]`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.32-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.34-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
