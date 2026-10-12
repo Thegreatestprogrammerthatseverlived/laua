@@ -1,452 +1,617 @@
-# Laua custom syntax reference — v3.9
+# Laua Documentation — v3.37
 
-This documents **features added by Laua beyond standard Luau**. It describes the current single-ModuleScript source transformer and its restrictions, not a hypothetical fully featured language. For the inventory of 31 custom words, see [KEYWORDS.md](KEYWORDS.md). For unfinished requests, see [FEATURE_STATUS.md](FEATURE_STATUS.md).
+**Laua** (pronounced *Lawah*) extends [Roblox Luau](https://luau.org/) with classes, signals, async functions, pattern matching, safe access, and additional syntax. Laua is a **source-to-source transpiler**: it produces Luau code for Roblox, not a separate game engine or VM.
 
-> **Verification note:** The v3.9 browser compiler passed focused and regression checks. The generated Luau and the Luau transpiler have **not** been completely tested in Roblox Studio. Examples below show intended/compiler-supported forms, not a guarantee of runtime correctness for every game.
+This reference targets the **v3.37 release package (October 12, 2026)**, not the older v3.9 documentation. It describes implemented syntax and the limits of the current compiler. For a searchable list of 35 Laua syntax words recognized by the playground, see [KEYWORDS.md](KEYWORDS.md). That list includes contextual words and editor-recognized tokens, **not 35 globally reserved keywords**.
 
-## 1. Install and compile — one ModuleScript
+> **Verification status:** The shipped v3.37 package passes its Node.js JavaScript compiler and embedded-playground parity suites. The native Luau ModuleScript has only been checked structurally in that package; it has **not** been executed in Roblox Studio. Passing transcription and static checks does not establish that every generated script passes Studio Script Analysis or behaves correctly at runtime.
 
-Use a ModuleScript named `transpiler` containing the whole Laua compiler. **The async, core, and signal runtimes are embedded in it**, and generated code includes only the runtimes it actually uses.
+## Contents
+
+1. [Getting started](#1-getting-started)
+2. [Classes, inheritance and visibility](#2-classes-inheritance-and-visibility)
+3. [Signals and asynchronous programming](#3-signals-and-asynchronous-programming)
+4. [Namespaces, enums, imports and exports](#4-namespaces-enums-imports-and-exports)
+5. [Control flow and expressions](#5-control-flow-and-expressions)
+6. [Collection and function syntax](#6-collection-and-function-syntax)
+7. [Compiler controls and diagnostics](#7-compiler-controls-and-diagnostics)
+8. [Playground and Studio workflow](#8-playground-and-studio-workflow)
+9. [Unsupported syntax and known limits](#9-unsupported-syntax-and-known-limits)
+10. [Tests and verification](#10-tests-and-verification)
+
+## 1. Getting started
+
+### Source files and output
+
+Write Laua in `.laua` files and transpile it to `.luau` before execution. Regular Luau syntax, including types, generics, attributes, `for ... in` loops, `--!strict`, standard Roblox APIs, and ordinary `self` method parameters, can be used alongside Laua extensions.
+
+The native compiler is a **single ModuleScript** stored in the repository at [`transpiler/transpiler.luau`](../transpiler/transpiler.luau). Its public entry point is `Transpiler.Transpile(source, options)`. It returns a **string containing Luau source**; it does not run the result.
 
 ```luau
 local Transpiler = require(script.Parent.transpiler)
-local generated = Transpiler.Transpile(source, {Mode = "Development"})
+local source = [[
+class Counter
+    Value = 0
+
+    function Increment()
+        self.Value += 1
+    end
+end
+
+local counter = new Counter()
+counter:Increment()
+print(counter.Value)
+]]
+
+local generated = Transpiler.Transpile(source, {Mode = "Development", OutputStyle = "Readable"})
 print(generated)
 ```
 
-`Transpile()` returns generated source text, **not** a running script. The script's case-sensitive ModuleScript name can be changed if you update the `require()` path. Standard Roblox `require()` imports are still used for **your own modules**.
+The `source` example above is a string passed to the transpiler; `class` and `new` must **not** be pasted directly into a regular Roblox Script without compilation.
 
-**Migration:** Recompile older generated scripts before deleting previous standalone `LauaAsync`, `LauaCore`, or `LauaSignal` modules if those scripts still require them.
+The package also contains a standalone Node/VS Code-oriented `compiler.js` with:
 
-## 2. Classes and inheritance
+```js
+const {transpile, compilationStats} = require('./compiler.js');
+const luau = transpile('local result = nil ?? 25');
+console.log(luau);
+```
 
-### `class`, `constructor`, `extends`, `new`, `super`
+The website's `playground.html` is a self-contained HTML file with an **embedded** JavaScript compiler. The v3.37 release ZIP labels that file `index.html`. The native Luau and JavaScript implementations are separate: do not assume that updating one automatically updates the others.
+
+### Compiler options
+
+| Option | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `Mode` | `"Development"`, `"Debug"`, `"Release"` | `"Development"` | Chooses `--#if` compile-time branches. |
+| `OutputStyle` | `"Readable"`, `"Compact"` | `"Readable"` | Compact removes safe blank lines/comments; it does **not** mean full minification. |
+| `SemanticCheck` | `true`, `false` | `true` | `false` disables part of the name/member/type preflight. Syntax checks still run. |
+
+`SemanticCheck = false` is a compatibility/debugging escape hatch, **not** a guarantee of valid code. Use the default for new projects. Invalid mode/style names throw compiler errors. `--!strict` is a **Luau directive**, not a compiler option, and emitted source still needs Studio type checking.
+
+### Generated runtime
+
+Newly generated files are self-contained: when a feature needs one, the compiler embeds the relevant Laua Async, Core, or Signal runtime. Unused runtime families are omitted and selected Core helpers can be omitted individually. You do **not** need separate `LauaAsync`, `LauaCore`, `LauaSignal` ModuleScripts or third-party signal packages for newly generated output. Old already-compiled files that import those modules should be recompiled before the older modules are deleted.
+
+## 2. Classes, inheritance and visibility
+
+### `class`, `constructor`, `new` and `self`
+
+```luau
+class PlayerData
+    Health: number = 100
+    Name: string = "Player"
+
+    constructor(name: string)
+        self.Name = name
+    end
+
+    function TakeDamage(amount: number)
+        self.Health -= amount
+    end
+end
+
+local player = new PlayerData("Alex")
+player:TakeDamage(25)
+print(player.Health)
+```
+
+Methods use Luau's **`self`**, not `this`. Define instance functions inside the class and call them with `:`. `new PlayerData(...)` creates an instance; classes without required arguments also accept `new PlayerData`. Fields may include Luau type annotations. Laua lowers classes to Luau tables, metatables and constructors.
+
+### Inheritance, `extends`, `super`, `override`
 
 ```luau
 class Entity
     Name = "Entity"
 
-    constructor(name)
+    constructor(name: string)
         self.Name = name
     end
 
-    function GetName()
+    function Describe()
         return self.Name
     end
 end
 
 class Zombie extends Entity
-    constructor(name)
+    constructor(name: string)
         super(name)
     end
 
-    override function GetName()
-        return super:GetName()
+    override function Describe()
+        return super:Describe()
     end
 end
 
 local zombie = new Zombie("Runner")
-local another = new Zombie
+print(zombie:Describe())
 ```
 
-Classes compile to table/metatable constructors. `new Class(...)` and `new Class` are both supported. `super(...)` calls the parent initializer on the same instance; `super:Method()` calls a parent method. Keep explicit `super(...)` at the beginning of a child constructor.
+`super(...)` invokes the inherited initializer on the current instance. `super:Method()` invokes an inherited method. Put an explicit parent constructor call near the start of the child constructor. The compiler has checks for known inheritance and override contracts, but it is **not** a complete class type system.
 
-### `public`, `private`, `protected`, `static`
+### Visibility, static members and modifiers
 
 ```luau
-class Enemy
-    public Health = 100
-    private Secret = 42
-    protected Speed = 12
+abstract class BaseEnemy
+    protected Health = 100
+
+    abstract function Move()
+    end
+end
+
+class Enemy extends BaseEnemy
+    private Token = "hidden"
+    public Name = "Enemy"
     static Count = 0
-end
-```
 
-`static` belongs to the class rather than individual instances. **`private` and `protected` are recognized but not fully enforced**. Do not rely on them for security.
-
-### `abstract`, `override`, `final`
-
-```luau
-abstract class Entity
-    abstract function Update()
-    end
-end
-
-class Zombie extends Entity
-    override final function Update()
-        print("Updated")
+    override final function Move()
+        print(self.Name)
     end
 end
 ```
 
-Abstract classes are intended to prevent direct instantiation and require subclass implementations; `override` marks a replacement, and `final` prevents class inheritance or method overriding. Some constraints are checked in generated code. Full static verification is not provided.
+| Modifier | Use | Important limitation |
+| --- | --- | --- |
+| `public` | Public class member | Access is ordinary Luau member access. |
+| `private` | Member intended for defining class | The v3.37 compiler checks some known illegal accesses, but it is **not a security boundary**. |
+| `protected` | Member intended for class/subclasses | Same caveat; dynamic aliases and external Luau can bypass static checks. |
+| `static` | Field/method on class table | Access through the class, e.g. `Enemy.Count`. |
+| `abstract` | Abstract class or method | Intended to require subclass implementation. |
+| `final` | Prevent subclassing/overriding at recognized sites | Not a universal protection against Luau table mutation. |
+| `override` | Declare inherited method replacement | Compiler can reject selected incorrect overrides. |
 
-### `get` / `set` — computed properties
+Avoid using an abstract class as a concrete instance. None of the class modifiers make client-side game state secure; enforce important behavior on the server.
+
+### Computed and observed properties
 
 ```luau
-class Enemy
+class HealthState
     Health = 100
+    lazy Inventory = {"Bandage"}
 
     get IsAlive()
         return self.Health > 0
     end
 
-    set NewHealth(value)
+    set NewHealth(value: number)
         self.Health = math.max(0, value)
     end
+
 end
 ```
 
-`enemy.IsAlive` calls the getter and `enemy.NewHealth = 50` calls the setter. A getter takes no arguments and a setter takes one. Avoid defining a stored field with the same name as a computed property.
+`get` reads like a property, `set` reacts to property assignment, and `lazy` evaluates and caches an initializer on first access. Getters accept no parameters and setters take exactly one. Do not give a computed property and stored field the same name.
 
-### `lazy` / `watch` — property helpers
+The `watch` syntax observes writes to a property:
 
 ```luau
-class Zombie
+class WatchedHealth
     Health = 100
-    lazy Inventory = LoadInventory()
-
-    watch Health(oldValue, newValue)
-        print(oldValue, newValue)
+    watch Health(previous, current)
+        print(previous, current)
     end
 end
 ```
 
-`lazy` computes on first access and caches per instance, **including a `nil` result**. A failed initializer can retry; assigning beforehand prevents initialization. `watch` runs synchronously when a watched value actually changes. Default initialization itself does not invoke the watcher; watched fields use backing storage to handle later writes.
+**v3.37 issue:** The default JavaScript semantic preflight incorrectly diagnoses some valid watcher declarations as `Unknown function 'Health'`. For such a declaration, `SemanticCheck = false` allows the lowering step to proceed, but you must verify its behavior and types in Studio. This is a known preflight bug, not a guarantee that every watcher is runtime-correct. Watchers are not a replacement for Roblox replication.
 
-### `operator` — Luau metamethods
+### Custom operators and `is`
 
 ```luau
 class Amount
     Value = 0
 
+    constructor(value: number)
+        self.Value = value
+    end
+
     operator +(other)
         return new Amount(self.Value + other.Value)
     end
 end
+
+local a = new Amount(4)
+local b = new Amount(6)
+print((a + b).Value)
+print(a is Amount)
 ```
 
-Operators map onto supported Luau metamethods such as arithmetic, comparison, concatenation, and length. Only operators recognized by the transpiler work. A class constructor must accept the parameters used in your operator body.
+`operator` maps supported symbols to Luau metamethods. `is` tests membership in Laua class hierarchies using an embedded helper. It does **not** replace Roblox `Instance:IsA()` and does not provide general Luau type narrowing.
 
-### `is` — v3.9 class membership
+## 3. Signals and asynchronous programming
 
-```luau
-class Entity
-end
-
-class Zombie extends Entity
-end
-
-local zombie = new Zombie
-local valid = zombie is Entity
-```
-
-Transpiles the class membership check using an embedded runtime helper. It recognizes **Laua class inheritance**, not Roblox `Instance:IsA()`, not arbitrary Luau types, and not a static type narrowing guarantee.
-
-## 3. Signals and asynchronous functions
-
-### `signal` and typed signal parameters
+### Class signals
 
 ```luau
-class Zombie
-    signal Died
+class HealthTracker
     signal Damaged(amount: number, reason: string?)
 
-    function Damage(amount)
+    function Damage(amount: number)
         self.Damaged:Fire(amount, nil)
     end
 end
+
+local tracker = new HealthTracker()
+local connection = tracker.Damaged:Connect(function(amount, reason)
+    print("Damage:", amount, reason)
+end)
+tracker:Damage(10)
+connection:Disconnect()
 ```
 
-Signals are individual event objects per instance, with `:Connect()`, `:Fire()`, `:Wait()` and connection cleanup. Typed signal declarations added in v3.9 check basic argument types and count **when `:Fire()` runs**. A `?` suffix permits `nil`. This does **not** add static type inference or full complex-type checking.
+Signals are original **pure-Luau** per-instance event objects. They are **not** `BindableEvent`, GoodSignal, or RemoteEvents. APIs are `:Connect(callback)`, `:Once(callback)`, `:Fire(...)`, `:Wait()`, connection `:Disconnect()`, and signal `:Destroy()`. A declaration such as `signal Damaged(amount: number)` carries runtime argument checks for simple types and counts; `?` allows `nil`. `:Fire` schedules connected callbacks using `task.spawn`, so do not assume callbacks run synchronously before `:Fire()` returns. Waiters can yield until the next firing. Destroyed signals reject new operations as appropriate and resume waiting coroutines with an error. **Signals never replicate automatically** between server and clients.
 
-### `async`, `await`, and direct signal awaiting
+### `async` and `await`
 
 ```luau
-async function LoadHealth()
-    task.wait(1)
+async function FetchHealth()
+    task.wait(0.1)
     return 100
 end
 
-async function Start()
-    local health = await LoadHealth()
-    return health
+async function Run()
+    return await FetchHealth()
 end
 
-Start():andThen(function(value)
+Run():andThen(function(value)
     print(value)
 end):catch(function(err)
     warn(err)
 end)
 ```
 
-An `async` function returns a Promise-like Laua operation. `await` suspends that asynchronous operation and propagates failures. **v3.9 also accepts `await zombie.Died` inside an `async` function**, waiting for a Laua signal. These features use Luau coroutines and scheduling; they do not create CPU parallelism.
+An `async function` returns a Promise-like object. `await` suspends inside asynchronous work and propagates failures; it also supports waiting on Laua signals in supported contexts. The embedded Async runtime exposes `Async.run` internally. Async work is coroutine-based, **not CPU parallelism**. Use care with cancellation, errors and multi-return behavior when integrating other Promise libraries.
 
-### `defer` / `using` — function-exit cleanup
+### Cleanup with `defer` and `using`
 
 ```luau
-local function Monitor()
-    using connection = game:GetService("RunService").Heartbeat:Connect(function(dt)
-        print(dt)
+local function Listen()
+    using connection = game:GetService("RunService").Heartbeat:Connect(function(delta)
+        print(delta)
     end)
 
     defer
-        print("Monitor exiting")
+        print("Done listening")
     end
 
-    task.wait(5)
+    task.wait(1)
 end
 ```
 
-Cleanup actions run when the **enclosing function exits**, including a normal return or an error. Deferred operations run in reverse registration order. `using` handles connections with `Disconnect`, instances with `Destroy`, and appropriate table cleanup methods such as `Dispose`. An unsupported cleanup resource can raise an error. Neither keyword means "at the end of every inner block," and `task.defer()` by itself would not provide this lifetime guarantee.
+`defer` registers a block to run when the enclosing **function** exits; cleanup runs in reverse order and also runs on errors. `using name = expression` creates a resource and schedules supported cleanup (`Disconnect`, `Destroy`, or `Dispose`). It does not close the resource at the end of each nested `do` or `if` block. Avoid holding event connections beyond the function without explicitly managing their lifetime.
 
-## 4. Modules and declarations
+## 4. Namespaces, enums, imports and exports
 
-### `namespace`
+### `namespace`, including direct return
 
 ```luau
-namespace MathHelpers
-    local function PrivateHelper()
-        return 2
-    end
+namespace MathTools
+    Value = 10
 
     function Double(value)
-        return value * PrivateHelper()
+        return value * 2
+    end
+end
+
+print(MathTools.Value)
+print(MathTools.Double(5))
+```
+
+A namespace compiles to a Luau table in a `do` block, with exported fields and namespace functions. `local function` inside a namespace stays internal. In v3.37, a namespace may be **standalone or directly returned** from a function:
+
+```luau
+local function CreateAPI()
+    return namespace API
+        Version = 337
     end
 end
 ```
 
-Namespaces compile to a table. `local function` declarations remain internal; ordinary namespace functions become members. A namespace can stand alone or be returned directly from a function, but not assigned using an arbitrary `local x = namespace ...` expression.
+Do not use `local api = namespace API ... end` as an expression; that form is unsupported. The v3.37 rewrite eliminates an older IIFE in basic namespace output.
 
 ### `enum`
 
 ```luau
-enum ZombieState
+enum State
     Idle
-    Moving
-    Attacking = 10
+    Running
     Dead
 end
+
+print(State.Running) -- 1
 ```
 
-Produces a frozen named table. Unassigned members receive automatic numbers; explicitly numbered entries affect subsequent numbering.
+Enums become frozen Luau tables. Auto-numbered members start at **0**. You may set explicit values:
 
-### `import`, `export`, `from`, `as`
+```luau
+enum Example
+    First
+    Custom = 10
+    Next
+end
+-- First = 0, Custom = 10, Next = 1 in v3.37
+```
 
-**Module being imported:**
+**Important:** Explicit enum values **do not advance the auto-number counter** in the v3.37 JavaScript compiler. Avoid assuming `Next` will be `11`; use explicit values if the numbering must be exact.
+
+### Modules: `import`, `export`, `from`, `as`, and lazy imports
+
+One module:
 
 ```luau
 export class Zombie
     Health = 100
 end
 
-export function Spawn()
-    return new Zombie
+export function StartingHealth()
+    return 100
 end
 ```
 
-**Other module:**
+Another module:
 
 ```luau
-import {Zombie, Spawn as MakeZombie} from "./Zombies"
-local zombie = MakeZombie()
+import {Zombie, StartingHealth as GetHealth} from "./Zombies"
+local health = GetHealth()
 ```
 
-Named `export` declarations compile into a return table. Named imports take fields from that table; `import ZombieModule from "./Zombies"` imports the whole return value. Paths start with `./` or `../` relative to the compiled script's location. Avoid an additional top-level `return` in a module using named exports. **Normal Luau `export type` passes through unchanged.**
+Named exports produce a return table. Named imports read fields from that table; `import ZombieModule from "./Zombies"` imports the entire return value. Paths must begin with `./` or `../` and resolve relative to the compiled Script's parent hierarchy. The transpiler emits `require()` and `:WaitForChild()` calls, so the corresponding ModuleScripts must exist in Studio. For a deferred module load, use `import lazy Registry from "./Registry"`; this creates a lazy proxy and **does not guarantee safe arbitrary cyclic imports**. Normal Luau `export type` is not the same as Laua value exports.
 
-### Lazy import — limited cycle mitigation
-
-```luau
-import lazy Registry from "./Registry"
-```
-
-This resolves the `require()` lazily through a proxy when the imported object is used. It can reduce **some** dependency initialization cycles; it cannot make every A-imports-B-imports-A cycle safe, especially if modules eagerly access one another while initializing.
-
-## 5. Matching and data manipulation
+## 5. Control flow and expressions
 
 ### `match`, `case`, `default`
 
 ```luau
-match zombie
+local status = {Health = 0}
+match status
     case {Health = 0}
         print("Dead")
-    case {Stats = {Level = 3}} if canAttack
-        print("Level three")
+    case {Health = 100}
+        print("Full")
     default
         print("Other")
 end
 ```
 
-The matched value is evaluated once. Cases run in order. Named table patterns can nest; an `if` guard is checked only when the pattern succeeds. No array patterns, captured variable patterns, exhaustive enum analysis, or expression-returning `match` are available yet.
+`match` evaluates its scrutinee once, walks cases in order, and supports selected nested table patterns and `if` guards. Patterns are intentionally limited: no array destructuring patterns, capture variables, exhaustive enum analysis, or expression-returning `match`.
 
-### Table destructuring
+### Optional chaining `?.`
 
 ```luau
-local {Health, Speed: WalkSpeed} = zombieData
+local character = nil
+local hp = character?.Humanoid?.Health
+local object = nil
+local value = object?.["Health"]
+local result = object?.:GetValue()
 ```
 
-Evaluates the source table once and binds named fields, with optional renamed variables. Nested patterns, array positions, and defaults in destructuring are **pending**.
+When the receiver is `nil`, optional property, index, call or method access returns `nil`. `object?.Method()` is a **dot-style call** without implicit `self`; `object?.:Method()` passes the receiver as `self`. `object?.(args)` is supported for some optional callable expressions. When the receiver is `nil`, optional key expressions and call arguments are skipped. The Core optional helper also handles Roblox Instances; the transformer does not make arbitrary wrong property names safe on non-nil receivers.
 
-### Safe access: `?.`, `?.[key]`, optional method calls
-
-```luau
-local health = player?.Character?.Humanoid?.Health
-local item = inventory?.[slot]
-local a = object?.GetName()
-local b = object?.:GetName()
-```
-
-`?.` returns `nil` when the receiver is `nil`. `?.[key]` skips key evaluation when the receiver is nil. `?.GetName(...)` performs a **dot-style call without implicit `self`**; `?.:GetName(...)` is the **colon-style** form that passes the receiver as `self`. Arguments are skipped when there is no receiver. Complex expressions may exceed the current transformer's supported patterns.
-
-### Nil coalescing: `??` and `??=`
+### Nil coalescing `??` / assignment `??=`
 
 ```luau
-local health = savedHealth ?? 100
+local coins = nil
+local saved = coins ?? 50
+
 local enabled = false
-enabled ??= true   -- remains false
+enabled ??= true -- still false
 ```
 
-Only `nil` triggers the fallback; `false` is preserved. `??` evaluates its fallback lazily. `??=` accepts common local, dotted, or one-index assignment targets; compound expressions may need parentheses.
+Only `nil` triggers the fallback, not `false`. Simple safe cases lower to Luau's `if` expression; more complex cases can use a helper. Some nested expressions and assignment targets are not supported by the current source-level transformer.
 
-### One-line arrow functions: `=>`
+### Early-return postfix `?`
+
+```luau
+local function Read(input)
+    local value = input?
+    return value
+end
+```
+
+This limited suffix form becomes `local value = input` followed by `if value == nil then return end`. It applies to **single-name `local`/`const` assignments on a line**, not general nested expressions. Do not confuse it with `?.`, `??`, optional types, or the conditional `if ... then ... else ...` expression already available in Luau.
+
+### Compile-time branches
+
+```luau
+--#if DEBUG
+print("Debug build")
+--#else
+print("Other build")
+--#end
+```
+
+The compiler uses `Mode` (`Debug`, `Development`, or `Release`) to decide which branch to emit. Branches may nest; unknown flags, missing ends and duplicated `--#else` cause errors. This is a compile-time source preprocessor, not Lua runtime conditionals.
+
+## 6. Collection and function syntax
+
+### Destructuring
+
+```luau
+local data = {Health = 90, Speed = 16}
+local {Health, Speed: WalkSpeed} = data
+print(Health, WalkSpeed)
+```
+
+Single-level named-field destructuring evaluates the source once. Renaming uses `field: localName`. Nested/array destructuring and default values in patterns are not implemented.
+
+### Spread expressions
+
+```luau
+local first = {1, 2}
+local second = {3, 4}
+local joined = {...first, ...second}
+```
+
+The supported spread literal is **spread-only**: `{...name, ...otherName}` (simple dotted receivers are also supported). It copies array items and named keys. Mixed `{"a", ...other}` and arbitrary spread expressions are not generally supported. Native Luau vararg `{...}` remains distinct.
+
+### Slices
+
+```luau
+local word = "Compiler"
+local first = word[1:4]
+local last = word[-3:-1]
+```
+
+Laua slices use 1-based inclusive bounds, with negative indices measured from the end. String and buffer slicing are supported by the embedded Core helper. The receiver must be a simple name or dotted path; bounds must currently be integer literals (or one omitted bound), not arbitrary expressions.
+
+### Higher-order table helpers
+
+```luau
+local values = {2, 4, 6}
+local doubled = table.map(values, function(value)
+    return value * 2
+end)
+local positive = table.filter(values, function(value)
+    return value > 0
+end)
+local sum = table.reduce(values, function(total, value)
+    return total + value
+end, 0)
+local found = table.findWhere(values, function(value)
+    return value == 4
+end)
+```
+
+These named calls are rewritten to **embedded Laua Core helpers**, not added to Roblox's global `table` library. `map`, `filter`, and `findWhere` callbacks take `(value, index)`, while `reduce` takes `(accumulator, value, index)`.
+
+### Arrow functions `=>`
 
 ```luau
 local double = (x) => x * 2
+print(double(3))
 ```
 
-Returns the value of one expression. The preview transformer does not support multi-statement arrow bodies or every nested expression shape.
-
-### Table spread: `{...a, ...b}`
-
-```luau
-local merged = {...first, ...second}
-```
-
-Combines arrays in sequence and merges named keys, with later inputs overriding duplicate names. This is currently a **spread-only literal** form using simple names or dotted paths; mixed `{1, ...list}` literals and arbitrary spread expressions are not supported. Normal Luau `{...}` for varargs remains valid and unchanged.
-
-### String and buffer slices
-
-```luau
-local firstWord = text[1:5]
-local endOfText = text[-3:-1]
-local chunk = packet[2:8]
-```
-
-Ranges are 1-based and inclusive, with negative bounds measured from the end. Strings return substrings; buffers return copied buffers. The source receiver must be simple and bounds are currently integer literals (or omitted bounds), not arbitrary computed expressions.
-
-### `table` helpers
-
-```luau
-local active = table.filter(items, function(item)
-    return item.Active
-end)
-
-local names = table.map(items, function(item)
-    return item.Name
-end)
-
-local total = table.reduce(items, function(sum, item)
-    return sum + item.Amount
-end, 0)
-
-local matchItem = table.findWhere(items, function(item)
-    return item.Id == 1
-end)
-```
-
-Laua rewrites these calls to **embedded helper functions**. It does not modify the regular Roblox `table` library. Helpers iterate arrays in order; callback arguments are `(value, index)` for filter/map/findWhere and `(accumulator, value, index)` for reduce.
-
-## 6. New function features in v3.9
-
-### `memo` — cache named function results
-
-```luau
-memo function Double(value)
-    return value * 2
-end
-
-local x = Double(5)
-local y = Double(5)
-```
-
-A wrapper caches the **entire return tuple**, including nil results, by the identities/values of arguments. `memo local function Name(...)` is also supported. No automatic cache expiry or size limit exists. Avoid memoizing a function whose result depends on mutable external state, time, or randomness.
+This is a **one-line, one-expression** function body. Multiline arrow bodies and some deeply nested expression forms are unsupported.
 
 ### Default parameters
 
 ```luau
-function Heal(amount = 100)
+local function Damage(amount: number = 10)
     return amount
 end
 ```
 
-The default is used if an argument is `nil`, not if it's `false`. Simple comma-separated defaults are supported; nested commas or complicated parameter expressions need further parsing work.
+A missing or `nil` argument uses the default. Default expressions may include nested table/call arguments in supported signature forms, but this is still a source-level rewrite, not a full function-grammar implementation. Verify generated typing in Studio for more complex annotations.
 
-### Pipeline operator: `|>`
-
-```luau
-local result = 10 |> Double |> tostring
-```
-
-Evaluates left-to-right by nesting calls: `tostring(Double(10))`. **Current restrictions:** one line, assigned to a variable or used in a `return`, with each stage a named function (`Double` or `math.abs` style). Not a general expression pipeline yet.
-
-## 7. Laua compiler and editor controls
-
-### Conditional compilation: `--#if`, `--#else`, `--#end`
+### `memo` function caching
 
 ```luau
---#if DEBUG
-print("Debug-only")
---#else
-print("Other modes")
---#end
+memo function Square(x)
+    return x * x
+end
 ```
 
-Compile with:
+`memo` wraps a named function with a tuple-preserving memoization helper. Results are cached by argument identities/values, including `nil` in returned tuples. No built-in invalidation or cache-size bound exists; don't use it for time-dependent or side-effectful computations. **Known issue:** v3.37 can omit the newline between a generated memo wrapper and a statement immediately following the function. Inspect generated output and use caution before shipping memoized functions.
+
+### `inline` specialization
 
 ```luau
-Transpiler.Transpile(source, {Mode = "Debug"})
+inline function AddOne(x)
+    return x + 1
+end
+
+print(AddOne(5))
 ```
 
-Modes are `Development` (default), `Debug`, and `Release`; compare them using uppercase directive flags `DEVELOPMENT`, `DEBUG`, and `RELEASE`. Nesting is supported. Invalid modes or unbalanced directives produce errors. These are Laua compile-time branches, **not** Roblox's `--!` directives or a complete compile-time interpreter.
+`inline` is **conservative**: the top-level function must have zero or one parameter and return a constant, its parameter, or simple parameter arithmetic with a numeric literal. Complex functions, mutation, or type annotations can prevent specialization or result in an error. A function declaration may remain in the generated output. This is not a general optimizer.
 
-### Scoped `@nolint("WarningName")`
+### Pipeline `|>`
+
+```luau
+local function Double(x)
+    return x * 2
+end
+local result = 5 |> Double |> tostring
+```
+
+Pipelines are currently **single-line** assignment/return constructs where each stage is a named function (also `math.abs`-style dotted names). They are lowered to nested calls; arbitrary expressions or multiline pipelines are not guaranteed.
+
+### `const` status
+
+The editor's syntax list contains `const`, and the limited `const name = value?` early-return syntax can be lowered to `local`. **However, plain `const name = value` is currently emitted unchanged by the v3.37 JavaScript transpiler.** It is not a reliable immutable variable declaration and is **not valid ordinary Luau syntax**. Use `local` for normal variable declarations until a complete `const` lowering/immutability feature is implemented.
+
+## 7. Compiler controls and diagnostics
+
+### Lint suppression
 
 ```luau
 @nolint("UnusedLocal")
-local unused = 100
+local unusedValue = 10
 ```
 
-The playground suppresses a named lint warning for the next relevant statement. It does **not** silence syntax or type errors. This Laua annotation is stripped/replaced during transpilation and is not a Roblox built-in attribute.
+`@nolint("WarningName")` is intended to control an appropriate **playground diagnostic**, not the compiler's semantic correctness. It is replaced with a comment in generated source. **Known v3.37 bug:** the default JavaScript semantic preflight can incorrectly reject this syntax as `Unknown function 'nolint'`; `SemanticCheck = false` allows it through, at the cost of skipping other semantic checks. It cannot make an invalid program valid, silence missing members, or replace Luau Script Analysis. Standard Luau directives such as `--!strict` remain separate.
 
-### Playground features
+### Errors the compiler can catch
 
-The optional `index.html` supports editing Laua, viewing generated Luau, **Copy Luau**, selecting build modes, exporting `.luau`, linting, autocomplete, comparing the last two successful outputs, basic Markdown declaration-index export, and built-in regression checks. The visible diff is capped at 400 lines; generated source isn't truncated. Monaco Editor and Roblox API data are normally loaded over the network.
+The v3.37 semantic/syntax preflight rejects selected cases such as:
 
-## 8. Known unsupported requests
+```luau
+local x = 5 + * 3 -- malformed expression
+```
 
-Do not treat these examples as working features:
+```luau
+class Player
+    function Damage(amount: number)
+        print(amount)
+    end
+end
+local player = new Player()
+player:Heal(10) -- unknown method on a known class
+```
 
-| Proposed feature | Example / reason it remains pending |
-|---|---|
-| Labeled loop exit | `break outer`, `continue outer` need correct nested control-flow transformation |
-| Constrained generic | `function Spawn<T: Entity>(value: T)` requires type enforcement |
-| Nominal / unique types | `unique type PlayerId = number` must keep types distinct |
-| Truthy / falsy types | Need accurate integration with type analysis |
-| Positional typed tables | `type Result = [number, string]` needs per-position checks |
-| Full regex | `regex.match(text, "(cat|dog)+")` requires a real regex engine |
-| Mixins, `derive`, named arguments | No complete lowering/validation yet |
-| Expression `match`, captures, exhaustiveness | Need richer pattern analysis |
-| Full parser, AST, source maps, type checker | Not part of current v3.9 implementation |
-| Multi-file editing, offline autocomplete, project bundling | Not complete in current playground |
+Also tested: undeclared simple variables/functions, some out-of-scope local references, incorrect known method/constructor argument counts or primitive literal types, missing enum/namespace members, selected invalid signal arguments, mismatched separators and bracket structures. **This is not a complete AST parser, name resolver, type checker, source-map generator, or Roblox API type analyzer.** Dynamic `require()` results and arbitrary Instance APIs need normal Studio checks.
 
-The transpiler rejects several proposed but unsupported syntax forms instead of silently outputting code with incorrect semantics. Its error coverage is not comprehensive, because Laua still relies on multiple source-level passes.
+`SemanticCheck = false` relaxes part of these semantic errors for legacy compatibility; it is not an opt-out from all syntax checking.
 
-## 9. Testing and safety limits
+## 8. Playground and Studio workflow
 
-- **One compiled runtime:** no separate LauaAsync/LauaCore/LauaSignal modules are required for *newly generated* scripts.
-- **Source transformation:** not a full parser or security boundary; nested expressions and complicated function scopes may expose edge cases.
-- **Class privacy:** `private` and `protected` do not provide complete access enforcement.
-- **Cleanup scope:** `defer` and `using` are function-scoped.
-- **Validation:** the browser transpiler passed focused and older regression tests, but executing the Luau ModuleScript and generated Luau in Roblox Studio is still necessary to establish runtime correctness.
+The website at [laua.dev](https://laua.dev) hosts the playground. In the repository, the published single-file HTML is `playground.html` (named `index.html` in the v3.37 package). The playground contains the JavaScript compiler internally and supports Monaco editing, syntax highlighting, diagnostics, autocomplete, generation/copying of `.luau`, output style and mode selection, and a **multi-file project workspace**.
 
-See [KEYWORDS.md](KEYWORDS.md) for the custom keyword inventory and [FEATURE_STATUS.md](FEATURE_STATUS.md) for the complete 43-item roadmap.
+The v3.37 HTML also includes compiled `.rbxmx` project export, **editable Studio `.rbxmx` export**, project `.rbxmx` import, project files, comparison/statistics tools and built-in tests. A compiled-only export is for generated Lua source; the editable Studio export is for retaining source as well. Verify both versions of a project before replacing your originals, and don't assume Roblox Studio will interpret `.laua` directly.
+
+Suggested workflow:
+
+1. Write and save `.laua` files.
+2. Transpile every source file, preferably with `SemanticCheck` enabled and `OutputStyle = "Readable"`.
+3. Inspect compile diagnostics and generated output; don't treat a lack of warnings as proof of correctness.
+4. Keep source `.laua` files under version control alongside compiled `.luau` files or an editable project export.
+5. Run Roblox Studio Script Analysis on generated source, then execute tests in the correct server/client context.
+
+The Studio plugin (separately versioned) can refresh its native compiler from `transpiler/transpiler.luau` on GitHub. The plugin, website compiler and any VS Code extension must all match your chosen Laua release; refreshing one does not silently synchronize the others. Evaluate plugin permissions and downloaded code before enabling automatic updates.
+
+## 9. Unsupported syntax and known limits
+
+**Not implemented as full language features in v3.37:** labeled `break`/`continue`, constrained generic enforcement, nominal `unique type`, tuple-like positional typed tables, truthy/falsy types, a full regex library, mixins/`derive`, general named arguments, expression-returning `match`, captured/array match patterns, and exhaustive pattern checking. Plain `const` lowering/immutability is incomplete.
+
+Additional important limits:
+
+- Source rewrites are partly regex/token-based, not a complete lexer/AST pipeline. Complex nested expressions, scopes, and long literals can expose unsupported cases or incorrect transformations.
+- The compiler's semantic checker is conservative and incomplete. Some valid complex Luau and some invalid programs may slip through or trigger false positives. A warning-free compile is not full type safety.
+- Type checks focus on known symbols and simple types/literal arguments; they do not replace Studio's Luau type checker, Roblox API information, generic inference, or user-defined dynamic modules.
+- `private`/`protected` are not security protection; signals and local async work do not replicate to clients.
+- Compiled code may require validation of `--!strict` typing, timing/yield behavior and runtime helper interactions in Studio.
+- The generated memo-wrapper newline issue described above is a known v3.37 case.
+- The JavaScript semantic preflight can incorrectly flag `watch Name(...)` and `@nolint(...)` under its default settings. Do not mistake these for unsupported syntax, and do not disable semantic checks globally without separately verifying generated output.
+- **Never trust the client:** keep authorization, currency, inventories and other sensitive game decisions server-side regardless of Laua syntax.
+
+## 10. Tests and verification
+
+The v3.37 release ZIP includes these commands. Run them from its extracted root using Node.js 18+ (its recorded verification used Node.js 22):
+
+```bash
+node --check compiler.js
+node tests/release-integrity.cjs
+node tests/v337-smoke.cjs
+node tests/semantic-v336.cjs
+node tests/expanded-stress.cjs
+node tests/editor-markers.cjs
+node tests/semantic.cjs
+```
+
+The shipped test baselines are **438** v3.37 targeted compiler/browser checks, **737** semantic/literal checks, **4,249** expanded cases, and separate editor/semantic/integrity suites. Those are distinct suites; don't treat static native structural checks as native execution. The ZIP includes `Studio-Verification.luau` for manual use with the native ModuleScript in Studio, but **Studio execution was not established by the package**.
+
+If a compiler output looks suspicious, minimize the failing `.laua` file, record the expected behavior and actual emitted `.luau`/error, and test it against the standalone JS compiler, embedded website compiler and native Luau transpiler. Publish all changed implementation targets together for language changes. Documentation-only edits such as this reference **do not change the language version**.
+
+---
+
+**Related:** [Keyword reference](KEYWORDS.md) · [Repository](https://github.com/Thegreatestprogrammerthatseverlived/laua) · [Playground](https://laua.dev)
