@@ -463,218 +463,77 @@ local function trim(value: string): string
     return (value:match("^%s*(.-)%s*$") or "")
 end
 
-local function scanLauaSource(source: string, strict: boolean?, collectTokens: boolean?)
-    local tokens = {}
-    local literals = {}
-    local pieces = {}
-    local index = 1
-    local line = 1
-    local copied = 1
-    local length = #source
-    local function fail(message: string, at: number, tokenLine: number)
-        if not strict then return end
-        error("Laua syntax error (line " .. tostring(tokenLine) .. "): " .. message, 0)
-    end
-    local function char(at: number): string
-        return source:sub(at, at)
-    end
-    local function advance()
-        if char(index) == "\n" then line += 1 end
-        index += 1
-    end
-    local function jump(finish: number)
-        while index < finish do
-            local nextLine = source:find("\n", index, true)
-            if not nextLine or nextLine >= finish then break end
-            line += 1
-            index = nextLine + 1
-        end
-        index = finish
-    end
-    local function longOpening(at: number)
-        if char(at) ~= "[" then return nil end
-        local finish = at + 1
-        while char(finish) == "=" do finish += 1 end
-        if char(finish) ~= "[" then return nil end
-        return {finish = finish + 1, close = "]" .. string.rep("=", finish - at - 1) .. "]"}
-    end
-    local function readLong(opening, at: number, tokenLine: number, comment: boolean)
-        local closing = source:find(opening.close, opening.finish, true)
-        if not closing then fail(comment and "Unterminated long comment." or "Unterminated long string.", at, tokenLine) end
-        jump(closing and closing + #opening.close or length + 1)
-    end
-    local function escape()
-        advance()
-        if index > length then return end
-        local ch = char(index)
-        advance()
-        if ch == "z" then
-            while index <= length and char(index):match("%s") do advance() end
-        elseif ch == "\r" and char(index) == "\n" then
-            advance()
-        elseif ch == "u" and char(index) == "{" then
-            advance()
-            while index <= length and char(index):match("[%da-fA-F]") do advance() end
-            if char(index) == "}" then advance() end
-        end
-    end
-    local function readQuoted()
-        local at = index
-        local tokenLine = line
-        local quote = char(index)
-        advance()
-        while index <= length do
-            local ch = char(index)
-            if ch == "\\" then escape() continue end
-            if ch == quote then advance() return end
-            if ch == "\n" or ch == "\r" then fail("Unescaped newline in string literal.", at, tokenLine) end
-            advance()
-        end
-        fail("Unterminated string literal.", at, tokenLine)
-    end
-    local function readComment()
-        local at = index
-        local tokenLine = line
-        local opening = longOpening(index + 2)
-        if opening then
-            readLong(opening, at, tokenLine, true)
-        else
-            jump(source:find("\n", index, true) or length + 1)
-        end
-    end
-    local function readTemplate()
-        local stack = {{kind = "text", at = index, line = line, depth = 0}}
-        advance()
-        while index <= length and #stack > 0 do
-            local frame = stack[#stack]
-            local ch = char(index)
-            if frame.kind == "text" then
-                if ch == "\n" or ch == "\r" then fail("Unescaped newline in interpolated string.", frame.at, frame.line) end
-                if ch == "\\" then escape() continue end
-                if ch == "`" then table.remove(stack) advance() continue end
-                if ch == "{" then
-                    if char(index + 1) == "{" then fail("Double braces are not permitted in interpolated strings.", index, line) end
-                    table.insert(stack, {kind = "expression", depth = 1, at = index, line = line})
-                end
-                advance()
-            elseif source:sub(index, index + 1) == "--" then
-                readComment()
-            elseif ch == '"' or ch == "'" then
-                readQuoted()
-            elseif ch == "`" then
-                table.insert(stack, {kind = "text", at = index, line = line, depth = 0})
-                advance()
-            elseif ch == "[" and longOpening(index) then
-                readLong(longOpening(index), index, line, false)
-            else
-                if ch == "{" then frame.depth += 1 end
-                if ch == "}" then
-                    frame.depth -= 1
-                    if frame.depth == 0 then table.remove(stack) end
-                end
-                advance()
-            end
-        end
-        if #stack > 0 then
-            local frame = stack[#stack]
-            fail(frame.kind == "text" and "Unterminated interpolated string." or "Unclosed interpolation.", frame.at, frame.line)
-        end
-    end
-    local function readNumber()
-        local prefix = source:sub(index, index + 1):lower()
-        if prefix == "0x" and char(index + 2):match("[%da-fA-F_]") then
-            index += 2
-            while index <= length and char(index):match("[%da-fA-F_]") do index += 1 end
-        elseif prefix == "0b" and char(index + 2):match("[01_]") then
-            index += 2
-            while index <= length and char(index):match("[01_]") do index += 1 end
-        else
-            while index <= length and char(index):match("[%d_]") do index += 1 end
-            if char(index) == "." and char(index + 1) ~= "." then
-                index += 1
-                while index <= length and char(index):match("[%d_]") do index += 1 end
-            end
-            if char(index):lower() == "e" then
-                local finish = index + 1
-                if char(finish) == "+" or char(finish) == "-" then finish += 1 end
-                if char(finish):match("%d") then
-                    index = finish + 1
-                    while index <= length and char(index):match("[%d_]") do index += 1 end
-                end
-            end
-        end
-    end
-    local multiOperators = {"...", "??=", "..=", "//=", "??", "?.", "|>", "!=", "==", "~=", "<=", ">=", "=>", "->", "::", "+=", "-=", "*=", "/=", "%=", "^=", "..", "//"}
-    while index <= length do
-        local at = index
-        local tokenLine = line
-        local ch = char(index)
-        local kind = nil
-        if source:sub(index, index + 1) == "--" then
-            readComment()
-            kind = "comment"
-        elseif ch == '"' or ch == "'" then
-            readQuoted()
-            kind = "literal"
-        elseif ch == "`" then
-            readTemplate()
-            kind = "literal"
-        elseif ch == "[" then
-            local opening = longOpening(index)
-            if opening then
-                readLong(opening, at, tokenLine, false)
-                kind = "literal"
-            end
-        end
-        if kind then
-            table.insert(pieces, source:sub(copied, at - 1))
-            local masked = source:sub(at, index - 1):gsub("[^\r\n]", " ")
-            table.insert(pieces, masked)
-            copied = index
-            if kind == "literal" then
-                local token = {kind = kind, value = "<string>", at = at, finish = index, line = tokenLine, endLine = line, quote = ch}
-                table.insert(literals, token)
-                if collectTokens then table.insert(tokens, token) end
-            end
-            continue
-        end
-        if not collectTokens or ch:match("%s") then advance() continue end
-        if ch:match("[A-Za-z_]") then
-            kind = "word"
-            repeat index += 1 until index > length or not char(index):match("[A-Za-z0-9_]")
-        elseif ch:match("%d") or ch == "." and char(index + 1):match("%d") then
-            kind = "number"
-            readNumber()
-        else
-            kind = "symbol"
-            local operator = nil
-            for _, candidate in multiOperators do
-                if source:sub(index, index + #candidate - 1) == candidate then operator = candidate break end
-            end
-            index += operator and #operator or 1
-        end
-        table.insert(tokens, {kind = kind, value = source:sub(at, index - 1), at = at, finish = index, line = tokenLine, endLine = line})
-    end
-    table.insert(pieces, source:sub(copied))
-    return {masked = table.concat(pieces), tokens = tokens, literals = literals}
-end
-
 local function maskNonCode(source: string): string
-    if not source:find('["\'`%[]') and not source:find("--", 1, true) then return source end
-    return scanLauaSource(source).masked
-end
+    if not source:find('"', 1, true) and not source:find("'", 1, true) and not source:find("`", 1, true) and not source:find("[", 1, true) and not source:find("--", 1, true) then return source end
+    local output = table.create(#source)
+    local position = 1
+    local quote = nil
+    local longClose = nil
+    local lineComment = false
 
-local function trimGeneratedWhitespace(source: string): string
-    if not source:find("[ \t]\n") and not source:find("[ \t]$") then return source end
-    local literals = scanLauaSource(source).literals
-    local cursor = 1
-    local result = source:gsub("()([ \t]+)(\n?)", function(at, space, newline)
-        if newline == "" and at + #space <= #source then return space end
-        while cursor <= #literals and literals[cursor].finish <= at do cursor += 1 end
-        if cursor <= #literals and literals[cursor].at <= at then return space .. newline end
-        return newline
-    end)
-    return result
+    while position <= #source do
+        local char = source:sub(position, position)
+        local nextChar = source:sub(position + 1, position + 1)
+
+        if longClose then
+            local closing = source:sub(position, position + #longClose - 1) == longClose
+            if closing then
+                for _ = 1, #longClose do output[#output + 1] = " " end
+                position += #longClose
+                longClose = nil
+            else
+                output[#output + 1] = char == "\n" and "\n" or " "
+                position += 1
+            end
+        elseif lineComment then
+            output[#output + 1] = char == "\n" and "\n" or " "
+            if char == "\n" then lineComment = false end
+            position += 1
+        elseif quote then
+            if char == "\\" and position < #source then
+                output[#output + 1] = " "
+                output[#output + 1] = " "
+                position += 2
+            else
+                output[#output + 1] = char == "\n" and "\n" or " "
+                if char == quote then quote = nil end
+                position += 1
+            end
+        elseif char == "-" and nextChar == "-" then
+            local equals = source:sub(position + 2, position + 2) == "[" and source:sub(position + 3):match("^(=*)%[") or nil
+            if equals then
+                local opening = 4 + #equals
+                for _ = 1, opening do output[#output + 1] = " " end
+                position += opening
+                longClose = "]" .. equals .. "]"
+            else
+                output[#output + 1] = " "
+                output[#output + 1] = " "
+                lineComment = true
+                position += 2
+            end
+        elseif char == '"' or char == "'" or char == "`" then
+            quote = char
+            output[#output + 1] = " "
+            position += 1
+        elseif char == "[" then
+            local equals = (nextChar == "[" or nextChar == "=") and source:sub(position + 1):match("^(=*)%[") or nil
+            if equals then
+                local opening = 2 + #equals
+                for _ = 1, opening do output[#output + 1] = " " end
+                position += opening
+                longClose = "]" .. equals .. "]"
+            else
+                output[#output + 1] = char
+                position += 1
+            end
+        else
+            output[#output + 1] = char
+            position += 1
+        end
+    end
+
+    return table.concat(output)
 end
 
 local function splitLines(source: string)
@@ -890,40 +749,39 @@ local function getParams(params: string): string
     return table.concat(names, ", ")
 end
 
-local function replaceSuper(source: string, base: string): string
+local function replaceSuper(source: string, base: string, instanceReceiver: boolean?): string
+    local includeSelf = instanceReceiver ~= false
     local masked = maskNonCode(source)
-    local positions = {}
-    local cursor = 1
-
-    while true do
-        local start, finish, method = masked:find("%f[%w]super%s*:%s*([%a_][%w_]*)%s*%(", cursor)
-        if not start then break end
-        local open = finish
-        local depth = 1
-        local close = nil
-        for index = open + 1, #masked do
-            local char = masked:sub(index, index)
-            if char == "(" then depth += 1 end
-            if char == ")" then depth -= 1 end
-            if depth == 0 then close = index; break end
-        end
-        if not close then error(`Unclosed super:{method}(`) end
-        local args = trim(source:sub(open + 1, close - 1))
-        local replacement = base .. "." .. method .. "(self" .. (args ~= "" and ", " .. args or "") .. ")"
-        table.insert(positions, {Start = start, Finish = close, Replacement = replacement})
-        cursor = close + 1
-    end
-    for index = #positions, 1, -1 do
-        local item = positions[index]
-        source = source:sub(1, item.Start - 1) .. item.Replacement .. source:sub(item.Finish + 1)
-    end
-
-    masked = maskNonCode(source)
     local changes = {}
-    for start, method in masked:gmatch("()super%s*%.%s*([%a_][%w_]*)") do
-        local prefix = masked:sub(1, start - 1)
-        local original = masked:sub(start):match("^super%s*%.%s*[%a_][%w_]*")
-        table.insert(changes, {Start = start, Finish = start + #original - 1, Replacement = base .. "." .. method})
+    local cursor = 1
+    while true do
+        local start, finish, separator, method = masked:find("%f[%w]super%s*([:.])%s*([%a_][%w_]*)", cursor)
+        if not start then break end
+        if masked:sub(start - 1, start - 1):match("[.:]") then cursor = finish + 1; continue end
+        local open = finish + 1
+        while masked:sub(open, open):match("%s") and open <= #masked do open += 1 end
+        local isCall = masked:sub(open, open) == "("
+        if separator == ":" and not isCall then error(`Expected '(' after super:{method}`) end
+        if separator == ":" and not includeSelf then error(`super:{method}(...) cannot be used in a static method`) end
+        if isCall and includeSelf then
+            local depth = 0
+            local close = nil
+            for index = open, #masked do
+                local char = masked:sub(index, index)
+                if char == "(" then depth += 1 end
+                if char == ")" then
+                    depth -= 1
+                    if depth == 0 then close = index; break end
+                end
+            end
+            if not close then error(`Unclosed super.{method}(`) end
+            local args = trim(source:sub(open + 1, close - 1))
+            table.insert(changes, {Start = start, Finish = close, Replacement = base .. "." .. method .. "(self" .. (args ~= "" and ", " .. args or "") .. ")"})
+            cursor = close + 1
+        else
+            table.insert(changes, {Start = start, Finish = finish, Replacement = base .. "." .. method})
+            cursor = finish + 1
+        end
     end
     for index = #changes, 1, -1 do
         local item = changes[index]
@@ -1141,6 +999,23 @@ local function transpileClasses(source: string): string
         if maskNonCode(ctorBody):find("super%s*%(") then error("super(...) must be first in constructor") end
         if base then ctorBody = replaceSuper(ctorBody, base) end
         if not base and maskNonCode(ctorBody):find("super%s*[:%.%(%[]") then error("super requires a parent class") end
+        if not base then
+            for _, member in methods do
+                if maskNonCode(member.Body):find("%f[%w]super%s*[:%.%(%[]") then error("super requires a parent class") end
+            end
+            for _, member in getters do
+                if maskNonCode(member.Body):find("%f[%w]super%s*[:%.%(%[]") then error("super requires a parent class") end
+            end
+            for _, member in setters do
+                if maskNonCode(member.Body):find("%f[%w]super%s*[:%.%(%[]") then error("super requires a parent class") end
+            end
+            for _, member in operators do
+                if maskNonCode(member.Body):find("%f[%w]super%s*[:%.%(%[]") then error("super requires a parent class") end
+            end
+            for _, member in watchers do
+                if maskNonCode(member.Body):find("%f[%w]super%s*[:%.%(%[]") then error("super requires a parent class") end
+            end
+        end
 
         -- Only allocate lazy/watched state when this known inheritance chain needs it.
         -- Unknown or external parent classes retain the conservative allocation path.
@@ -1201,13 +1076,13 @@ local function transpileClasses(source: string): string
             if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
         end
         local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
-        local finalMethods = base and ("setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods})") or finalTable
+        local finalMethods = base and ("setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})") or finalTable
         table.insert(generated, `{name}.__finalMethods = {finalMethods}`)
-        table.insert(generated, name .. ".__getters = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__getters})") or "{}"))
-        table.insert(generated, name .. ".__setters = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__setters})") or "{}"))
-        table.insert(generated, name .. ".__lazy = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__lazy})") or "{}"))
-        table.insert(generated, name .. ".__watchers = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__watchers})") or "{}"))
-        table.insert(generated, name .. ".__watchedFields = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__watchedFields})") or "{}"))
+        table.insert(generated, name .. ".__getters = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__getters or {}})") or "{}"))
+        table.insert(generated, name .. ".__setters = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__setters or {}})") or "{}"))
+        table.insert(generated, name .. ".__lazy = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__lazy or {}})") or "{}"))
+        table.insert(generated, name .. ".__watchers = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__watchers or {}})") or "{}"))
+        table.insert(generated, name .. ".__watchedFields = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__watchedFields or {}})") or "{}"))
         for watchName in watchers do table.insert(generated, `{name}.__watchedFields["{watchName}"] = true`) end
         table.insert(generated, `{name}.__index = function(self: any, key: any)`)
         table.insert(generated, `    local getter: ((any) -> any)? = {name}.__getters[key]`)
@@ -1322,7 +1197,7 @@ local function transpileClasses(source: string): string
         for _, method in methods do
             if base then table.insert(generated, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
             if base and method.Override then table.insert(generated, `if not {base}.{method.Name} then error("No inherited method '{method.Name}' to override") end`) end
-            local nested = base and replaceSuper(method.Body, base) or method.Body
+            local nested = base and replaceSuper(method.Body, base, not method.Static) or method.Body
             table.insert(generated, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")})`)
             local code = normalized(transpileSource(nested), "    ")
             if method.Abstract then
@@ -1348,20 +1223,11 @@ local function transpileNamespaces(source: string): string
         local body = source:sub(headerEnd + 1, closing.Start - 1)
         local output = {}
         local depth = 0
-        local view = scanLauaSource(body, false, true)
-        local tokenCursor = 1
         for _, line in splitLines(body) do
             local raw = line.Text
-            local code = trim(view.masked:sub(line.Start, line.Finish))
-            while tokenCursor <= #view.tokens and view.tokens[tokenCursor].at < line.Start do tokenCursor += 1 end
-            local head = view.tokens[tokenCursor]
-            local async = head and head.value == "async"
-            local fnToken = view.tokens[tokenCursor + (async and 1 or 0)]
-            local nameToken = view.tokens[tokenCursor + (async and 2 or 1)]
-            local afterName = view.tokens[tokenCursor + (async and 3 or 2)]
-            local fn = depth == 0 and head and head.at <= line.Finish and fnToken and fnToken.value == "function" and nameToken and nameToken.kind == "word" and afterName and (afterName.value == "(" or afterName.value == "<") and nameToken.value or nil
-            local nextToken = view.tokens[tokenCursor + 1]
-            local field = depth == 0 and head and head.at <= line.Finish and head.kind == "word" and nextToken and nextToken.value == "=" and head.value or nil
+            local code = trim(maskNonCode(raw))
+            local fn = depth == 0 and (code:match("^function%s+([%a_][%w_]*)%s*%b()%s*$") or code:match("^function%s+([%a_][%w_]*)%s*%b()%s*:%s*[%a_][%w_]*%s*$") or code:match("^async%s+function%s+([%a_][%w_]*)%s*%b()%s*$") or code:match("^async%s+function%s+([%a_][%w_]*)%s*%b()%s*:%s*[%a_][%w_]*%s*$")) or nil
+            local field = depth == 0 and code:match("^([%a_][%w_]*)%s*=%s*.+$") or nil
             if fn then
                 local newLine
                 if code:match("^async%s+function%s+") then
@@ -2798,10 +2664,91 @@ end
 
 -- Semantic checks for statically known Laua declarations. Dynamic Roblox values,
 -- external imports and untyped tables remain governed by Luau at runtime.
--- Token-based syntax validation. This guards source-level token relationships
+-- v3.37 syntax validation. This guards source-level token relationships
 -- before the transformation passes; it does not replace Roblox's Luau parser.
 local function validateExpressionSyntax(source: string)
-    local tokens = scanLauaSource(source, true, true).tokens
+    local masked = maskNonCode(source)
+    local tokens = {}
+    local index = 1
+    local lineNumber = 1
+    local length = #source
+    local multiOperators = {"...", "??=", "//=" , "..=", "?.", "??", "==", "~=", "<=", ">=", "=>", "->", "::", "+=", "-=", "*=", "/=", "%=", "^=", "..", "//"}
+    local function add(kind: string, value: string, at: number)
+        table.insert(tokens, {kind = kind, value = value, line = lineNumber, at = at})
+    end
+    while index <= length do
+        local char = source:sub(index, index)
+        local visible = masked:sub(index, index)
+        if (char == '"' or char == "'" or char == "`") and visible == " " then
+            local start = index
+            local quote = char
+            index += 1
+            while index <= length do
+                local current = source:sub(index, index)
+                if current == "\\" then
+                    index += 2
+                elseif current == quote then
+                    index += 1
+                    break
+                else
+                    if current == "\n" then lineNumber += 1 end
+                    index += 1
+                end
+            end
+            add("literal", "<string>", start)
+        elseif char == "[" and visible == " " then
+            local equalSigns = source:sub(index):match("^%[(=*)%[")
+            if equalSigns then
+                local start = index
+                local closing = "]" .. equalSigns .. "]"
+                local openingLength = #equalSigns + 2
+                local closeAt = source:find(closing, index + openingLength, true)
+                local finish = closeAt and closeAt + #closing or length + 1
+                local chunk = source:sub(index, finish - 1)
+                local _, breaks = chunk:gsub("\n", "")
+                lineNumber += breaks
+                index = finish
+                add("literal", "<string>", start)
+            else
+                index += 1
+            end
+        elseif visible == " " or visible == "\t" or visible == "\r" or visible == "\n" then
+            if char == "\n" then lineNumber += 1 end
+            index += 1
+        elseif char:match("[%a_]") then
+            local start = index
+            repeat
+                index += 1
+            until index > length or not masked:sub(index, index):match("[%w_]")
+            add("word", masked:sub(start, index - 1), start)
+        elseif char:match("%d") then
+            local start = index
+            repeat
+                index += 1
+            until index > length or not masked:sub(index, index):match("[%w_]")
+            if source:sub(index, index) == "." and source:sub(index + 1, index + 1) ~= "." then
+                index += 1
+                while index <= length and masked:sub(index, index):match("%d") do index += 1 end
+            end
+            add("number", masked:sub(start, index - 1), start)
+        else
+            local start = index
+            local operator = nil
+            for _, candidate in multiOperators do
+                if masked:sub(index, index + #candidate - 1) == candidate then
+                    operator = candidate
+                    break
+                end
+            end
+            if operator then
+                index += #operator
+                add("symbol", operator, start)
+            else
+                index += 1
+                add("symbol", char, start)
+            end
+        end
+    end
     local openers = {["("] = ")", ["["] = "]", ["{"] = "}"}
     local stack = {}
     local binary = {["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["//"] = true, ["%"] = true, ["^"] = true, [".."] = true, ["??"] = true, ["and"] = true, ["or"] = true, ["=="] = true, ["~="] = true, ["<"] = true, [">"] = true, ["<="] = true, [">="] = true}
@@ -2830,13 +2777,12 @@ local function validateExpressionSyntax(source: string)
             if assignments[word] and (prev.kind == "number" or prev.kind == "literal" or prev.value == "true" or prev.value == "false" or prev.value == "nil") then
                 fail("Assignment requires a variable or property.", token)
             end
-            if (prev.value == ")" or prev.value == "]" or prev.value == "}") and (token.kind == "number" or token.kind == "literal" and (prev.value == "}" or token.quote == "`")) and prev.endLine == token.line then
+            if (prev.value == ")" or prev.value == "]" or prev.value == "}") and (token.kind == "number" or token.kind == "literal") and prev.line == token.line then
                 fail("Missing separator after '" .. prev.value .. "'.", token)
             end
-            if prev.kind == "number" and (token.kind == "number" or token.kind == "literal") and prev.endLine == token.line then
+            if prev.kind == "number" and (token.kind == "number" or token.kind == "literal") and prev.line == token.line then
                 fail("Missing operator between values.", token)
             end
-            if prev.kind == "literal" and (token.kind == "number" or token.kind == "literal") and prev.endLine == token.line then fail("Missing separator after string literal.", token) end
             if prev.value == "=" and word == "*" then fail("Unexpected '*' after '='.", token) end
         end
         if word == "do" and prev and prev.value == "," then
@@ -2844,18 +2790,8 @@ local function validateExpressionSyntax(source: string)
                 if tokens[n].value == "for" then fail("Missing range value before do.", token) end
             end
         end
-        if prev and prev.value == "then" and word == "else" then
-            local depth = 0
-            for n = position - 2, 1, -1 do
-                local value = tokens[n].value
-                if value == ")" or value == "]" or value == "}" then depth += 1 end
-                if value == "(" or value == "[" or value == "{" then depth -= 1 end
-                if depth == 0 and value == "if" then
-                    local before = tokens[n - 1] and tokens[n - 1].value
-                    if before == "=" or before == "return" or before == "(" or before == "," or before == "[" or before == "=>" or binary[before] then fail("Conditional expression is missing its then value.", token) end
-                    break
-                end
-            end
+        if prev and prev.value == "then" and word == "else" and prev.line == token.line then
+            fail("Conditional expression may be missing a value.", token)
         end
     end
     local top = stack[#stack]
@@ -3043,7 +2979,7 @@ local function validateLauaSemantics(source: string)
         for name in line.Text:gmatch("%f[%w_]for%s+([%a_][%w_]*)") do knownCalls[name] = true end
         for name in line.Text:gmatch("%f[%w_]function%s+([%a_][%w_]*)") do knownCalls[name] = true end
         for name in line.Text:gmatch("%f[%w_]import%s+([%a_][%w_]*)") do knownCalls[name] = true end
-        for _, pattern in {"function%s+[%a_][%w_]*%s*%(([^)]*)%)", "function%s+[%a_][%w_]*%s*%b<>%s*%(([^)]*)%)", "function%s*%(([^)]*)%)"} do
+        for _, pattern in {"function%s+[%a_][%w_]*%s*%(([^)]*)%)", "function%s+[%a_][%w_]*%s*%b<>%s*%(([^)]*)%)"} do
             for params in line.Text:gmatch(pattern) do
                 for _, part in paramParts(params) do
                     local name = part:match("^([%a_][%w_]*)")
@@ -3063,7 +2999,7 @@ local function validateLauaSemantics(source: string)
         for startPos, name in code:gmatch("()([%a_][%w_]*)%s*%(") do
             local before = code:sub(1, startPos - 1)
             local prev = before:match("(%S)%s*$")
-            if prev ~= "." and prev ~= ":" and not before:match("function%s*$") and not before:match("new%s*$") and not before:match("constructor%s*$") and not before:match("signal%s*$") and not before:match("get%s*$") and not before:match("set%s*$") then
+            if prev ~= "." and prev ~= ":" and not before:match("function%s*$") and not before:match("new%s*$") and not before:match("constructor%s*$") and not before:match("signal%s*$") and not before:match("watch%s*$") and not before:match("get%s*$") and not before:match("set%s*$") then
                 if not knownCalls[name] then fail(`Unknown function '{name}'.`, line.Start + startPos - 1) end
             end
         end
@@ -3112,11 +3048,7 @@ local function validateLauaSemantics(source: string)
             if className then
                 local found = memberOf(className, member, isStatic)
                 if not found and owner == "self" and code:find("self%." .. member .. "%s*=") then continue end
-                if not found then
-                    local ownerKind = isStatic and "Class" or "Instance"
-                    local memberKind = delimiter == ":" and "method" or "member"
-                    fail(`{ownerKind} '{className}' has no {memberKind} '{member}'.`, line.Start)
-                end
+                if not found then fail(`Instance '{className}' has no member '{member}'.`, line.Start) end
                 if delimiter == ":" and found.Kind ~= "method" then fail(`'{className}.{member}' is not a method.`, line.Start) end
             end
         end
@@ -3197,7 +3129,7 @@ function Transpiler.Transpile(source: string, options: any?): string
         for _, name in exportedNames do table.insert(values, `{name} = {name}`) end
         source ..= "\nreturn {" .. table.concat(values, ", ") .. "}"
     end
-    source = trimGeneratedWhitespace(source)
+    source = source:gsub("[ \t]+\n", "\n")
     -- Narrow generated-syntax preflight. Roblox Studio remains the final parser.
     if not source:find("[[", 1, true) then
         local masked = maskNonCode(source)
