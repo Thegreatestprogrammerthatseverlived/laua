@@ -93,7 +93,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.40 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.41 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -205,8 +205,9 @@
       "class", "extends", "constructor", "private", "public", "protected",
       "static", "new", "namespace", "super", "abstract", "override", "enum",
       "final", "get", "set", "defer", "using", "async", "await",
-      "match", "case", "default", "import", "from", "operator", "signal",
-      "lazy", "watch", "export", "as", "memo", "is", "inline", "const"
+      "match", "case", "default", "exhaustive", "import", "from", "operator", "signal",
+      "lazy", "watch", "export", "as", "memo", "is", "inline", "const",
+      "schema", "network", "client_to_server", "server_to_client", "exhaustive"
     ];
 
     const LUAU_ATTRIBUTES = [
@@ -632,6 +633,7 @@ local part = message[1:7]`;
             /^(abstract\s+|final\s+)?class\b/.test(maskedLine) ||
             /^(?:return\s+)?namespace\b/.test(maskedLine) ||
             /^enum\b/.test(maskedLine) ||
+            /^(?:schema|network)\b/.test(maskedLine) ||
             /^match\b/.test(maskedLine) ||
             /^operator\s+/.test(maskedLine) ||
             /^watch\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(maskedLine) ||
@@ -2806,7 +2808,15 @@ local part = message[1:7]`;
       const masked = maskNonCode(source);
       const classes = new Map(), enums = new Map(), namespaces = new Map();
       const knownVariables = new Map(), functions = new Map();
-      const builtins = new Set(('assert error getfenv getmetatable ipairs loadstring newproxy next pairs pcall print rawequal rawget rawlen rawset select setfenv setmetatable tonumber tostring type typeof unpack xpcall require warn tick time elapsedTime gcinfo settings UserSettings plugin delay spawn wait collectgarbage debug vector _G _VERSION shared game workspace script Enum Instance CFrame Vector2 Vector3 UDim UDim2 Color3 BrickColor NumberRange NumberSequence ColorSequence Rect Ray Region3 PhysicalProperties Random DateTime TweenInfo OverlapParams RaycastParams Axes Faces Font Vector3int16 Vector2int16 NumberSequenceKeypoint ColorSequenceKeypoint math table string task coroutine utf8 os bit32 buffer').split(' '));
+      const importedSymbols = new Set();
+      for(const imp of source.matchAll(/^\s*import\s+\{([^{}]+)\}\s+from\s+["'][^"'\n]+["']/gm)) {
+        for(const part of imp[1].split(',')) {
+          const match=/^\s*([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*$/.exec(part);
+          if(match)importedSymbols.add(match[2]||match[1]);
+        }
+      }
+
+      const builtins = new Set(('assert error getfenv getmetatable ipairs loadstring newproxy next pairs pcall print rawequal rawget rawlen rawset select setfenv setmetatable tonumber tostring type typeof unpack xpcall require warn tick time elapsedTime gcinfo settings UserSettings plugin cancelScope delay spawn wait collectgarbage debug vector _G _VERSION shared game workspace script Enum Instance CFrame Vector2 Vector3 UDim UDim2 Color3 BrickColor NumberRange NumberSequence ColorSequence Rect Ray Region3 PhysicalProperties Random DateTime TweenInfo OverlapParams RaycastParams Axes Faces Font Vector3int16 Vector2int16 NumberSequenceKeypoint ColorSequenceKeypoint math table string task coroutine utf8 os bit32 buffer').split(' '));
       const lines = splitLinesWithOffsets(source);
       const fail = (message, at) => { const line = source.slice(0, at).split('\n').length, column = at-source.lastIndexOf('\n',at-1); const error=new Error(`Laua semantic error (line ${line}, column ${column}): ${message}`); Object.assign(error,{code:'LAUA_SEMANTIC',offset:at,line,column});throw error; };
       const signature = (raw) => {
@@ -2893,7 +2903,7 @@ local part = message[1:7]`;
         return null;
       };
       for(const m of masked.matchAll(/\b(?:local\s+|const\s+)?([A-Za-z_]\w*)\s*(?::\s*([A-Za-z_]\w*))?\s*=\s*new\s+([A-Za-z_]\w*)\s*(?:\(([^\n)]*)\))?/g)){
-        if(!classes.has(m[3])){if(!m[3].includes('.'))fail(`Unknown class '${m[3]}'.`,m.index);continue;}
+        if(!classes.has(m[3])){if(!importedSymbols.has(m[3])&&!m[3].includes('.'))fail(`Unknown class '${m[3]}'.`,m.index);continue;}
         knownVariables.set(m[1],m[3]);checkCall(`${m[3]} constructor`,classes.get(m[3]).ctor||[],m[4]===undefined?'':source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index+m[0].indexOf('new'));
       }
       for(const m of masked.matchAll(/\blocal\s+(\w+)\s*:\s*(\w+)\b/g)){if(classes.has(m[2])&&!knownVariables.has(m[1])) knownVariables.set(m[1],m[2]);}
@@ -2988,7 +2998,7 @@ local part = message[1:7]`;
       for(const m of masked.matchAll(/\bnew\s+([A-Za-z_]\w*)\s*\(/g)){
         const prefix=masked.slice(Math.max(0,m.index-3),m.index);
         if(/\.\s*$/.test(prefix))continue;
-        if(!classes.has(m[1])&&!declarations.has(m[1]))fail(`Unknown class '${m[1]}'.`,m.index);
+        if(!classes.has(m[1])&&!declarations.has(m[1])&&!importedSymbols.has(m[1]))fail(`Unknown class '${m[1]}'.`,m.index);
       }
       for(const m of masked.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)){
         const name=m[1],before=masked.slice(Math.max(0,m.index-50),m.index);
@@ -3041,17 +3051,253 @@ local part = message[1:7]`;
       }
     }
 
+    // Laua v3.41: opt-in schema, network and cancellation primitives.
+    // Each lowering is driven by a top-level declaration; no runtime is added
+    // to unrelated programs.
+    function lauaFieldSpec(raw, context) {
+      const match = /^([A-Za-z_]\w*)\s*:\s*(\{\s*[A-Za-z_]\w*\s*\}|[A-Za-z_]\w*)\s*(\?)?\s*,?$/.exec(raw.trim());
+      if (!match) throw new Error(`Invalid ${context} field: ${raw.trim()}`);
+      const type = match[2].replace(/\s/g,'');
+      return {name: match[1], type: type.replace(/\?$/,''), optional: !!match[3]};
+    }
+
+    function lauaTypePredicate(expr, type) {
+      if (type === 'any') return 'true';
+      if (type === 'Instance') return `typeof(${expr}) == "Instance"`;
+      if (['string','number','boolean','table','function','thread','Vector3','CFrame','Color3'].includes(type))
+        return `typeof(${expr}) == ${JSON.stringify(type)}`;
+      if (/^\{[A-Za-z_]\w*\}$/.test(type)) {
+        const inner=type.slice(1,-1);
+        return `(type(${expr}) == "table" and (function() for _, __item in ${expr} do if not (${lauaTypePredicate('__item',inner)}) then return false end end return true end)())`;
+      }
+      if (!/^[A-Za-z_]\w*$/.test(type)) throw new Error(`Unsupported schema type '${type}'`);
+      return `(type(${type}) == "table" and type(${type}.Validate) == "function" and ${type}.Validate(${expr}))`;
+    }
+
+    function transpileSchemas(source) {
+      let masked=maskNonCode(source);
+      const ctx={masked,lines:splitLinesWithOffsets(source),blockMarkers:[]};
+      const blocks=[];
+      for(const line of ctx.lines) {
+        const clean=masked.slice(line.start,line.end).trim();
+        const m=/^schema\s+([A-Za-z_]\w*)$/.exec(clean);
+        if(!m) continue;
+        const end=findMatchingEndByLines(source,line.start,ctx);
+        const body=source.slice(line.end+1,end.start),fields=[],seen=new Set();
+        for(const raw of body.split('\n')) {
+          const text=maskNonCode(raw).trim();
+          if(!text)continue;
+          const f=lauaFieldSpec(raw,`schema ${m[1]}`);
+          if(seen.has(f.name))throw new Error(`Duplicate schema field '${f.name}'`);
+          seen.add(f.name);fields.push(f);
+        }
+        const emitted=[`local ${m[1]} = {}`,
+          `function ${m[1]}.Validate(value: any): (boolean, string?)`,
+          '    if type(value) ~= "table" then return false, "Expected table" end'];
+        for(const f of fields) {
+          const value=`value[${JSON.stringify(f.name)}]`;
+          const expression=lauaTypePredicate(value,f.type);
+          emitted.push(`    if ${f.optional ? `${value} ~= nil and ` : ''}not (${expression}) then return false, ${JSON.stringify(`Invalid field ${f.name}: expected ${f.type}${f.optional?'?':''}`)} end`);
+        }
+        emitted.push('    return true, nil','end',
+          `function ${m[1]}.Assert(value: any): any`,
+          `    local ok, message = ${m[1]}.Validate(value)`,
+          '    if not ok then error(message, 2) end',
+          '    return value','end');
+        blocks.push({start:line.start,end:end.end,out:emitted.join('\n')});
+      }
+      for(const block of blocks.reverse())source=replaceRange(source,block.start,block.end,block.out);
+      return source;
+    }
+
+    function lauaParseParameters(text, context) {
+      const params=[];
+      if(!text.trim())return params;
+      for(const part of text.split(',')) {
+        const p=/^\s*([A-Za-z_]\w*)\s*:\s*(\{\s*[A-Za-z_]\w*\s*\}|[A-Za-z_]\w*)(\?)?\s*$/.exec(part);
+        if(!p)throw new Error(`Invalid ${context} parameter '${part.trim()}'`);
+        params.push({name:p[1],type:p[2].replace(/\s/g,''),optional:!!p[3]});
+      }
+      if(new Set(params.map(p=>p.name)).size!==params.length)throw new Error(`Duplicate parameter in ${context}`);
+      return params;
+    }
+
+    function transpileNetworks(source) {
+      const masked=maskNonCode(source),ctx={masked,lines:splitLinesWithOffsets(source),blockMarkers:[]},blocks=[];
+      for(const line of ctx.lines) {
+        const m=/^network\s+([A-Za-z_]\w*)$/.exec(masked.slice(line.start,line.end).trim());
+        if(!m)continue;
+        const end=findMatchingEndByLines(source,line.start,ctx);
+        const name=m[1],events=[],seen=new Set();
+        for(const raw of source.slice(line.end+1,end.start).split('\n')) {
+          if(!maskNonCode(raw).trim())continue;
+          const e=/^\s*(client_to_server|server_to_client)\s+(function|signal)\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\s*$/.exec(raw);
+          if(!e)throw new Error(`Invalid network contract in '${name}': ${raw.trim()}`);
+          if(seen.has(e[3]))throw new Error(`Duplicate network event '${e[3]}'`);
+          seen.add(e[3]);events.push({direction:e[1],name:e[3],params:lauaParseParameters(e[4],`${name}.${e[3]}`)});
+        }
+        if(!events.length)throw new Error(`Network '${name}' needs at least one event`);
+        const out=[`local ${name} = {}`,
+          `function ${name}.Bind(folder: Instance)`,
+          '    assert(typeof(folder) == "Instance", "Network requires a RemoteEvent folder")'];
+        // Resolve RemoteEvents once at Bind rather than on each hot-path send.
+        // No extra cache table is needed: the contract table owns each handle.
+        for(const event of events) {
+          out.push(`    ${name}.__${event.name} = folder:WaitForChild(${JSON.stringify(event.name)})`);
+          out.push(`    assert(${name}.__${event.name}:IsA("RemoteEvent"), "Network expects a RemoteEvent")`);
+        }
+        out.push(`    ${name}.__folder = folder`, 'end');
+        for(const event of events) {
+          const remote=`${name}.__${event.name}`;
+          const declared=event.params.map(p=>`${p.name}: ${p.type}${p.optional?'?':''}`).join(', ');
+          const names=event.params.map(p=>p.name).join(', ');
+          const sender=event.direction==='client_to_server'?'FireServer':'FireClient';
+          const senderParam=event.direction==='client_to_server'?declared:`player: Player${declared?', '+declared:''}`;
+          const invoke=event.direction==='client_to_server'?names:`player${names?', '+names:''}`;
+          out.push(`function ${name}.Send${event.name}(${senderParam})`,
+            `    assert(${name}.__folder ~= nil, "Bind network '${name}' first")`,
+            `    local remote = ${remote}`,
+            `    remote:${sender}(${invoke})`, 'end');
+          const receiver=event.direction==='client_to_server'?'OnServerEvent':'OnClientEvent';
+          const callbackParams=event.direction==='client_to_server'?`player: Player${declared?', '+declared:''}`:declared;
+          const callbackInvoke=event.direction==='client_to_server'?`player${names?', '+names:''}`:names;
+          const callbackType=event.direction==='client_to_server'?'(Player, ...any) -> ()':'(...any) -> ()';
+          out.push(`function ${name}.On${event.name}(callback: ${callbackType}): RBXScriptConnection`,
+            `    assert(${name}.__folder ~= nil, "Bind network '${name}' first")`,
+            `    local remote = ${remote}`,
+            `    return remote.${receiver}:Connect(function(${callbackParams})`);
+          for(const p of event.params) {
+            const value=p.name, predicate=lauaTypePredicate(value,p.type);
+            out.push(`        if ${p.optional?`${value} ~= nil and `:''}not (${predicate}) then return end`);
+          }
+          out.push(`        callback(${callbackInvoke})`, '    end)','end');
+        }
+        blocks.push({start:line.start,end:end.end,out:out.join('\n')});
+      }
+      for(const block of blocks.reverse())source=replaceRange(source,block.start,block.end,block.out);
+      return source;
+    }
+
+    const LAUA_CANCELLATION_RUNTIME = `local __lauaCancelScope = {}
+function __lauaCancelScope.new()
+    local scope = {_cancelled = false, _jobs = {}, _cleanups = {}}
+    function scope:OnCancel(cleanup)
+        assert(type(cleanup) == "function", "OnCancel expects a function")
+        if self._cancelled then cleanup(); return end
+        table.insert(self._cleanups, cleanup)
+    end
+    function scope:Spawn(callback)
+        assert(type(callback) == "function", "Spawn expects a function")
+        if self._cancelled then return nil end
+        local thread = task.spawn(function() if not self._cancelled then callback(self) end end)
+        table.insert(self._jobs, thread)
+        return thread
+    end
+    function scope:Cancel()
+        if self._cancelled then return end
+        self._cancelled = true
+        for _, thread in self._jobs do pcall(task.cancel, thread) end
+        table.clear(self._jobs)
+        for i = #self._cleanups, 1, -1 do pcall(self._cleanups[i]) end
+        table.clear(self._cleanups)
+    end
+    scope.Dispose = scope.Cancel
+    return scope
+end`;
+
+    function transpileCancelScopes(source) {
+      const masked=maskNonCode(source),pattern=/\bcancelScope\s*\(\s*\)/g;
+      const matches=[...masked.matchAll(pattern)].filter(m=>!/[.:\w]/.test(masked[m.index-1]||''));
+      if(!matches.length)return source;
+      for(const match of matches.reverse())source=replaceRange(source,match.index,match.index+match[0].length,'__lauaCancelScope.new()');
+      const header=source.match(/^(?:[ \t]*--![^\n]*(?:\n|$))*/)[0];
+      return header+LAUA_CANCELLATION_RUNTIME+'\n'+source.slice(header.length);
+    }
+
+    function validateExhaustiveMatches(source) {
+      const masked=maskNonCode(source),ctx={masked,lines:splitLinesWithOffsets(source),blockMarkers:[]};
+      const enumDefs=new Map();
+      for(const line of ctx.lines) {
+        const m=/^enum\s+([A-Za-z_]\w*)$/.exec(masked.slice(line.start,line.end).trim());
+        if(!m)continue;
+        const ending=findMatchingEndByLines(source,line.start,ctx);
+        enumDefs.set(m[1],new Set(source.slice(line.end+1,ending.start).split('\n')
+          .map(raw=>/^\s*([A-Za-z_]\w*)\s*(?:=|,|$)/.exec(maskNonCode(raw))?.[1]).filter(Boolean)));
+      }
+      const types=new Map();
+      for(const m of masked.matchAll(/\b(?:local|const)\s+([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)\b/g))types.set(m[1],m[2]);
+      const blocks=[];
+      for(const line of ctx.lines) {
+        const header=/^match\s+exhaustive\s+(.+)$/.exec(source.slice(line.start,line.end).trim());
+        if(!header || !/^match\s+exhaustive\b/.test(masked.slice(line.start,line.end).trim()))continue;
+        const end=findMatchingEndByLines(source,line.start,ctx);
+        const body=source.slice(line.end+1,end.start);
+        let caseType=types.get(header[1].trim())||null;
+        const cases=[],seen=new Set();let hasDefault=false,guard=false;
+        for(const row of body.split('\n')) {
+          const raw=row.trim();
+          if(/^default\s*$/.test(raw))hasDefault=true;
+          const match=/^case\s+(.+)$/.exec(raw);
+          if(!match)continue;
+          let value=match[1].trim();
+          if(/\s+if\s+/.test(value)){guard=true;value=value.split(/\s+if\s+/)[0];}
+          if(seen.has(value))throw new Error(`Duplicate exhaustive match case '${value}'`);
+          seen.add(value);cases.push(value);
+          const prefix=/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(value);
+          if(prefix&&enumDefs.has(prefix[1])){
+            if(!caseType)caseType=prefix[1];
+            if(caseType!==prefix[1])throw new Error('Exhaustive match mixes enum types');
+            if(!enumDefs.get(prefix[1]).has(prefix[2]))throw new Error(`Unknown enum case '${value}'`);
+          }
+        }
+        if(!hasDefault){
+          if(guard)throw new Error('Exhaustive guarded match requires default (guard may fail)');
+          let required;
+          if(caseType==='boolean')required=['true','false'];
+          else if(enumDefs.has(caseType))required=[...enumDefs.get(caseType)].map(member=>`${caseType}.${member}`);
+          else throw new Error('Exhaustive match requires an enum/boolean-typed subject or default');
+          const missing=required.filter(value=>!seen.has(value));
+          if(missing.length)throw new Error(`Non-exhaustive match: missing ${missing.join(', ')}`);
+        }
+        blocks.push({start:line.start,at:line.start+source.slice(line.start,line.end).indexOf('exhaustive'),end:line.end});
+      }
+      return blocks.reduceRight((text,block)=>replaceRange(text,block.at,block.at+'exhaustive '.length,''),source);
+    }
+
+    function maskLauaContractBlocks(source) {
+      const masked=maskNonCode(source),ctx={masked,lines:splitLinesWithOffsets(source),blockMarkers:[]},ranges=[];
+      for(const line of ctx.lines) {
+        if(!/^(?:schema|network)\s+[A-Za-z_]\w*$/.test(masked.slice(line.start,line.end).trim()))continue;
+        const end=findMatchingEndByLines(source,line.start,ctx);
+        ranges.push([line.start,end.end]);
+      }
+      const letters=source.split('');
+      for(const [a,b] of ranges)for(let i=a;i<b;i++)if(letters[i]!=='\n'&&letters[i]!=='\r')letters[i]=' ';
+      return letters.join('');
+    }
+
     function transpile(source, options = {}) {
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
       validateExpressionSyntax(source);
-      if (options?.SemanticCheck !== false) {validateClassContracts(source);validateScopedReferences(source);validateLauaSemantics(source);validateTypedSemantics(source);}
+      const contractPresent = /\b(?:schema|network)\s+[A-Za-z_]/.test(source);
+      if(contractPresent) {
+        // Validate the new syntax before older semantic checks inspect its body.
+        if(/\bschema\s+[A-Za-z_]/.test(source))transpileSchemas(source);
+        if(/\bnetwork\s+[A-Za-z_]/.test(source))transpileNetworks(source);
+      }
+      const semanticSource=contractPresent?maskLauaContractBlocks(source):source;
+      if (options?.SemanticCheck !== false) {validateClassContracts(semanticSource);validateScopedReferences(semanticSource);validateLauaSemantics(semanticSource);validateTypedSemantics(semanticSource);}
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact'].includes(style))throw new Error('Invalid Laua output style');
 
       // Skip whole-file transforms when their syntax cannot occur. Check the
       // current text at each stage because an earlier pass can introduce syntax.
       if (source.includes('--#')) source = preprocessMode(source,mode);
+      if (/\bmatch\s+exhaustive\b/.test(source)) source = validateExhaustiveMatches(source);
+      if (/\bschema\s+[A-Za-z_]/.test(source)) source = transpileSchemas(source);
+      if (/\bnetwork\s+[A-Za-z_]/.test(source)) source = transpileNetworks(source);
+      if (source.includes('cancelScope')) source = transpileCancelScopes(source);
       if (source.includes('inline')) source = transpileInlineFunctions(source);
       validateKnownVisibility(source);
       validatePendingFeatures(source);
@@ -3086,6 +3332,7 @@ local part = message[1:7]`;
       }
       return style==='Compact' ? compactGeneratedOutput(output) : output;
     }
+
     function buildLauaSymbolIndex(source) {
       const symbols = {
         namespaces: {},
@@ -6407,12 +6654,30 @@ local part = message[1:7]`;
       }
     }
 
+    function editorLintContractSource(source) {
+      if(!/\b(?:schema|network)\s+[A-Za-z_]/.test(source))return source;
+      let result=maskLauaContractBlocks(source);
+      const masked=maskNonCode(source),changes=[];
+      for(const line of splitLinesWithOffsets(source)){
+        const visible=masked.slice(line.start,line.end);
+        const m=/^(\s*)(?:schema|network)\s+([A-Za-z_]\w*)\s*$/.exec(visible);
+        if(!m)continue;
+        changes.push({start:line.start,end:line.end,content:(m[1]+'local '+m[2]).padEnd(line.end-line.start,' ')});
+      }
+      for(const item of changes.reverse())result=replaceRange(result,item.start,item.end,item.content);
+      return result;
+    }
+
     function updateLauaDiagnostics(model) {
       if (model.getLanguageId() !== "laua") return;
 
       const source = model.getValue();
-      const masked = maskNonCode(source);
-      const symbols = getLauaSymbols(source);
+      // The older editor hints do not parse v3.41 declaration bodies. Give
+      // them an offset-preserving `local Name` instead of bogus block ends.
+      // The actual transpiler still validates the full unmodified source.
+      const lintSource = editorLintContractSource(source);
+      const masked = maskNonCode(lintSource);
+      const symbols = getLauaSymbols(lintSource);
       const markers = [];
       const directives = readPlaygroundDirectives(source);
 
@@ -6444,7 +6709,7 @@ local part = message[1:7]`;
         const end = Number.isInteger(error.endOffset) ? Math.max(at + 1, error.endOffset) : lineStart + Math.max(1, (lines[lineNumber - 1] || "").length);
         pushMarker(at, end, monaco.MarkerSeverity.Error, message, "syntax", "CompilerPreflight");
       }
-      if (!expressionSyntaxErrors) lintExpressionTokens(source, (...args) => {
+      if (!expressionSyntaxErrors) lintExpressionTokens(lintSource, (...args) => {
         expressionSyntaxErrors++;
         pushMarker(...args);
       });
@@ -6659,7 +6924,7 @@ local part = message[1:7]`;
 
             [/\b(abstract)(\s+)(class)(\s+)([A-Za-z_][A-Za-z0-9_]*)/,
               ["keyword.laua", "", "keyword.laua", "", "type.identifier"]],
-            [/\b(class|namespace|enum)(\s+)([A-Za-z_][A-Za-z0-9_]*)/,
+            [/\b(class|namespace|enum|schema|network)(\s+)([A-Za-z_][A-Za-z0-9_]*)/,
               ["keyword.laua", "", "type.identifier"]],
             [/\b(function)(\s+)([A-Za-z_][A-Za-z0-9_]*)/,
               ["keyword", "", "function"]],
@@ -6899,7 +7164,12 @@ local part = message[1:7]`;
             super: "Access the parent class or call its constructor.",
             abstract: "Declare an abstract class or method.",
             override: "Declare that a method overrides a parent method.",
-            enum: "Declare a Laua enum."
+            enum: "Declare a Laua enum.",
+            schema: "Define a runtime data validation contract.",
+            network: "Define a typed client/server RemoteEvent contract.",
+            client_to_server: "Specify an event received by the server.",
+            server_to_client: "Specify an event received by clients.",
+            exhaustive: "Require all enum or boolean match cases to be handled."
           };
 
           const makeKeyword = (label, detail = "Luau keyword") => ({
@@ -8195,7 +8465,7 @@ local part = message[1:7]`;
       function exportStudioSourceProject() {
         try {
           const blob=makeStudioSourceRbxmx();
-          downloadProjectBlob('Laua-v3.40-editable-studio.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.41-editable-studio.rbxmx',blob);
           projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -8293,7 +8563,7 @@ local part = message[1:7]`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.40-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.41-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
