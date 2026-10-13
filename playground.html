@@ -207,7 +207,7 @@
       "final", "get", "set", "defer", "using", "async", "await",
       "match", "case", "default", "exhaustive", "import", "from", "operator", "signal",
       "lazy", "watch", "export", "as", "memo", "is", "inline", "const",
-      "schema", "network", "client_to_server", "server_to_client", "exhaustive"
+      "schema", "network", "client_to_server", "server_to_client"
     ];
 
     const LUAU_ATTRIBUTES = [
@@ -229,49 +229,64 @@
     const LUAU_KEYWORDS = [
       "and", "break", "continue", "do", "else", "elseif", "end",
       "false", "for", "function", "if", "in", "local", "nil", "not", "or",
-      "repeat", "return", "then", "true", "type", "until", "while", "const"
+      "repeat", "return", "then", "true", "type", "export", "until", "while", "const"
     ];
 
-    const LUAU_GLOBALS = [
-      "assert", "error", "getfenv", "getmetatable", "ipairs", "loadstring",
-      "newproxy", "next", "pairs", "pcall", "print", "rawequal", "rawget",
-      "rawlen", "rawset", "select", "setfenv", "setmetatable", "tonumber",
-      "tostring", "type", "typeof", "unpack", "xpcall", "_G", "_VERSION",
-      "shared", "game", "workspace", "script", "Enum", "Instance", "CFrame",
-      "Vector2", "Vector3", "UDim", "UDim2", "Color3", "BrickColor",
-      "NumberRange", "NumberSequence", "ColorSequence", "Rect", "Ray",
-      "Region3", "PhysicalProperties", "Random", "DateTime", "TweenInfo",
-      "OverlapParams", "RaycastParams", "Axes", "Faces", "Font",
-      "Vector3int16", "Vector2int16", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
-      "math", "table", "string", "task", "coroutine", "utf8", "os", "bit32", "buffer"
+    // Monaco autocomplete catalogs. Each item here is an actual Luau/Laua
+    // keyword, type, built-in, engine global, or datatype constructor.
+    // Engine classes are added separately when the cursor expects a type.
+    const LUAU_GLOBAL_FUNCTIONS = [
+      "assert", "collectgarbage", "error", "gcinfo", "getfenv", "getmetatable",
+      "ipairs", "loadstring", "newproxy", "next", "pairs", "pcall", "print",
+      "rawequal", "rawget", "rawlen", "rawset", "require", "select", "setfenv",
+      "setmetatable", "tonumber", "tostring", "type", "typeof", "unpack", "xpcall",
+      "DebuggerManager", "delay", "elapsedTime", "PluginManager", "printidentity",
+      "settings", "spawn", "stats", "tick", "time", "UserSettings", "version",
+      "wait", "warn", "ypcall"
     ];
 
     const LUAU_GLOBAL_OBJECTS = [
-      "game", "workspace", "script", "shared", "_G"
-    ];
-
-    const LUAU_GLOBAL_FUNCTIONS = [
-      "assert", "error", "getfenv", "getmetatable", "ipairs", "loadstring",
-      "newproxy", "next", "pairs", "pcall", "print", "rawequal", "rawget",
-      "rawlen", "rawset", "select", "setfenv", "setmetatable", "tonumber",
-      "tostring", "type", "typeof", "unpack", "xpcall"
+      "_G", "shared", "game", "workspace", "script", "plugin", "Enum"
     ];
 
     const LUAU_LIBRARIES = [
-      "math", "table", "string", "task", "coroutine", "utf8", "os", "bit32", "buffer"
+      "math", "table", "string", "task", "coroutine", "utf8", "os", "bit32",
+      "buffer", "debug"
     ];
 
     const LUAU_BUILTIN_TYPES = [
-      "Enum", "Instance", "CFrame", "Vector2", "Vector3", "UDim", "UDim2",
+      "Enum", "EnumItem", "Instance", "CFrame", "Vector2", "Vector3", "UDim", "UDim2",
       "Color3", "BrickColor", "NumberRange", "NumberSequence", "ColorSequence",
       "Rect", "Ray", "Region3", "PhysicalProperties", "Random", "DateTime",
-      "TweenInfo", "OverlapParams", "RaycastParams", "Axes", "Faces", "Font",
-      "Vector3int16", "Vector2int16", "NumberSequenceKeypoint", "ColorSequenceKeypoint"
+      "TweenInfo", "OverlapParams", "RaycastParams", "RaycastResult", "Axes", "Faces", "Font",
+      "Vector3int16", "Vector2int16", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
+      "RBXScriptConnection", "RBXScriptSignal"
     ];
 
-    const LUAU_GLOBAL_CONSTANTS = [
-      "_VERSION"
+    const LUAU_RUNTIME_CONSTRUCTORS = LUAU_BUILTIN_TYPES.filter(name =>
+      !["EnumItem", "RaycastResult", "RBXScriptConnection", "RBXScriptSignal"].includes(name)
+    );
+
+    // Type names are suggestions, not runtime globals. Include all directly
+    // spellable Luau type keywords (vector is intentionally not a type name).
+    const LUAU_TYPE_WORDS = [
+      "any", "unknown", "never", "nil", "boolean", "number", "string", "thread", "buffer"
     ];
+
+    const LUAU_GLOBAL_CONSTANTS = ["_VERSION"];
+    const LAUA_GLOBAL_FUNCTIONS = ["cancelScope"];
+    const LUAU_GLOBALS = [...new Set([
+      ...LUAU_GLOBAL_FUNCTIONS,
+      ...LUAU_GLOBAL_OBJECTS,
+      ...LUAU_LIBRARIES,
+      ...LUAU_RUNTIME_CONSTRUCTORS,
+      ...LUAU_GLOBAL_CONSTANTS
+    ])];
+
+    const LUAU_DEPRECATED_GLOBALS = new Set([
+      "collectgarbage", "getfenv", "setfenv", "DebuggerManager", "PluginManager",
+      "delay", "elapsedTime", "printidentity", "spawn", "version", "wait", "ypcall"
+    ]);
     const ROBLOX_SERVICES = [
       "Players", "RunService", "UserInputService", "ContextActionService",
       "ReplicatedStorage", "ServerStorage", "ServerScriptService",
@@ -292,7 +307,6 @@
         "huge", "pi"
       ],
       table: [
-        "filter", "map", "reduce", "findWhere",
         "clear", "clone", "concat", "create", "find", "freeze", "insert",
         "isfrozen", "maxn", "move", "pack", "remove", "sort", "unpack"
       ],
@@ -311,6 +325,7 @@
         "char", "charpattern", "codes", "codepoint", "graphemes", "len", "nfcnormalize", "nfdnormalize", "offset"
       ],
       os: ["clock", "date", "difftime", "time"],
+      debug: ["info", "traceback", "profilebegin", "profileend", "setmemorycategory", "resetmemorycategory"],
       bit32: [
         "arshift", "band", "bnot", "bor", "btest", "bxor", "countlz",
         "countrz", "extract", "lrotate", "lshift", "replace", "rrotate", "rshift"
@@ -347,12 +362,12 @@
     function makeLibraryMembers(owner) {
       const members = {};
       for (const name of LIBRARY_MEMBERS[owner] || []) {
-        if (HIDDEN_DEPRECATED_BUILTINS.has(`${owner}.${name}`)) continue;
+        // Deprecated standard-library words remain discoverable in completion.
         const definition = owner === "buffer" ? BUFFER_SIGNATURES[name] : null;
         members[name] = {
           kind: owner === "math" && ["pi", "huge"].includes(name) || owner === "utf8" && name === "charpattern" ? "field" : "function",
           params: definition?.[0] || "",
-          detail: definition?.[1] || `${owner} standard library`,
+          detail: definition?.[1] || `${owner} standard library${HIDDEN_DEPRECATED_BUILTINS.has(`${owner}.${name}`) ? " (deprecated)" : ""}`,
           documentation: definition?.[1] || `Luau ${owner}.${name}`
         };
       }
@@ -7005,7 +7020,7 @@ end`;
         builtinTypes: LUAU_BUILTIN_TYPES,
         globalConstants: LUAU_GLOBAL_CONSTANTS,
         typeKeywords: [
-          "any", "unknown", "never", "nil", "boolean", "number", "string", "thread", "buffer",
+          ...LUAU_TYPE_WORDS,
           "Vector2", "Vector3", "CFrame", "Color3", "UDim", "UDim2", "Instance", "Player",
           "Model", "BasePart", "Humanoid", "RemoteEvent", "RemoteFunction"
         ],
@@ -7251,14 +7266,6 @@ end`;
             watch: "React when a watched field is assigned a different value.",
             export: "Expose named declarations through the module return table.",
             as: "Rename a member in a named module import.",
-            lazy: "Initialize a class field when first accessed (cached per instance).",
-            watch: "React when a watched field is assigned a different value.",
-            export: "Expose named declarations through the module return table.",
-            as: "Rename a member in a named module import.",
-            lazy: "Initialize a class field when first accessed (cached per instance).",
-            watch: "React when a watched field is assigned a different value.",
-            export: "Expose named declarations through the module return table.",
-            as: "Rename a member in a named module import.",
             using: "Acquire a resource that is cleaned up at function exit.",
             async: "Create an asynchronous function that returns a promise-like result.",
             await: "Wait for a promise result inside an async function.",
@@ -7288,20 +7295,48 @@ end`;
             insertText: label,
             detail,
             documentation: keywordDocs[label] || undefined,
+            sortText: "0100_" + label,
             range
           });
 
+          const makeName = (label, kind, detail, priority = "0300") => ({
+            label,
+            kind,
+            insertText: label,
+            detail,
+            sortText: priority + "_" + label,
+            range
+          });
+
+          const isLaua = model.getLanguageId() === "laua";
+          const typeContext = /(?:\b(?:type|export\s+type)\s+[A-Za-z_][A-Za-z_0-9]*(?:<[^>]*>)?\s*=|::|:|\||&)\s*[A-Za-z_0-9]*$/.test(lineBefore);
+          const typedPrefix = word.word.toLowerCase();
           const suggestions = [
-            ...LUAU_KEYWORDS.map(k => makeKeyword(k)),
-            ...(model.getLanguageId() === "laua" ? LAUA_KEYWORDS.map(k => makeKeyword(k, "Laua keyword")) : []),
-            ...LUAU_GLOBALS.filter(label => !HIDDEN_DEPRECATED_BUILTINS.has(label)).map(label => ({
-              label,
-              kind: monaco.languages.CompletionItemKind.Variable,
-              insertText: label,
-              detail: "Global",
-              range
-            }))
+            ...LUAU_KEYWORDS.map(name => makeKeyword(name)),
+            ...(isLaua ? LAUA_KEYWORDS.map(name => makeKeyword(name, "Laua keyword")) : []),
+            ...LUAU_TYPE_WORDS.map(name => makeName(name, monaco.languages.CompletionItemKind.TypeParameter, "Luau type", "0200")),
+            ...LUAU_GLOBAL_FUNCTIONS.map(name => makeName(
+              name,
+              monaco.languages.CompletionItemKind.Function,
+              LUAU_DEPRECATED_GLOBALS.has(name) ? "Deprecated Luau/Roblox global" : "Luau/Roblox global function",
+              LUAU_DEPRECATED_GLOBALS.has(name) ? "0900" : "0300"
+            )),
+            ...LUAU_GLOBAL_OBJECTS.map(name => makeName(name, monaco.languages.CompletionItemKind.Variable, "Roblox/Luau global", "0300")),
+            ...LUAU_LIBRARIES.map(name => makeName(name, monaco.languages.CompletionItemKind.Module, "Luau library", "0300")),
+            ...LUAU_BUILTIN_TYPES.map(name => makeName(name, monaco.languages.CompletionItemKind.Class, "Roblox datatype or type", "0200")),
+            ...LUAU_GLOBAL_CONSTANTS.map(name => makeName(name, monaco.languages.CompletionItemKind.Constant, "Luau global constant", "0300")),
+            ...(isLaua ? LAUA_GLOBAL_FUNCTIONS.map(name => makeName(name, monaco.languages.CompletionItemKind.Function, "Laua built-in", "0300")) : [])
           ];
+
+          // An up-to-date Roblox Studio API dump supplies hundreds of
+          // additional engine types. They're not runtime globals, so only
+          // present them as types, never as fake standalone constructors.
+          if (typeContext && ROBLOX_API.ready) {
+            for (const className of ROBLOX_API.classes.keys()) {
+              if (typedPrefix && !className.toLowerCase().startsWith(typedPrefix)) continue;
+              suggestions.push(makeName(className, monaco.languages.CompletionItemKind.Class, "Roblox Instance type", "0200"));
+            }
+          }
 
           const snippet = (label, insertText, detail, documentation, sortText = "5000_" + label) => ({
             label,
@@ -7439,6 +7474,21 @@ end`;
             snippet("namespace local function", "local function ${1:Name}(${2})\n\t$0\nend", "Laua namespace member", "Create a private helper inside a namespace."),
             snippet("enum", "enum ${1:Name}\n\t${2:First} = 0\n\t${3:Second} = 1\n\t${4:Third} = 2\nend", "Laua enum", "Create a Laua enum."),
             snippet("enum auto values", "enum ${1:Name}\n\t${2:First}\n\t${3:Second}\n\t${4:Third}\nend", "Laua enum", "Create a Laua enum with automatic numeric values.")
+          );
+
+          // Opt-in Laua v3.41 constructs and common class features.
+          // Templates supplement literal keyword completions; they do not
+          // replace keywords or make these features appear in plain Luau.
+          suggestions.push(
+            snippet("schema definition", "schema ${1:PlayerData}\n\t${2:Name}: ${3:string}\nend", "Laua schema", "Define a runtime validation schema."),
+            snippet("network contract", "network ${1:Inventory}\n\tclient_to_server function ${2:Buy}(${3:itemId}: ${4:string})\n\tserver_to_client signal ${5:Updated}(${6:items}: {${7:string}})\nend", "Laua network", "Define a client/server RemoteEvent contract."),
+            snippet("match exhaustive", "match exhaustive ${1:value}\n\tcase ${2:Value}\n\t\t$0\nend", "Laua pattern matching", "Match exhaustively over enum or boolean values."),
+            snippet("cancellation scope", "using ${1:scope} = cancelScope()\n${1:scope}:OnCancel(function()\n\t$0\nend)", "Laua cancellation", "Track tasks and dispose a cancellation scope at function exit."),
+            snippet("signal declaration", "signal ${1:Changed}(${2:value}: ${3:number})", "Laua class member", "Declare a per-instance signal."),
+            snippet("lazy field", "lazy ${1:Items} = ${2:{}}", "Laua class member", "Initialize a field when first read."),
+            snippet("watch field", "watch ${1:Health}(${2:oldValue}, ${3:newValue})\n\t$0\nend", "Laua class member", "Run code after a watched field changes."),
+            snippet("getter", "get ${1:Value}()\n\treturn $0\nend", "Laua class member", "Declare a computed property getter."),
+            snippet("setter", "set ${1:Value}(${2:value})\n\t$0\nend", "Laua class member", "Declare a computed property setter.")
           );
 
           if (model.getLanguageId() === "lua") {
@@ -7623,7 +7673,10 @@ end`;
               }
             }
 
-            return { suggestions: memberSuggestions };
+            // `name: Type` in a field or parameter declaration can resemble
+            // a colon method access. If there is no known receiver, fall
+            // through to the type/keyword catalog instead of returning [].
+            if (members || operator === ".") return { suggestions: memberSuggestions };
           }
 
           if (/\bnamespace\s+[A-Za-z_][A-Za-z0-9_]*[\s\S]*$/.test(textBefore)) {
@@ -7642,38 +7695,24 @@ end`;
             );
           }
 
-          const literalSuggestions = suggestions.filter(item => {
-            if (item.kind === monaco.languages.CompletionItemKind.Snippet) return false;
-
-            const label = typeof item.label === "string"
-              ? item.label
-              : item.label?.label;
-
-            if (!label) return false;
-
-            // Only show literal identifiers/keywords in the popup.
-            // No descriptive entries such as "generic function",
-            // "class extends", or "GetService: Players".
-            return (
-              /^[A-Za-z_][A-Za-z0-9_]*$/.test(label) ||
-              /^@[A-Za-z_][A-Za-z0-9_]*$/.test(label) ||
-              /^--![A-Za-z_][A-Za-z0-9_]*$/.test(label)
-            );
-          });
-
+          // Keep *all* real Luau/Laua words. Older builds discarded every
+          // snippet and accidentally omitted entire classes of built-ins.
+          // Context-aware member completion above remains separate, so
+          // `object.` only offers valid members of that object.
           const seenLabels = new Set();
-
-          return {
-            suggestions: literalSuggestions.filter(item => {
-              const label = typeof item.label === "string"
-                ? item.label
-                : item.label?.label;
-
-              if (seenLabels.has(label)) return false;
-              seenLabels.add(label);
-              return true;
-            })
-          };
+          const completions = [];
+          for (const item of suggestions) {
+            const label = typeof item.label === "string" ? item.label : item.label?.label;
+            if (!label) continue;
+            // Monaco normally filters, but also filter here to prevent a
+            // massive list of unrelated templates while the user is typing.
+            const filterName = item.filterText || label;
+            if (typedPrefix && !filterName.toLowerCase().startsWith(typedPrefix)) continue;
+            if (seenLabels.has(label)) continue;
+            seenLabels.add(label);
+            completions.push(item);
+          }
+          return { suggestions: completions };
         }
       });
 
