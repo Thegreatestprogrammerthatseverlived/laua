@@ -4030,6 +4030,64 @@ end`;
       }
     };
 
+    // Officially documented Roblox members needed when the live API dump is offline.
+    // Once the dump loads, the full class inheritance and member metadata win.
+    const ROBLOX_CORE_FALLBACK = {
+      UserSettings: {
+        IsUserFeatureEnabled: {kind: "function", params: "name: string", detail: "UserSettings method"},
+        Reset: {kind: "function", detail: "UserSettings method"},
+        GetService: {kind: "function", params: "className: string", detail: "ServiceProvider method"},
+        FindService: {kind: "function", params: "className: string", detail: "ServiceProvider method"},
+        GameSettings: {kind: "field", returnClass: "UserGameSettings", detail: "UserGameSettings"}
+      },
+      GlobalSettings: {
+        GetFFlag: {kind: "function", params: "name: string", detail: "GlobalSettings method"},
+        GetFVariable: {kind: "function", params: "name: string", detail: "GlobalSettings method"}
+      },
+      Workspace: {
+        Raycast: {kind: "function", detail: "WorldRoot method"},
+        Blockcast: {kind: "function", detail: "WorldRoot method"},
+        GetPartsInPart: {kind: "function", detail: "WorldRoot method"},
+        GetPartBoundsInBox: {kind: "function", detail: "WorldRoot method"},
+        GetPartBoundsInRadius: {kind: "function", detail: "WorldRoot method"},
+        CurrentCamera: {kind: "field", returnClass: "Camera", detail: "Camera"},
+        Gravity: {kind: "field", detail: "Workspace property"},
+        Terrain: {kind: "field", returnClass: "Terrain", detail: "Terrain"}
+      },
+      Camera: {
+        WorldToViewportPoint: {kind: "function", detail: "Camera method"},
+        WorldToScreenPoint: {kind: "function", detail: "Camera method"},
+        ViewportPointToRay: {kind: "function", detail: "Camera method"},
+        ScreenPointToRay: {kind: "function", detail: "Camera method"},
+        GetRenderCFrame: {kind: "function", detail: "Camera method"},
+        ZoomToExtents: {kind: "function", detail: "Camera method"},
+        CFrame: {kind: "field", detail: "Camera property"},
+        FieldOfView: {kind: "field", detail: "Camera property"},
+        ViewportSize: {kind: "field", detail: "Camera property"}
+      },
+      UserGameSettings: {
+        SavedQualityLevel: {kind: "field", detail: "UserGameSettings property"},
+        CameraMode: {kind: "field", detail: "UserGameSettings property"},
+        MouseSensitivity: {kind: "field", detail: "UserGameSettings property"},
+        Changed: {kind: "event", detail: "Instance event"}
+      },
+      Instance: {
+        Destroy: {kind: "function", detail: "Instance method"},
+        FindFirstChild: {kind: "function", params: "name: string, recursive: boolean?", returnClass: "Instance"},
+        WaitForChild: {kind: "function", params: "name: string, timeout: number?", returnClass: "Instance"},
+        GetChildren: {kind: "function"}, GetDescendants: {kind: "function"},
+        GetAttribute: {kind: "function"}, SetAttribute: {kind: "function"},
+        Parent: {kind: "field", returnClass: "Instance"},
+        Name: {kind: "field"}, ChildAdded: {kind: "event"}
+      }
+    };
+
+    const ROBLOX_CORE_INSTANCE_PARENTS = {
+      Part: "BasePart", MeshPart: "BasePart", UnionOperation: "BasePart",
+      WedgePart: "BasePart", CornerWedgePart: "BasePart", TrussPart: "BasePart",
+      Seat: "BasePart", VehicleSeat: "BasePart", SpawnLocation: "BasePart"
+    };
+
     const SERVICE_MEMBER_SETS = {
       Players: {
         LocalPlayer: "field", PlayerAdded: "field", PlayerRemoving: "field", GetPlayers: "function",
@@ -4629,6 +4687,21 @@ end`;
       if (!ROBLOX_API.classes.has("Instance")) {
         problems.push("Instance class is missing.");
       }
+      // These representative inherited call chains must resolve like Studio.
+      for (const [className, methods] of [
+        ["UserSettings", ["IsUserFeatureEnabled", "Reset", "GetService", "FindService"]],
+        ["Players", ["GetPlayers", "GetPlayerByUserId"]],
+        ["DataModel", ["GetService", "FindService"]]
+      ]) {
+        if (!ROBLOX_API.classes.has(className)) {
+          problems.push(`${className} class is missing.`);
+          continue;
+        }
+        const available = getRobloxApiMembers(className);
+        for (const method of methods) {
+          if (available[method]?.kind !== "function") problems.push(`${className}.${method} not available in loaded API.`);
+        }
+      }
 
       const instanceConstructors = getRobloxDatatypeStaticMembers("Instance");
       if (!instanceConstructors?.new || !instanceConstructors?.fromExisting) {
@@ -4690,6 +4763,9 @@ end`;
 
     function ensureRobloxApiLoaded(force = false) {
       if (ROBLOX_API.ready && !force) return Promise.resolve(true);
+      // Avoid re-fetching megabytes after a failed load on every keystroke.
+      // The Refresh API button explicitly retries with force=true.
+      if (ROBLOX_API.failed && !force) return Promise.resolve(false);
 
       if (!robloxApiLoadPromise) {
         robloxApiLoadPromise = loadRobloxApiDump(force).finally(() => {
@@ -4738,8 +4814,24 @@ end`;
     function membersForType(typeName) {
       if (!typeName) return null;
       if (ROBLOX_API.ready && ROBLOX_API.classes.has(typeName)) return getRobloxApiMembers(typeName);
-      return getDatatypeValueMembers(typeName) || (SERVICE_MEMBER_SETS[typeName]
-        ? membersToCompletionMap(SERVICE_MEMBER_SETS[typeName], typeName) : null);
+      if (ROBLOX_CORE_FALLBACK[typeName]) return {
+        ...ROBLOX_CORE_FALLBACK.Instance, ...ROBLOX_CORE_FALLBACK[typeName]
+      };
+      if (ROBLOX_CORE_INSTANCE_PARENTS[typeName]) {
+        const parentType = ROBLOX_CORE_INSTANCE_PARENTS[typeName];
+        return {...ROBLOX_CORE_FALLBACK.Instance, ...membersToCompletionMap(BUILTIN_MEMBER_SETS[parentType], parentType)};
+      }
+      if (["BasePart", "Model", "Player", "Humanoid", "RemoteEvent", "RemoteFunction"].includes(typeName)) {
+        return {...ROBLOX_CORE_FALLBACK.Instance, ...membersToCompletionMap(BUILTIN_MEMBER_SETS[typeName], typeName)};
+      }
+      if (SERVICE_MEMBER_SETS[typeName]) {
+        const serviceMembers = membersToCompletionMap(SERVICE_MEMBER_SETS[typeName], typeName);
+        if (typeName === "Players") serviceMembers.LocalPlayer = {
+          kind: "field", returnClass: "Player", detail: "Players.LocalPlayer"
+        };
+        return {...ROBLOX_CORE_FALLBACK.Instance, ...serviceMembers};
+      }
+      return getDatatypeValueMembers(typeName);
     }
 
     // `:` is a method call, never a global-name search or property lookup.
@@ -4755,19 +4847,67 @@ end`;
       return true;
     }
 
+    // Identify a member expression before Monaco considers ordinary globals
+    // or type suggestions. Includes call receivers such as UserSettings(): and
+    // game:GetService("Players"):; unresolved expressions must return nothing.
+    function isTypeAnnotationCompletion(lineBefore, symbols, cursorOffset, isLaua) {
+      if (/^\s*(?:local|const|type|export\s+type)\s+[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9]*$/.test(lineBefore)) return true;
+      if (/\b(?:function|constructor)\s*(?:[A-Za-z_]\w*)?\s*\([^()]*\b[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9]*$/.test(lineBefore)) return true;
+      return Boolean(isLaua && findClassAtOffset(symbols, cursorOffset) &&
+        /^\s*[A-Za-z_]\w*\s*:\s+[A-Za-z_0-9]*$/.test(lineBefore));
+    }
+
+    function getCompletionMemberContext(lineBefore) {
+      const suffix = lineBefore.match(/([.:])\s*([A-Za-z_]\w*)?$/);
+      if (!suffix) return null;
+      const before = lineBefore.slice(0, suffix.index).trimEnd();
+      if (!before || before.endsWith(".") || before.endsWith(":")) return null;
+      const receiver = before.match(/([A-Za-z_]\w*(?:(?:\([^()\n]*\)|\[[^\]\n]*\])|\s*[.:]\s*[A-Za-z_]\w*)*)$/);
+      return {owner: receiver?.[1]?.replace(/\s*([.:])\s*/g, "$1") || null, operator: suffix[1], partial: suffix[2] || ""};
+    }
+
+    function getRobloxResolvedMembers(className) {
+      if (!className) return null;
+      if (ROBLOX_API.ready && ROBLOX_API.classes.has(className)) return getRobloxApiMembers(className);
+      return membersForType(className);
+    }
+
     function getChainedMembers(symbols, expression, cursorOffset) {
-      // Resolve ordinary property chains such as part.CFrame.Position or
-      // game.Workspace.CurrentCamera without pretending to be a full Luau analyzer.
-      const names = expression.split(/\s*[.:]\s*/);
-      if (names.length < 2) return null;
-      let members = getSymbolMembers(symbols, names[0], ".", cursorOffset);
-      for (const name of names.slice(1)) {
-        if (!members) return null;
-        const descriptor = members[name];
-        if (!descriptor) return null;
-        let resultType = descriptor.returnClass || null;
-        if (!resultType && name === "Parent") resultType = "Instance";
-        members = membersForType(resultType);
+      // Resolve receivers left to right. Unknown types stop the chain instead
+      // of leaking unrelated globals into the completion dropdown.
+      const value = expression.trim();
+      const start = value.match(/^([A-Za-z_]\w*)(\s*\(\s*\))?/);
+      if (!start) return null;
+      const rootName = start[1];
+      const rootCall = Boolean(start[2]);
+      let currentClass = rootCall && rootName === "UserSettings" ? "UserSettings"
+        : rootCall && rootName === "settings" ? "GlobalSettings" : null;
+      let members = currentClass ? getRobloxResolvedMembers(currentClass) : getSymbolMembers(symbols, rootName, ".", cursorOffset);
+      if (rootCall && !currentClass) return null;
+      let remainder = value.slice(start[0].length);
+      if (!remainder.trim()) return members;
+      while (remainder.length > 0) {
+        const step = remainder.match(/^\s*([.:])\s*([A-Za-z_]\w*)(\s*\((?:[^()"']|"[^"\n]*"|'[^'\n]*')*\))?/);
+        if (!step) return null;
+        const property = step[2];
+        const args = step[3] || "";
+        if (!members || !members[property]) return null;
+        const member = members[property];
+        if (step[1] === ":" && member.kind !== "function" && member.kind !== "method") return null;
+        let nextType = member.returnClass || null;
+        if (member.kind === "enum" && ROBLOX_API.enums.has(property)) {
+          if (args) return null;
+          members = getRobloxEnumItems(property);
+          remainder = remainder.slice(step[0].length);
+          continue;
+        }
+        if (args && (property === "GetService" || property === "FindService")) {
+          const name = args.match(/^\s*\(\s*["']([A-Za-z_]\w*)["']/)?.[1];
+          nextType = name && (ROBLOX_API.classes.has(name) || SERVICE_MEMBER_SETS[name] || ROBLOX_CORE_FALLBACK[name]) ? name : null;
+        }
+        if (args && member.kind !== "function" && member.kind !== "method") return null;
+        members = getRobloxResolvedMembers(nextType);
+        remainder = remainder.slice(step[0].length);
       }
       return members;
     }
@@ -4803,6 +4943,8 @@ end`;
 
       // Luau standard libraries.
       if (LIBRARY_MEMBERS[owner]) return makeLibraryMembers(owner);
+      if (owner === "plugin") return getRobloxResolvedMembers("Plugin");
+      if (owner === "script") return getRobloxResolvedMembers("Instance");
 
       // Roblox enums from the current API dump.
       if (owner === "Enum" && ROBLOX_API.ready) {
@@ -4812,6 +4954,11 @@ end`;
       if (ROBLOX_API.ready && ROBLOX_API.enums.has(owner)) {
         return getRobloxEnumItems(owner);
       }
+
+      // These globals are functions returning singleton objects, not objects
+      // themselves. `UserSettings():` works, `UserSettings:` does not.
+      if ((owner === "UserSettings" || owner === "settings") &&
+          !symbols.locals[owner] && !symbols.variables[owner]) return null;
 
       // Roblox global objects.
       if (owner === "game") {
@@ -4828,20 +4975,11 @@ end`;
         };
       }
 
-      if (owner === "workspace") {
-        if (ROBLOX_API.ready) return getRobloxApiMembers("Workspace");
+      if (owner === "workspace") return getRobloxResolvedMembers("Workspace");
 
-        return membersToCompletionMap(BUILTIN_MEMBER_SETS.Workspace || {}, "Workspace");
-      }
-
-      // Static Roblox datatype/class members.
-      if (ROBLOX_API.ready && ROBLOX_API.classes.has(owner)) {
-        return getRobloxApiMembers(owner);
-      }
-
-      if (BUILTIN_MEMBER_SETS[owner]) {
-        return membersToCompletionMap(BUILTIN_MEMBER_SETS[owner], owner);
-      }
+      // Class names in API dumps are types, not runtime object globals.
+      // Only a variable (or a resolved expression) may expose their methods.
+      // Datatype constructors such as Vector3.new are handled above.
 
       const localInfo = symbols.locals[owner];
 
@@ -4856,26 +4994,28 @@ end`;
           return getRobloxApiMembers(typeName);
         }
 
-        if (typeName && BUILTIN_MEMBER_SETS[typeName]) return getDatatypeValueMembers(typeName);
+        if (typeName && ROBLOX_CORE_FALLBACK[typeName]) return membersForType(typeName);
+        if (typeName && SERVICE_MEMBER_SETS[typeName]) return membersForType(typeName);
+        if (typeName && ROBLOX_CORE_INSTANCE_PARENTS[typeName]) return membersForType(typeName);
+        if (typeName && BUILTIN_MEMBER_SETS[typeName]) return membersForType(typeName);
 
         if (localInfo.service) {
           if (ROBLOX_API.ready && ROBLOX_API.classes.has(localInfo.service)) {
             return getRobloxApiMembers(localInfo.service);
           }
 
-          if (SERVICE_MEMBER_SETS[localInfo.service]) {
-            return membersToCompletionMap(SERVICE_MEMBER_SETS[localInfo.service], localInfo.service);
-          }
+          if (SERVICE_MEMBER_SETS[localInfo.service]) return membersForType(localInfo.service);
         }
 
         if (localInfo.robloxClass) {
+          if (!ROBLOX_API.ready && ROBLOX_CORE_FALLBACK[localInfo.robloxClass]) return membersForType(localInfo.robloxClass);
+          if (!ROBLOX_API.ready && SERVICE_MEMBER_SETS[localInfo.robloxClass]) return membersForType(localInfo.robloxClass);
           if (ROBLOX_API.ready && ROBLOX_API.classes.has(localInfo.robloxClass)) {
             return getRobloxApiMembers(localInfo.robloxClass);
           }
 
-          if (BUILTIN_MEMBER_SETS[localInfo.robloxClass]) {
-            return membersToCompletionMap(BUILTIN_MEMBER_SETS[localInfo.robloxClass], localInfo.robloxClass);
-          }
+          if (ROBLOX_CORE_INSTANCE_PARENTS[localInfo.robloxClass]) return membersForType(localInfo.robloxClass);
+          if (BUILTIN_MEMBER_SETS[localInfo.robloxClass]) return membersForType(localInfo.robloxClass);
         }
 
         if (localInfo.alias) {
@@ -4908,7 +5048,10 @@ end`;
           return getRobloxApiMembers(typeName);
         }
 
-        if (BUILTIN_MEMBER_SETS[typeName]) return getDatatypeValueMembers(typeName);
+        if (ROBLOX_CORE_FALLBACK[typeName]) return membersForType(typeName);
+        if (SERVICE_MEMBER_SETS[typeName]) return membersForType(typeName);
+        if (ROBLOX_CORE_INSTANCE_PARENTS[typeName]) return membersForType(typeName);
+        if (BUILTIN_MEMBER_SETS[typeName]) return membersForType(typeName);
       }
 
       const enclosingClass = findClassAtOffset(symbols, cursorOffset);
@@ -4936,6 +5079,20 @@ end`;
         symbols.locals[match[1]].service = match[2];
         symbols.locals[match[1]].robloxClass = match[2];
         symbols.locals[match[1]].detail = `Roblox service: ${match[2]}`;
+      }
+
+      const globalObjectPattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*(UserSettings|settings)\s*\(\s*\)/g;
+      while ((match = globalObjectPattern.exec(source)) !== null) {
+        if (!symbols.locals[match[1]]) symbols.locals[match[1]] = {name: match[1], type: null, detail: "Local variable"};
+        const className = match[2] === "UserSettings" ? "UserSettings" : "GlobalSettings";
+        symbols.locals[match[1]].robloxClass = className;
+        symbols.locals[match[1]].detail = `Roblox ${className}`;
+      }
+      const userGameSettingsPattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*UserSettings\s*\(\s*\)\s*(?::\s*GetService\s*\(\s*["']UserGameSettings["']\s*\)|\.GameSettings)/g;
+      while ((match = userGameSettingsPattern.exec(source)) !== null) {
+        if (!symbols.locals[match[1]]) symbols.locals[match[1]] = {name: match[1], type: null, detail: "Local variable"};
+        symbols.locals[match[1]].robloxClass = "UserGameSettings";
+        symbols.locals[match[1]].detail = "Roblox UserGameSettings";
       }
 
       const connectionPattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*[^\n]*?:(?:Connect|ConnectParallel|Once)\s*\(/g;
@@ -4990,6 +5147,12 @@ end`;
 
         symbols.locals[match[1]].robloxClass = "Workspace";
         symbols.locals[match[1]].detail = "Roblox Workspace";
+      }
+
+      const serviceProviderPropertyPattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*UserSettings\s*\(\s*\)\.GameSettings/g;
+      while ((match = serviceProviderPropertyPattern.exec(source)) !== null) {
+        if (!symbols.locals[match[1]]) symbols.locals[match[1]] = {name: match[1], type: null, detail: "Local variable"};
+        symbols.locals[match[1]].robloxClass = "UserGameSettings";
       }
 
       const gameServicePropertyPattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*game\.([A-Za-z_][A-Za-z0-9_]*)/g;
@@ -7476,11 +7639,11 @@ end`;
             return quotedCall;
           }
 
-          const memberMatch = lineBefore.match(/([A-Za-z_]\w*(?:\s*[.:]\s*[A-Za-z_]\w*)*)\s*([.:])\s*([A-Za-z_]\w*)?$/);
+          const memberMatch = getCompletionMemberContext(lineBefore);
 
           if (memberMatch) {
-            const owner = memberMatch[1];
-            const operator = memberMatch[2];
+            const owner = memberMatch.owner;
+            const operator = memberMatch.operator;
             const cursorOffset = model.getOffsetAt(position);
 
             const localInfo = sourceSymbols.locals[owner];
@@ -7495,6 +7658,9 @@ end`;
               owner === "game" ||
               owner === "workspace" ||
               owner === "Enum" ||
+              owner === "UserSettings" || owner === "UserSettings()" ||
+              owner === "settings" || owner === "settings()" ||
+              owner?.includes("GetService(") || owner?.includes("FindService(") ||
               ROBLOX_API.enums.has(owner) ||
               BUILTIN_MEMBER_SETS[owner] !== undefined ||
               SERVICE_MEMBER_SETS[owner] !== undefined ||
@@ -7510,13 +7676,13 @@ end`;
 
             // A buffer is a primitive, not an object with methods: complete
             // `buff.` to e.g. `buffer.readu8(buff, 0)` instead of invalid code.
-            if (isBufferVariable(sourceSymbols, owner)) {
+            if (owner && isBufferVariable(sourceSymbols, owner)) {
               return { suggestions: operator === "."
-                ? makeBufferCallSuggestions(monaco, model, position, owner, memberMatch[3] || "", lineBefore)
+                ? makeBufferCallSuggestions(monaco, model, position, owner, memberMatch.partial, lineBefore)
                 : [] };
             }
 
-            const members = owner.includes(".") || owner.includes(":")
+            const members = !owner ? null : (owner.includes(".") || owner.includes(":") || owner.includes("("))
               ? getChainedMembers(sourceSymbols, owner, cursorOffset)
               : getSymbolMembers(sourceSymbols, owner, operator, cursorOffset);
             const memberSuggestions = [];
@@ -7550,14 +7716,7 @@ end`;
             // which previously made game:print / game:__index appear.
             // Only an actual type annotation may use the type-name catalog.
             const annotationContext = operator === ":" && typeContext &&
-              (/^\s*(?:local|const|type|export\s+type)\s+[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9]*$/.test(lineBefore) ||
-               (isLaua && findClassAtOffset(sourceSymbols, cursorOffset) &&
-                // Prefer the explicit field-annotation form `Field: Type`.
-                // `object:Method` without whitespace is a method call.
-                /^\s*[A-Za-z_]\w*\s*:\s+[A-Za-z_0-9]*$/.test(lineBefore))) &&
-              owner !== "game" && owner !== "workspace" &&
-              !sourceSymbols.locals[owner] && !sourceSymbols.parameters[owner] &&
-              !sourceSymbols.variables[owner] && !sourceSymbols.classes[owner];
+              isTypeAnnotationCompletion(lineBefore, sourceSymbols, cursorOffset, isLaua);
             if (!annotationContext) return { suggestions: memberSuggestions };
           }
 
@@ -7677,16 +7836,17 @@ end`;
           }
 
           const symbols = getProjectSymbols(model);
-          const memberMatch = before.match(/([A-Za-z_]\w*(?:\s*[.:]\s*[A-Za-z_]\w*)*)\s*([.:])\s*([A-Za-z_]\w*)$/);
-          if (memberMatch) {
-            const owner = memberMatch[1];
-            const operator = memberMatch[2];
+          const memberMatch = getCompletionMemberContext(before);
+          if (memberMatch && !isTypeAnnotationCompletion(before, symbols, cursorOffset, isLaua)) {
+            const owner = memberMatch.owner;
+            const operator = memberMatch.operator;
             if (!ROBLOX_API.ready && (owner === "game" || owner === "workspace" || owner === "Enum" ||
+               owner === "UserSettings()" || owner === "settings()" || owner?.includes("GetService(") ||
                symbols.locals[owner]?.service || symbols.locals[owner]?.robloxClass)) {
               await ensureRobloxApiLoaded();
             }
-            if (isBufferVariable(symbols, owner)) return { items: [] };
-            const members = owner.includes(".") || owner.includes(":")
+            if (owner && isBufferVariable(symbols, owner)) return { items: [] };
+            const members = !owner ? null : (owner.includes(".") || owner.includes(":") || owner.includes("("))
               ? getChainedMembers(symbols, owner, cursorOffset)
               : getSymbolMembers(symbols, owner, operator, cursorOffset);
             if (!members) return { items: [] };
@@ -8631,7 +8791,7 @@ end`;
 
       function showRobloxApiStatus(loaded) {
         if (!loaded) {
-          apiStatus.textContent = "Roblox API: unavailable — bundled datatype constructors still work; full autocomplete is not verified";
+          apiStatus.textContent = "Roblox API: unavailable — offline core autocomplete active; full Studio method coverage requires Refresh API";
           apiStatus.className = "error";
           return;
         }
