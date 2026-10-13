@@ -93,7 +93,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.41 · multi-file · validated export · live preflight</span>
+      <span>pronounced “Lawah” · v3.43 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -457,6 +457,19 @@ local part = message[1:7]`;
       return source.slice(0, start) + replacement + source.slice(end);
     }
 
+    // All source-location offsets are UTF-16 indices, matching Monaco models.
+    // Preserve diagnostics already located by the semantic analyzer.
+    function locatedLauaError(error, source, offset, tokenLength = 1) {
+      if (Number.isInteger(error.offset)) return error;
+      const at = Math.max(0, Math.min(source.length, offset));
+      const lineStart = source.lastIndexOf("\n", at - 1) + 1;
+      error.offset = at;
+      error.endOffset = Math.min(source.length, at + Math.max(1, tokenLength));
+      error.line = source.slice(0, at).split("\n").length;
+      error.column = at - lineStart + 1;
+      return error;
+    }
+
     function normalizeBlockIndent(source, indent = "    ") {
       const lines = source.replace(/\r\n/g, "\n").split("\n");
 
@@ -696,11 +709,11 @@ local part = message[1:7]`;
         if (idx === -1) break;
 
         const headerEnd = source.indexOf("\n", idx);
-        if (headerEnd === -1) throw new Error("Enum body expected");
+        if (headerEnd === -1) throw locatedLauaError(new Error("Enum body expected"), source, idx, 4);
 
         const header = source.slice(idx, headerEnd).trim();
         const m = header.match(/^enum\s+([A-Za-z_][A-Za-z0-9_]*)$/);
-        if (!m) throw new Error("Invalid enum declaration");
+        if (!m) throw locatedLauaError(new Error("Invalid enum declaration"), source, idx, 4);
 
         const name = m[1];
         const endPos = findMatchingEndByLines(source, idx);
@@ -708,19 +721,21 @@ local part = message[1:7]`;
         const members = [];
         let auto = 0;
 
+        let memberOffset = headerEnd + 1;
         for (const raw of body.split("\n")) {
           let line = raw.trim().replace(/,$/, "");
-          if (!line || line.startsWith("--")) continue;
+          if (!line || line.startsWith("--")) { memberOffset += raw.length + 1; continue; }
 
           let mm = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/);
           if (mm) {
             members.push(`    ${mm[1]} = ${mm[2]},`);
           } else {
             mm = line.match(/^([A-Za-z_][A-Za-z0-9_]*)$/);
-            if (!mm) throw new Error(`Invalid enum member: ${line}`);
+            if (!mm) throw locatedLauaError(new Error(`Invalid enum member: ${line}`), source, memberOffset + raw.indexOf(line), line.length);
             members.push(`    ${mm[1]} = ${auto},`);
             auto++;
           }
+          memberOffset += raw.length + 1;
         }
 
         const result = `local ${name} = table.freeze({\n${members.join("\n")}\n})`;
@@ -730,6 +745,49 @@ local part = message[1:7]`;
       return source;
     }
 
+    // Validate enum member locations against the original Laua source before
+    // schema, network, namespace or earlier enum lowering changes offsets.
+    function validateEnumLocations(source) {
+      const masked = maskNonCode(source);
+      const blockIndex = {lines: splitLinesWithOffsets(source), masked};
+      let cursor = 0;
+      while (true) {
+        const idx = findKeyword(masked, "enum", cursor);
+        if (idx < 0) break;
+        const headerEnd = source.indexOf("\n", idx);
+        if (headerEnd < 0) throw locatedLauaError(new Error("Enum body expected"), source, idx, 4);
+        const header = source.slice(idx, headerEnd).trim();
+        if (!/^enum\s+[A-Za-z_][A-Za-z0-9_]*$/.test(header)) {
+          throw locatedLauaError(new Error("Invalid enum declaration"), source, idx, 4);
+        }
+        let endPos;
+        try { endPos = findMatchingEndByLines(source, idx, blockIndex); }
+        catch (error) { throw locatedLauaError(error, source, idx, 4); }
+        const body = source.slice(headerEnd + 1, endPos.start);
+        let memberOffset = headerEnd + 1;
+        for (const raw of body.split("\n")) {
+          const line = raw.trim().replace(/,$/, "");
+          if (line && !line.startsWith("--")
+              && !/^([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*.+)?$/.test(line)) {
+            throw locatedLauaError(new Error(`Invalid enum member: ${line}`), source, memberOffset + raw.indexOf(line), line.length);
+          }
+          memberOffset += raw.length + 1;
+        }
+        cursor = endPos.end;
+      }
+    }
+
+    function validateNamespacePlacement(source) {
+      const masked = maskNonCode(source);
+      for (const match of masked.matchAll(/\bnamespace\s+([A-Za-z_]\w*)/g)) {
+        const rowStart = masked.lastIndexOf('\n', match.index - 1) + 1;
+        const prefix = masked.slice(rowStart, match.index).trim();
+        if (prefix && prefix !== 'return') {
+          throw locatedLauaError(new Error('namespace can only be standalone or directly returned'), source, match.index, 9);
+        }
+      }
+    }
+
     function transpileNamespace(source) {
       while (true) {
         const masked = maskNonCode(source);
@@ -737,19 +795,19 @@ local part = message[1:7]`;
         if (idx === -1) break;
 
         const headerEnd = source.indexOf("\n", idx);
-        if (headerEnd === -1) throw new Error("Namespace body expected");
+        if (headerEnd === -1) throw locatedLauaError(new Error("Namespace body expected"), source, idx, 9);
 
         const lineStart = source.lastIndexOf("\n", idx - 1) + 1;
         const before = source.slice(lineStart, idx).trim();
         const returned = before === "return";
 
         if (before && !returned) {
-          throw new Error("namespace can only be standalone or directly returned");
+          throw locatedLauaError(new Error("namespace can only be standalone or directly returned"), source, idx, 9);
         }
 
         const header = source.slice(idx, headerEnd).trim();
         const m = header.match(/^namespace\s+([A-Za-z_][A-Za-z0-9_]*)$/);
-        if (!m) throw new Error("Invalid namespace declaration");
+        if (!m) throw locatedLauaError(new Error("Invalid namespace declaration"), source, idx, 9);
 
         const name = m[1];
         const endPos = findMatchingEndByLines(source, idx);
@@ -849,6 +907,9 @@ local part = message[1:7]`;
     }
 
     function transpileClass(source) {
+      const classInputSource = source;
+      let generatedOffsetShift = 0;
+      const classLocation = (error, currentOffset, length=1) => locatedLauaError(error, classInputSource, currentOffset - generatedOffsetShift, length);
       const allocationRequirements = new Map();
       const hookFreeClasses = new Map();
       let searchFrom = 0;
@@ -862,7 +923,7 @@ local part = message[1:7]`;
         if (prefix && !/^(?:final|abstract)$/.test(prefix)) {
           const endOfLine = source.indexOf('\n', classIdx);
           const candidate = source.slice(classIdx, endOfLine < 0 ? source.length : endOfLine).trim();
-          if (/^class\s+[A-Za-z_]\w*(?:\s+extends\s+[A-Za-z_][\w.]*)?$/.test(candidate)) throw new Error(`Invalid class modifier: ${prefix}`);
+          if (/^class\s+[A-Za-z_]\w*(?:\s+extends\s+[A-Za-z_][\w.]*)?$/.test(candidate)) throw classLocation(new Error(`Invalid class modifier: ${prefix}`), lineStart + source.slice(lineStart, classIdx).indexOf(prefix), prefix.length);
           searchFrom = classIdx + 5; continue;
         }
         searchFrom = 0;
@@ -870,10 +931,10 @@ local part = message[1:7]`;
         const isAbstract = prefix === "abstract";
         const isFinal = prefix === "final";
         const headerEnd = source.indexOf("\n", classIdx);
-        if (headerEnd < 0) throw new Error("Class body expected");
+        if (headerEnd < 0) throw classLocation(new Error("Class body expected"), classIdx, 5);
         const header = source.slice(classIdx, headerEnd).trim();
         const headerMatch = header.match(/^class\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+extends\s+([A-Za-z_][A-Za-z0-9_.]*))?$/);
-        if (!headerMatch) throw new Error("Invalid class declaration");
+        if (!headerMatch) throw classLocation(new Error("Invalid class declaration"), classIdx, 5);
         const name = headerMatch[1];
         const base = headerMatch[2] || null;
         const endPos = findMatchingEndByLines(source, classIdx, {lines:splitLinesWithOffsets(source),masked});
@@ -887,7 +948,10 @@ local part = message[1:7]`;
         const declaredProperties = new Set();
         const watcherNames = new Set();
         let li = 0;
+        let activeMemberLine = 0;
+        try {
         while (li < lines.length) {
+          activeMemberLine = li;
           const raw = lines[li].text;
           const original = raw.trim();
           if (!original || original.startsWith("--")) { li++; continue; }
@@ -939,7 +1003,7 @@ local part = message[1:7]`;
             const start = lines[li].start + raw.indexOf('watch');
             const finish = findMatchingEndByLines(body, start, blockIndex);
             const newline = body.indexOf('\n', start);
-            watchers.push({name: property, params, body: body.slice(newline + 1, finish.start)});
+            watchers.push({name: property, params, body: body.slice(newline + 1, finish.start), start: headerEnd + 1 + start, bodyStart: headerEnd + 2 + newline});
             li = lineIndexAfter(lines, finish.end);
             if (li < 0) break;
             continue;
@@ -949,7 +1013,7 @@ local part = message[1:7]`;
             if (modifiers.size || attrs.length) throw new Error('lazy cannot have modifiers or attributes');
             if (declaredNames.has(lazyMatch[1])) throw new Error(`Duplicate class member '${lazyMatch[1]}'`);
             declaredNames.add(lazyMatch[1]);
-            lazyFields.push({name: lazyMatch[1], value: lazyMatch[2]});
+            lazyFields.push({name: lazyMatch[1], value: lazyMatch[2], start: headerEnd + 1 + lines[li].start + raw.indexOf(lazyMatch[1])});
             li++;
             continue;
           }
@@ -982,7 +1046,7 @@ local part = message[1:7]`;
             const params = constructorMatch ? constructorMatch[1] : methodMatch[3];
             const member = { name: methodMatch?.[2], kind, params, body: memberBody, static: isStatic,
               final: modifiers.has("final"), override: modifiers.has("override"), abstract: modifiers.has("abstract"),
-              attributes: attrs.join("\n") };
+              attributes: attrs.join("\n"), start:headerEnd + 1 + memberStart, bodyStart:headerEnd + 2 + lineEnd };
             attrs = [];
             if (kind === "constructor") {
               if (ctor) throw new Error(`Multiple constructors in ${name}`);
@@ -1016,20 +1080,37 @@ local part = message[1:7]`;
             if (modifiers.has("override") || modifiers.has("abstract") || modifiers.has("final")) throw new Error(`Invalid modifier for field '${fieldMatch[1]}'`);
             if (declaredNames.has(fieldMatch[1])) throw new Error(`Duplicate class member '${fieldMatch[1]}'`);
             declaredNames.add(fieldMatch[1]);
-            (isStatic ? statics : fields).push({ name: fieldMatch[1], value: fieldMatch[2] ?? null });
+            (isStatic ? statics : fields).push({ name: fieldMatch[1], value: fieldMatch[2] ?? null, start:headerEnd + 1 + lines[li].start + raw.indexOf(fieldMatch[1]) });
             if (attrs.length) throw new Error("Attributes only apply to functions");
             li++;
             continue;
           }
           throw new Error(`Invalid member in class ${name}: ${original}`);
         }
-        if (attrs.length) throw new Error(`Orphan attribute in class '${name}'`);
+        } catch (error) {
+          // A member parser failure belongs to its own declaration, never the class header.
+          const row = lines[activeMemberLine];
+          const raw = row?.text || '';
+          const message = String(error.message || error);
+          const quoted = /(?:member|field|property|watcher|signal|operator|Getter|Setter)\s*['"]([^'"]+)['"]/.exec(message)?.[1]
+            || /(?:'([^']+)')/.exec(message)?.[1];
+          const inRow = quoted && raw.indexOf(quoted) >= 0 ? raw.indexOf(quoted) : raw.search(/\S/);
+          const at = headerEnd + 1 + (row?.start || 0) + Math.max(0, inRow);
+          throw classLocation(error, at, quoted && raw.includes(quoted) ? quoted.length : (/^[A-Za-z_]+/.exec(raw.trim())?.[0].length || 1));
+        }
+        if (attrs.length) {
+          const at = headerEnd + 1 + (lines.at(-1)?.start || 0);
+          throw classLocation(new Error(`Orphan attribute in class '${name}'`), at, 1);
+        }
         const propertyNames = new Set([...getters, ...setters].map(item => item.name));
-        for (const field of fields) if (propertyNames.has(field.name)) throw new Error(`Property '${field.name}' conflicts with an instance field`);
-        for (const prop of propertyNames) if (declaredNames.has(prop)) throw new Error(`Property '${prop}' conflicts with an existing member`);
+        for (const field of fields) if (propertyNames.has(field.name)) throw classLocation(new Error(`Property '${field.name}' conflicts with an instance field`), field.start, field.name.length);
+        for (const prop of propertyNames) if (declaredNames.has(prop)) {
+          const member = [...getters, ...setters].find(item=>item.name===prop);
+          throw classLocation(new Error(`Property '${prop}' conflicts with an existing member`), member?.start ?? classIdx, prop.length);
+        }
         for (const item of watchers) {
-          if (![...fields, ...lazyFields].some(field => field.name === item.name)) throw new Error(`watch '${item.name}' requires a field or lazy property`);
-          if (propertyNames.has(item.name)) throw new Error(`watch '${item.name}' conflicts with getter/setter`);
+          if (![...fields, ...lazyFields].some(field => field.name === item.name)) throw classLocation(new Error(`watch '${item.name}' requires a field or lazy property`), item.start, 5);
+          if (propertyNames.has(item.name)) throw classLocation(new Error(`watch '${item.name}' conflicts with getter/setter`), item.start, 5);
         }
 
         let constructorBody = ctor?.body || "";
@@ -1047,13 +1128,13 @@ local part = message[1:7]`;
             }
           }
         }
-        if (/\bsuper\s*\(/.test(maskNonCode(constructorBody))) throw new Error("super(...) must be the first statement of the constructor");
-        if (!base && /\bsuper\s*[:.(]/.test(maskNonCode(constructorBody))) throw new Error(`Class '${name}' has no parent for super`);
+        if (/\bsuper\s*\(/.test(maskNonCode(constructorBody))) throw classLocation(new Error("super(...) must be the first statement of the constructor"), ctor.bodyStart + maskNonCode(ctor.body).search(/\bsuper\s*\(/), 5);
+        if (!base && /\bsuper\s*[:.(]/.test(maskNonCode(constructorBody))) throw classLocation(new Error(`Class '${name}' has no parent for super`), headerEnd + 1 + Math.max(0,maskNonCode(body).search(/\bsuper\s*[:.(]/)), 5);
         if (base) constructorBody = replaceSuperReferences(constructorBody, base);
-        if (ctor && !base && /\bsuper\b/.test(maskNonCode(constructorBody))) throw new Error(`Class '${name}' has no parent for super`);
+        if (ctor && !base && /\bsuper\b/.test(maskNonCode(constructorBody))) throw classLocation(new Error(`Class '${name}' has no parent for super`), headerEnd + 1 + Math.max(0,maskNonCode(body).search(/\bsuper\s*[:.(]/)), 5);
         if (!base) {
           for (const member of [...methods, ...getters, ...setters, ...operators, ...watchers]) {
-            if (/\bsuper\s*[:.(]/.test(maskNonCode(member.body))) throw new Error(`Class '${name}' has no parent for super`);
+            if (/\bsuper\s*[:.(]/.test(maskNonCode(member.body))) throw classLocation(new Error(`Class '${name}' has no parent for super`), headerEnd + 1 + Math.max(0,maskNonCode(body).search(/\bsuper\s*[:.(]/)), 5);
           }
         }
         // An ordinary class only needs a metatable, constructor, fields, and methods.
@@ -1080,9 +1161,10 @@ local part = message[1:7]`;
           }
           for (const member of methods) {
             const memberBody = normalizeBlockIndent(transpileCore(member.body), "    ");
-            if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw new Error("super(...) can only be called in constructors");
+            if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
             output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
+          generatedOffsetShift += output.trimEnd().length - (endPos.end - declStart);
           source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
           continue;
         }
@@ -1113,13 +1195,14 @@ local part = message[1:7]`;
           for (const member of methods) {
             if (base) output += `if ${base}.__finalMethods and ${base}.__finalMethods[${JSON.stringify(member.name)}] then error("Cannot override final method '${member.name}'") end\n`;
             let body = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
-            if (/\bsuper\s*\(/.test(maskNonCode(body))) throw new Error('super(...) can only be called in constructors');
+            if (/\bsuper\s*\(/.test(maskNonCode(body))) throw classLocation(new Error('super(...) can only be called in constructors'), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
             body = normalizeBlockIndent(transpileCore(body));
             output += `${member.attributes ? member.attributes + '\n' : ''}${member.kind === 'async function' ? 'async ' : ''}function ${name}.${member.name}(${member.static ? member.params : 'self: any' + (member.params.trim() ? ', ' + member.params : '')})\n`;
             if (member.abstract) output += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
             else if (body) output += body + '\n';
             output += 'end\n';
           }
+          generatedOffsetShift += output.trimEnd().length - (endPos.end - declStart);
           source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
           continue;
         }
@@ -1216,7 +1299,7 @@ local part = message[1:7]`;
         for (const member of [...getters, ...setters]) {
           const tableName = getters.includes(member) ? "__getters" : "__setters";
           let memberBody = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
-          if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw new Error("super(...) can only be called in constructors");
+          if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
           generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self: any${member.params.trim() ? ", " + member.params : ""})\n`;
           if (memberBody) generated += memberBody + "\n";
@@ -1229,14 +1312,15 @@ local part = message[1:7]`;
         for (const member of methods) {
           if (base) generated += `\nif ${base}.__finalMethods and ${base}.__finalMethods[${JSON.stringify(member.name)}] then error("Cannot override final method '${member.name}'") end\n`;
           let memberBody = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
-          if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw new Error("super(...) can only be called in constructors");
+          if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
           generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n`;
           if (member.abstract) generated += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
           else if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
         }
-        source = source.slice(0, declStart) + generated + source.slice(endPos.end);
+        generatedOffsetShift += generated.length - (endPos.end - declStart);
+          source = source.slice(0, declStart) + generated + source.slice(endPos.end);
       }
       return source;
     }
@@ -2287,7 +2371,7 @@ local part = message[1:7]`;
         }
         if(!allowed) {
           const line=masked.slice(0,m.index).split('\n').length;
-          throw new Error(`Cannot access ${visibility} member '${defining}.${m[2]}' (line ${line}).`);
+          throw locatedLauaError(new Error(`Cannot access ${visibility} member '${defining}.${m[2]}' (line ${line}).`), source, m.index + m[0].lastIndexOf(m[2]), m[2].length);
         }
       }
     }
@@ -3278,9 +3362,12 @@ end`;
     }
 
     function transpile(source, options = {}) {
+      const originalLauaSource = source;
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
       validateExpressionSyntax(source);
+      if (source.includes('enum')) validateEnumLocations(source);
+      if (source.includes('namespace')) validateNamespacePlacement(source);
       const contractPresent = /\b(?:schema|network)\s+[A-Za-z_]/.test(source);
       if(contractPresent) {
         // Validate the new syntax before older semantic checks inspect its body.
@@ -3291,6 +3378,9 @@ end`;
       if (options?.SemanticCheck !== false) {validateClassContracts(semanticSource);validateScopedReferences(semanticSource);validateLauaSemantics(semanticSource);validateTypedSemantics(semanticSource);}
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact'].includes(style))throw new Error('Invalid Laua output style');
+      // Visibility diagnostics must use original positions before opt-in
+      // schema/network transformations expand the source.
+      validateKnownVisibility(source);
 
       // Skip whole-file transforms when their syntax cannot occur. Check the
       // current text at each stage because an earlier pass can introduce syntax.
@@ -3300,7 +3390,6 @@ end`;
       if (/\bnetwork\s+[A-Za-z_]/.test(source)) source = transpileNetworks(source);
       if (source.includes('cancelScope')) source = transpileCancelScopes(source);
       if (source.includes('inline')) source = transpileInlineFunctions(source);
-      validateKnownVisibility(source);
       validatePendingFeatures(source);
       if (source.includes('|>')) source = transpilePipelines(source);
       if (source.includes('memo')) source = transpileMemo(source);
@@ -3310,7 +3399,20 @@ end`;
       source = exported.source;
       if (source.includes('??=')) source = transpileCoalescingAssign(source);
       if (source.includes('using')) source = transpileUsing(source);
-      source = transpileCore(source);
+      try {
+        source = transpileCore(source);
+      } catch (error) {
+        // Namespace/enum and other earlier passes may change source length.
+        // On failure only, reparse the original class source so reported spans
+        // refer to the editor text rather than the partially lowered text.
+        if (/\bclass\b/.test(maskNonCode(originalLauaSource))) {
+          try { transpileClass(originalLauaSource); }
+          catch (originalError) {
+            if (originalError.message === error.message && Number.isInteger(originalError.offset)) throw originalError;
+          }
+        }
+        throw error;
+      }
       if (source.includes('import')) source = transpileImports(source);
       if (source.includes('local') && source.includes('{')) source = transpileDestructuring(source);
       if (source.includes('match')) source = transpileMatches(source);
@@ -6792,7 +6894,13 @@ end`;
       if (!expressionSyntaxErrors) try {
         const output=transpile(source);
         for(const diagnostic of generatedLuauPreflight(output)){
-          pushMarker(0,Math.min(Math.max(1,source.length),5),monaco.MarkerSeverity.Error,'Generated Luau preflight: '+diagnostic.message,'syntax');
+          // A generated-only location is NOT an offset into Laua source.
+          // Report on the source only when the exact offending pair also occurs
+          // in user code; generated-editor validation handles lowered-only faults.
+          const pair = output.slice(diagnostic.start, diagnostic.end);
+          const originalAt = maskNonCode(source).indexOf(pair);
+          if (originalAt < 0) continue;
+          pushMarker(originalAt,originalAt+pair.length,monaco.MarkerSeverity.Error,'Generated Luau preflight: '+diagnostic.message,'syntax');
         }
       } catch (error) {
         const message=error?.message || String(error);
@@ -6812,7 +6920,9 @@ end`;
         if (parent) {
           for (const [methodName, methodInfo] of Object.entries(classInfo.instanceMembers || {})) {
             if (parent.instanceMembers?.[methodName]?.final) {
-              pushMarker(classInfo.start, classInfo.start + 5, monaco.MarkerSeverity.Error,
+              const memberOffset = methodInfo?.declarationOffset;
+              const at = Number.isInteger(memberOffset) ? memberOffset : classInfo.start;
+              pushMarker(at, at + (Number.isInteger(memberOffset) ? methodName.length : 5), monaco.MarkerSeverity.Error,
                 `Cannot override final method '${methodName}' from '${parent.name}'.`, "syntax");
             }
           }
@@ -8465,7 +8575,7 @@ end`;
       function exportStudioSourceProject() {
         try {
           const blob=makeStudioSourceRbxmx();
-          downloadProjectBlob('Laua-v3.41-editable-studio.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.43-editable-studio.rbxmx',blob);
           projectStatus().textContent=`Exported ${projectFiles.size} original source files. Import the model into Studio, select LauaStudioProject, and click Import Selected in the Laua Studio plugin.`;
           projectStatus().className='ok';
         } catch(error) {
@@ -8563,7 +8673,7 @@ end`;
         try {
           const all=compileProjectFiles();
           const {blob}=makeProjectRbxmx(all);
-          downloadProjectBlob('Laua-v3.41-project.rbxmx',blob);
+          downloadProjectBlob('Laua-v3.43-project.rbxmx',blob);
           projectStatus().textContent=`Exported ${all.length} compiled ModuleScripts. Original .laua sources are not stored in this model; keep your project files separately.`;
           projectStatus().className='ok';
         } catch(error) {
