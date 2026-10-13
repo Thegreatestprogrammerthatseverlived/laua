@@ -4066,9 +4066,25 @@ end`;
         ViewportSize: {kind: "field", detail: "Camera property"}
       },
       UserGameSettings: {
-        SavedQualityLevel: {kind: "field", detail: "UserGameSettings property"},
-        CameraMode: {kind: "field", detail: "UserGameSettings property"},
-        MouseSensitivity: {kind: "field", detail: "UserGameSettings property"},
+        // Offline subset verified against Roblox Creator Hub. Omit properties
+        // that require RobloxScriptSecurity or are NotScriptable.
+        SavedQualityLevel: {kind: "field", detail: "UserGameSettings property · Enum.SavedQualitySetting"},
+        MouseSensitivity: {kind: "field", detail: "UserGameSettings property · number"},
+        GamepadCameraSensitivity: {kind: "field", detail: "UserGameSettings property · number"},
+        ComputerCameraMovementMode: {kind: "field", detail: "UserGameSettings property"},
+        ComputerMovementMode: {kind: "field", detail: "UserGameSettings property"},
+        TouchCameraMovementMode: {kind: "field", detail: "UserGameSettings property"},
+        TouchMovementMode: {kind: "field", detail: "UserGameSettings property"},
+        RotationType: {kind: "field", detail: "UserGameSettings property"},
+        GetCameraYInvertValue: {kind: "function", detail: "UserGameSettings method"},
+        GetOnboardingCompleted: {kind: "function", params: "onboardingId: string", detail: "UserGameSettings method"},
+        InFullScreen: {kind: "function", detail: "UserGameSettings method"},
+        InStudioMode: {kind: "function", detail: "UserGameSettings method"},
+        SetCameraYInvertVisible: {kind: "function", detail: "UserGameSettings method"},
+        SetGamepadCameraSensitivityVisible: {kind: "function", detail: "UserGameSettings method"},
+        SetOnboardingCompleted: {kind: "function", params: "onboardingId: string", detail: "UserGameSettings method"},
+        FullscreenChanged: {kind: "event", detail: "UserGameSettings event"},
+        StudioModeChanged: {kind: "event", detail: "UserGameSettings event"},
         Changed: {kind: "event", detail: "Instance event"}
       },
       Instance: {
@@ -4343,7 +4359,7 @@ end`;
     }
 
     function shouldExposeRobloxMember(member) {
-      if (!member?.Name) return false;
+      if (!member?.Name || /^__/.test(member.Name)) return false;
 
       if (isRobloxDeprecated(member)) {
         ROBLOX_API.stats.deprecatedFiltered += 1;
@@ -4462,6 +4478,17 @@ end`;
         };
       }
 
+      // Roblox exposes this singleton child with dot access, even though it
+      // does not appear as a declared UserSettings property in every API dump.
+      // Keep the documented child mapping alongside live inherited members.
+      if (className === "UserSettings") {
+        own.GameSettings = {
+          kind: "field",
+          returnClass: "UserGameSettings",
+          detail: "Documented UserSettings child · UserGameSettings"
+        };
+      }
+
       const result = {...inherited, ...own};
       apiMemberCache.set(className, result);
       return result;
@@ -4563,7 +4590,10 @@ end`;
 
         const tags = robloxTags(classInfo);
 
-        if (tags.includes("Service") || classInfo.Name === "Workspace") {
+        // UserGameSettings is a service owned by the UserSettings singleton,
+        // not by the DataModel returned by game:GetService().
+        if ((tags.includes("Service") || classInfo.Name === "Workspace") &&
+            classInfo.Name !== "UserGameSettings") {
           ROBLOX_API.services.add(classInfo.Name);
         }
 
@@ -4690,6 +4720,7 @@ end`;
       // These representative inherited call chains must resolve like Studio.
       for (const [className, methods] of [
         ["UserSettings", ["IsUserFeatureEnabled", "Reset", "GetService", "FindService"]],
+        ["UserGameSettings", ["InFullScreen", "InStudioMode", "GetOnboardingCompleted"]],
         ["Players", ["GetPlayers", "GetPlayerByUserId"]],
         ["DataModel", ["GetService", "FindService"]]
       ]) {
@@ -4881,7 +4912,9 @@ end`;
       const rootName = start[1];
       const rootCall = Boolean(start[2]);
       let currentClass = rootCall && rootName === "UserSettings" ? "UserSettings"
-        : rootCall && rootName === "settings" ? "GlobalSettings" : null;
+        : rootCall && rootName === "settings" ? "GlobalSettings"
+        : !rootCall ? (symbols.locals[rootName]?.robloxClass || symbols.locals[rootName]?.service ||
+            symbols.parameters[rootName]?.type?.replace(/\?$/, "").trim() || null) : null;
       let members = currentClass ? getRobloxResolvedMembers(currentClass) : getSymbolMembers(symbols, rootName, ".", cursorOffset);
       if (rootCall && !currentClass) return null;
       let remainder = value.slice(start[0].length);
@@ -4902,8 +4935,17 @@ end`;
           continue;
         }
         if (args && (property === "GetService" || property === "FindService")) {
-          const name = args.match(/^\s*\(\s*["']([A-Za-z_]\w*)["']/)?.[1];
-          nextType = name && (ROBLOX_API.classes.has(name) || SERVICE_MEMBER_SETS[name] || ROBLOX_CORE_FALLBACK[name]) ? name : null;
+          const name = args.match(/^\s*\(\s*["']([A-Za-z_]\w*)["']\s*\)$/)?.[1];
+          // game:GetService() accepts game services; UserSettings() exposes
+          // UserGameSettings, not arbitrary classes. Never infer a class from
+          // an invalid string argument.
+          const userSettingsProvider = currentClass === "UserSettings";
+          const gameService = name && (ROBLOX_API.ready
+            ? ROBLOX_API.services.has(name)
+            : ROBLOX_SERVICES.includes(name));
+          nextType = userSettingsProvider
+            ? (name === "UserGameSettings" ? name : null)
+            : (gameService ? name : null);
         }
         if (args && member.kind !== "function" && member.kind !== "method") return null;
         members = getRobloxResolvedMembers(nextType);
@@ -4913,15 +4955,16 @@ end`;
     }
 
     function completeRobloxStringArgument(model, position, lineBefore) {
-      const match = lineBefore.match(/(?:\b(Instance)\.new|\b(game):GetService|\b[A-Za-z_]\w*:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*(["'])([A-Za-z_]\w*)?$/);
+      const match = lineBefore.match(/(?:\b(Instance)\.new|\b(game):GetService|\b(UserSettings\s*\(\s*\)):GetService|\b[A-Za-z_]\w*:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*(["'])([A-Za-z_]\w*)?$/);
       if (!match) return null;
-      const kind = match[1] === "Instance" ? "construct" : match[2] === "game" ? "service" : "class";
+      const kind = match[1] === "Instance" ? "construct" : match[2] === "game" ? "service" : match[3] ? "userSettingsService" : "class";
       let names;
       if (kind === "service") names = ROBLOX_API.ready ? [...ROBLOX_API.services] : ROBLOX_SERVICES;
+      else if (kind === "userSettingsService") names = ["UserGameSettings"];
       else if (ROBLOX_API.ready) names = [...ROBLOX_API.classes].filter(([, info]) => kind !== "construct" ||
         !hasRobloxTag(info, "NotCreatable") && !hasRobloxTag(info, "Service") && !hasRobloxTag(info, "NotScriptable")).map(([name]) => name);
       else names = Object.keys(BUILTIN_MEMBER_SETS).filter(name => !ROBLOX_DATATYPE_STATIC[name]);
-      const partial = match[4] || "";
+      const partial = match[5] || "";
       const range = new monaco.Range(position.lineNumber, position.column - partial.length, position.lineNumber, position.column);
       return { suggestions: names.filter(name => name.toLowerCase().startsWith(partial.toLowerCase())).map(name => ({
         label: name, insertText: name, kind: monaco.languages.CompletionItemKind.Class,
@@ -7406,7 +7449,7 @@ end`;
           const masked = maskNonCode(model.getValue(), true);
           const cursorIsNonCode = cursorOffset > 0 && masked[cursorOffset - 1] === " " &&
             /\S/.test(lineBefore.slice(-1));
-          const robloxStringArgument = /(?:\bInstance\.new|\bgame:GetService|\w+:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*["'][A-Za-z_\w]*$/.test(lineBefore);
+          const robloxStringArgument = /(?:\bInstance\.new|\bgame:GetService|\bUserSettings\s*\(\s*\)\s*:GetService|\w+:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*["'][A-Za-z_\w]*$/.test(lineBefore);
           if (cursorIsNonCode && !robloxStringArgument) return { suggestions: [] };
 
           const attributeMatch = lineBefore.match(/@([A-Za-z_]*)$/);
@@ -7691,6 +7734,7 @@ end`;
               for (const [memberName, memberInfo] of Object.entries(members)) {
                 if (deprecatedFunctions.has(`${owner}.${memberName}`) || deprecatedFunctions.has(`${owner}:${memberName}`)) continue;
                 if (!shouldSuggestMember(sourceSymbols, owner, operator, memberName, memberInfo)) continue;
+                if (memberMatch.partial && !memberName.toLowerCase().startsWith(memberMatch.partial.toLowerCase())) continue;
                 const isFunction = memberInfo.kind === "function" || memberInfo.kind === "method";
                 const params = memberInfo.params?.trim() || "";
 
@@ -7827,7 +7871,7 @@ end`;
           const directiveMatch = before.match(/--!([A-Za-z_][A-Za-z_0-9]*)$/);
           if (directiveMatch) return choose(LUAU_DIRECTIVES.map(value => value.slice(3)));
 
-          const stringArgument = /(?:\bInstance\.new|\bgame:GetService|\w+:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*["'][A-Za-z_\w]*$/.test(before);
+          const stringArgument = /(?:\bInstance\.new|\bgame:GetService|\bUserSettings\s*\(\s*\)\s*:GetService|\w+:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*["'][A-Za-z_\w]*$/.test(before);
           if (isMasked && !stringArgument) return { items: [] };
           if (stringArgument) {
             if (!ROBLOX_API.ready) await ensureRobloxApiLoaded();
