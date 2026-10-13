@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.40"}
+local Transpiler = {Version = "3.41"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -552,7 +552,7 @@ end
 
 local function blockStart(line: string): boolean
     if line:match("^abstract%s+class%s+") or line:match("^final%s+class%s+") or line:match("^class%s+") then return true end
-    if line:match("^namespace%s+") or line:match("^return%s+namespace%s+") or line:match("^enum%s+") or line:match("^match%s+") then return true end
+    if line:match("^namespace%s+") or line:match("^return%s+namespace%s+") or line:match("^enum%s+") or line:match("^match%s+") or line:match("^schema%s+") or line:match("^network%s+") then return true end
     if line:match("^constructor%s*%(") or line:match("^defer%s*$") or line:match("^operator%s+") or line:match("^watch%s+[%a_][%w_]*%s*%(") then return true end
     if line:match("^async%s+function%s+") or line:match("^local%s+async%s+function%s+") then return true end
     if line:match("^get%s+[%a_][%w_]*%s*%(") or line:match("^set%s+[%a_][%w_]*%s*%(") then return true end
@@ -2949,6 +2949,21 @@ local function validateLauaSemantics(source: string)
     local namespaces: {[string]: {[string]: boolean}} = {}
     local knownVariables: {[string]: string} = {}
     local functions: {[string]: string} = {}
+    local importedSymbols = {}
+    for _, importLine in splitLines(masked) do
+        local text = trim(importLine.Text)
+        local named = text:match('^import%s+%{(.-)%}%s+from%s+')
+        if named then
+            for piece in named:gmatch('[^,]+') do
+                local original, replacement = trim(piece):match('^([%a_][%w_]*)%s+as%s+([%a_][%w_]*)$')
+                if original then importedSymbols[replacement]=true
+                else
+                    local name=trim(piece):match('^([%a_][%w_]*)$')
+                    if name then importedSymbols[name]=true end
+                end
+            end
+        end
+    end
     local globals = {}
     for word in ("assert error getfenv getmetatable ipairs loadstring newproxy next pairs pcall print rawequal rawget rawlen rawset select setfenv setmetatable tonumber tostring type typeof unpack xpcall require warn tick time elapsedTime gcinfo settings UserSettings plugin delay spawn wait collectgarbage debug vector _G _VERSION shared game workspace script Enum Instance CFrame Vector2 Vector3 UDim UDim2 Color3 BrickColor NumberRange NumberSequence ColorSequence Rect Ray Region3 PhysicalProperties Random DateTime TweenInfo OverlapParams RaycastParams Axes Faces Font math table string task coroutine utf8 os bit32 buffer nil true false"):gmatch("[%a_][%w_]*") do
         globals[word] = true
@@ -3091,8 +3106,10 @@ local function validateLauaSemantics(source: string)
         local name, className, arguments = code:match("local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)%s*%(([^)]*)%)")
         if not name then name, className, arguments = code:match("local%s+([%a_][%w_]*)%s*:%s*[%a_][%w_]*%s*=%s*new%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
         if name and className then
-            if not classes[className] then fail(`Unknown class '{className}'.`, line.Start) end
-            knownVariables[name] = className
+            if not classes[className] then
+                if not importedSymbols[className] then fail(`Unknown class '{className}'.`, line.Start) end
+            end
+            if classes[className] then knownVariables[name] = className end
             local raw = source:sub(line.Start, line.Finish)
             local open = code:find("new%s+[%a_][%w_]*%s*%(")
             local rawArguments = arguments
@@ -3101,7 +3118,7 @@ local function validateLauaSemantics(source: string)
                 local closeAt = code:find("%)", startAt or open)
                 if startAt and closeAt then rawArguments = raw:sub(startAt + 1, closeAt - 1) end
             end
-            checkCall(className .. " constructor", classes[className].Constructor or "", rawArguments, line.Start)
+            if classes[className] then checkCall(className .. " constructor", classes[className].Constructor or "", rawArguments, line.Start) end
         end
         local typedName, typedClass = code:match("local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)")
         if typedName and classes[typedClass] then knownVariables[typedName] = typedClass end
@@ -3166,6 +3183,7 @@ local function validateLauaSemantics(source: string)
     end
     local knownCalls = {}
     for word in ("if while for until repeat return function constructor signal get set new super async await select continue else elseif then do end not and or"):gmatch("[%a_][%w_]*") do knownCalls[word] = true end
+    knownCalls.cancelScope = true
     for name in globals do knownCalls[name] = true end
     for name in functions do knownCalls[name] = true end
     for name in classes do knownCalls[name] = true end
@@ -3214,7 +3232,7 @@ local function validateLauaSemantics(source: string)
     for _, line in lines do
         local code = line.Text
         for className in code:gmatch("%f[%w_]new%s+([%a_][%w_]*)%s*%(") do
-            if not classes[className] and not knownCalls[className] then fail(`Unknown class '{className}'.`, line.Start) end
+            if not classes[className] and not knownCalls[className] and not importedSymbols[className] then fail(`Unknown class '{className}'.`, line.Start) end
         end
         for _, pattern in {
             "^%s*return%s+([%a_][%w_]*)%s*$",
@@ -3478,6 +3496,255 @@ local function validateTypedSemantics(source: string)
     end
 end
 
+-- Laua v3.41 experimental native parity for opt-in declarations.
+local function contractPredicate(expression: string, name: string): string
+    if name == "any" then return "true" end
+    if name == "Instance" then return `typeof({expression}) == "Instance"` end
+    local known = {string = true, number = true, boolean = true, table = true, Vector3 = true, CFrame = true, Color3 = true}
+    if known[name] then return `typeof({expression}) == "{name}"` end
+    local array = name:match("^{([%a_][%w_]*)}$")
+    if array then
+        local predicate = contractPredicate("item", array)
+        return `(type({expression}) == "table" and (function() for _, item in {expression} do if not ({predicate}) then return false end end return true end)())`
+    end
+    if not name:match("^[%a_][%w_]*$") then error(`Unsupported contract type '{name}'`) end
+    return `(type({name}) == "table" and type({name}.Validate) == "function" and {name}.Validate({expression}))`
+end
+
+local function contractParams(raw: string): {any}
+    local fields = {}
+    local seen = {}
+    if trim(raw) == "" then return fields end
+    for part in raw:gmatch("[^,]+") do
+        local name, annotation = trim(part):match("^([%a_][%w_]*)%s*:%s*(.-)%s*$")
+        if not name or seen[name] then error(`Invalid or duplicate contract parameter '{trim(part)}'`) end
+        seen[name] = true
+        local isOptional = annotation:sub(-1) == "?"
+        if isOptional then annotation = annotation:sub(1,-2) end
+        if not annotation:match("^[%a_][%w_]*$") and not annotation:match("^{[%a_][%w_]*}$") then error(`Invalid contract type '{annotation}'`) end
+        table.insert(fields, {Name = name, Type = annotation, Optional = isOptional})
+    end
+    return fields
+end
+
+local function nativeTranspileContracts(source: string): string
+    local lines = splitLines(maskNonCode(source))
+    local replacements = {}
+    for _, line in lines do
+        local kind, name = trim(line.Text):match("^(schema)%s+([%a_][%w_]*)$")
+        if not kind then kind, name = trim(line.Text):match("^(network)%s+([%a_][%w_]*)$") end
+        if not kind then continue end
+        local closing = findBlock(source, line.Start, lines)
+        local rows = splitLines(source:sub(line.Finish + 2, closing.Start - 1))
+        local out = {}
+        if kind == "schema" then
+            table.insert(out, "local " .. name .. " = {}")
+            table.insert(out, `function {name}.Validate(value: any): (boolean, string?)`)
+            table.insert(out, '    if type(value) ~= "table" then return false, "Expected table" end')
+            local seen = {}
+            for _, row in rows do
+                local original = trim(row.Text)
+                if original == "" or original:match("^%-%-") then continue end
+                local field, annotation = original:match("^([%a_][%w_]*)%s*:%s*([^,%s]+)%s*,?$")
+                if not field or seen[field] then error(`Invalid or duplicate schema field '{original}'`) end
+                seen[field] = true
+                local optional = annotation:sub(-1) == "?"
+                if optional then annotation = annotation:sub(1,-2) end
+                local value = `value["{field}"]`
+                local predicate = contractPredicate(value, annotation)
+                local guard = optional and `{value} ~= nil and ` or ""
+                table.insert(out, `    if {guard}not ({predicate}) then return false, "Invalid field {field}: expected {annotation}" end`)
+            end
+            table.insert(out,'    return true, nil')
+            table.insert(out,'end')
+            table.insert(out,`function {name}.Assert(value: any): any`)
+            table.insert(out,`    local ok, message = {name}.Validate(value)`)
+            table.insert(out,'    if not ok then error(message, 2) end')
+            table.insert(out,'    return value')
+            table.insert(out,'end')
+        else
+            table.insert(out, "local " .. name .. " = {}")
+            table.insert(out, `function {name}.Bind(folder: Instance)`)
+            table.insert(out,'    assert(typeof(folder) == "Instance", "Network requires a RemoteEvent folder")')
+            local events = {}
+            local setup = {}
+            for _, row in rows do
+                local original = trim(row.Text)
+                if original == "" or original:match("^%-%-") then continue end
+                local direction, flavor, event, params = original:match("^(client_to_server)%s+(function)%s+([%a_][%w_]*)%s*%((.*)%)$")
+                if not direction then direction,flavor,event,params=original:match("^(server_to_client)%s+(signal)%s+([%a_][%w_]*)%s*%((.*)%)$") end
+                if not direction or events[event] then error(`Invalid or duplicate network declaration '{original}'`) end
+                events[event] = true
+                local fields = contractParams(params)
+                table.insert(setup, `    {name}.__{event} = folder:WaitForChild("{event}")`)
+                table.insert(setup, `    assert({name}.__{event}:IsA("RemoteEvent"), "Network expects a RemoteEvent")`)
+                local typed,names = {},{}
+                for _, p in fields do
+                    table.insert(typed, `{p.Name}: {p.Type}{p.Optional and "?" or ""}`)
+                    table.insert(names,p.Name)
+                end
+                local types = table.concat(typed,', ')
+                local arguments = table.concat(names,', ')
+                local client = direction == "client_to_server"
+                local sendParams = client and types or ('player: Player' .. (types ~= '' and ', ' .. types or ''))
+                local sendArgs = client and arguments or ('player' .. (arguments ~= '' and ', ' .. arguments or ''))
+                table.insert(out, `function {name}.Send{event}({sendParams})`)
+                table.insert(out, `    assert({name}.__folder ~= nil, "Bind network first")`)
+                table.insert(out, `    local remote = {name}.__{event}`)
+                table.insert(out,`    remote:{client and 'FireServer' or 'FireClient'}({sendArgs})`)
+                table.insert(out,'end')
+                table.insert(out, `function {name}.On{event}(callback: {client and '(Player, ...any) -> ()' or '(...any) -> ()'}): RBXScriptConnection`)
+                table.insert(out, `    assert({name}.__folder ~= nil, "Bind network first")`)
+                table.insert(out, `    local remote = {name}.__{event}`)
+                local recvParams = client and ('player: Player' .. (types ~= '' and ', ' .. types or '')) or types
+                table.insert(out, `    return remote.{client and 'OnServerEvent' or 'OnClientEvent'}:Connect(function({recvParams})`)
+                for _, p in fields do
+                    local guard = p.Optional and `{p.Name} ~= nil and ` or ''
+                    table.insert(out, `        if {guard}not ({contractPredicate(p.Name, p.Type)}) then return end`)
+                end
+                local received = client and ('player' .. (arguments ~= '' and ', ' .. arguments or '')) or arguments
+                table.insert(out, `        callback({received})`)
+                table.insert(out,'    end)')
+                table.insert(out,'end')
+            end
+            if next(events) == nil then error(`Network '{name}' needs events`) end
+            -- Bind executes before generated send/listen methods; place its
+            -- event initialization at the front of the contract declaration.
+            table.insert(setup, `    {name}.__folder = folder`)
+            table.insert(setup, 'end')
+            for index = #setup, 1, -1 do table.insert(out, 4, setup[index]) end
+        end
+        table.insert(replacements, {First=line.Start, Last=closing.Finish, Text=table.concat(out,'\n')})
+    end
+    for index = #replacements, 1, -1 do
+        local r = replacements[index]
+        source = replaceRange(source,r.First,r.Last,r.Text)
+    end
+    return source
+end
+
+local function nativeExhaustiveMatches(source: string): string
+    local masked = maskNonCode(source)
+    local classes, typeNames = {}, {}
+    for _, line in splitLines(masked) do
+        local name = trim(line.Text):match('^enum%s+([%a_][%w_]*)$')
+        if name then
+            local closing = findBlock(source,line.Start)
+            local members = {}
+            for _, row in splitLines(source:sub(line.Finish+2,closing.Start-1)) do
+                local member = trim(row.Text):match('^([%a_][%w_]*)%s*=?')
+                if member then members[member]=true end
+            end
+            classes[name]=members
+        end
+    end
+    for name, annotation in masked:gmatch('local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)') do typeNames[name]=annotation end
+    local replacements = {}
+    for _, line in splitLines(masked) do
+        local subject = trim(line.Text):match('^match%s+exhaustive%s+(.+)$')
+        if not subject then continue end
+        local closing = findBlock(source,line.Start)
+        local kind = typeNames[subject]
+        local matched,default,guard = {},false,false
+        for _, row in splitLines(source:sub(line.Finish+2,closing.Start-1)) do
+            local code = trim(row.Text)
+            if code=='default' then default=true end
+            local c = code:match('^case%s+(.+)$')
+            if c then
+                if c:find(' if ',1,true) then guard=true;c=c:match('^(.-)%s+if%s+') end
+                if matched[c] then error(`Duplicate exhaustive match case '{c}'`) end
+                matched[c]=true
+                local enum = c:match('^([%a_][%w_]*)%.')
+                if enum and classes[enum] then
+                    if kind and kind~=enum then error('Exhaustive match mixes enum types') end
+                    kind=enum
+                end
+            end
+        end
+        if not default then
+            if guard then error('Guarded exhaustive match requires default') end
+            local expected = {}
+            if kind=='boolean' then expected={'true','false'}
+            elseif classes[kind or ''] then for member in classes[kind] do table.insert(expected,kind..'.'..member) end
+            else error('Exhaustive match needs an enum/boolean-typed subject or default') end
+            for _, item in expected do if not matched[item] then error(`Non-exhaustive match: missing {item}`) end end
+        end
+        local start=line.Start + (line.Text:find('exhaustive',1,true) or 1)-1
+        table.insert(replacements,{First=start,Last=start+#'exhaustive ',Text=''})
+    end
+    for index=#replacements,1,-1 do
+        local r=replacements[index]
+        source=source:sub(1,r.First-1)..source:sub(r.Last)
+    end
+    return source
+end
+
+local NATIVE_CANCELLATION_RUNTIME = [==[
+local __lauaCancelScope = {}
+function __lauaCancelScope.new()
+    local scope = {_cancelled = false, _jobs = {}, _cleanups = {}}
+    function scope:OnCancel(callback)
+        assert(type(callback) == "function", "OnCancel expects function")
+        if self._cancelled then callback(); return end
+        table.insert(self._cleanups, callback)
+    end
+    function scope:Spawn(callback)
+        assert(type(callback) == "function", "Spawn expects function")
+        if self._cancelled then return nil end
+        local thread = task.spawn(function() if not self._cancelled then callback(self) end end)
+        table.insert(self._jobs, thread)
+        return thread
+    end
+    function scope:Cancel()
+        if self._cancelled then return end
+        self._cancelled = true
+        for _, thread in self._jobs do pcall(task.cancel, thread) end
+        table.clear(self._jobs)
+        for i = #self._cleanups, 1, -1 do pcall(self._cleanups[i]) end
+        table.clear(self._cleanups)
+    end
+    scope.Dispose = scope.Cancel
+    return scope
+end
+]==]
+local function nativeCancelScopes(source: string): string
+    local masked=maskNonCode(source)
+    local locations = {}
+    local from=1
+    while true do
+        local start,finish=masked:find('%f[%w]cancelScope%s*%(%s*%)',from)
+        if not start then break end
+        local previous=masked:sub(start-1,start-1)
+        if previous~='.' and previous~=':' then table.insert(locations,{Start=start,Finish=finish}) end
+        from=finish+1
+    end
+    if #locations==0 then return source end
+    for index=#locations,1,-1 do
+        local match=locations[index]
+        source=replaceRange(source,match.Start,match.Finish,'__lauaCancelScope.new()')
+    end
+    local header = source:match('^(%s*%-%-![^\n]*\n)') or ''
+    return header..NATIVE_CANCELLATION_RUNTIME..'\n'..source:sub(#header+1)
+end
+
+local function nativeMaskContractBodies(source: string): string
+    local masked=maskNonCode(source)
+    local ranges={}
+    local lines=splitLines(masked)
+    for _,line in lines do
+        local code=trim(line.Text)
+        if not code:match('^schema%s+[%a_][%w_]*$') and not code:match('^network%s+[%a_][%w_]*$') then continue end
+        local ending=findBlock(source,line.Start,lines)
+        table.insert(ranges,{First=line.Start,Last=ending.Finish})
+    end
+    for index=#ranges,1,-1 do
+        local r=ranges[index]
+        local section=source:sub(r.First,r.Last):gsub('[^\n\r]',' ')
+        source=replaceRange(source,r.First,r.Last,section)
+    end
+    return source
+end
+
 function Transpiler.Transpile(source: string, options: any?): string
     assert(type(source) == "string", "Expected Laua source string")
     local mode = type(options) == "table" and options.Mode or "Development"
@@ -3486,13 +3753,17 @@ function Transpiler.Transpile(source: string, options: any?): string
     if style ~= "Readable" and style ~= "Compact" then error("Invalid Laua output style") end
 
     validateExpressionSyntax(source)
+    local checkSource = (source:find('schema', 1, true) or source:find('network', 1, true)) and nativeMaskContractBodies(source) or source
     if type(options) ~= "table" or options.SemanticCheck ~= false then
-        validateClassContracts(source)
-        validateLauaSemantics(source)
-        validateTypedSemantics(source)
+        validateClassContracts(checkSource)
+        validateLauaSemantics(checkSource)
+        validateTypedSemantics(checkSource)
     end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
+    if source:find("match exhaustive", 1, true) then source = nativeExhaustiveMatches(source) end
+    if source:find("schema", 1, true) or source:find("network", 1, true) then source = nativeTranspileContracts(source) end
+    if source:find("cancelScope", 1, true) then source = nativeCancelScopes(source) end
     if source:find("inline", 1, true) then source = transpileInlineFunctions(source) end
     validateKnownVisibility(source)
     validatePendingFeatures(source)
