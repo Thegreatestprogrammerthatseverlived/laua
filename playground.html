@@ -254,17 +254,22 @@
       "buffer", "debug"
     ];
 
+    // Roblox Studio engine datatype catalog (type names, not necessarily constructors).
+    // Keep values like Secret and RBXScriptSignal type-only: they cannot all be .new()'d.
     const LUAU_BUILTIN_TYPES = [
-      "Enum", "EnumItem", "Instance", "CFrame", "Vector2", "Vector3", "UDim", "UDim2",
-      "Color3", "BrickColor", "NumberRange", "NumberSequence", "ColorSequence",
-      "Rect", "Ray", "Region3", "PhysicalProperties", "Random", "DateTime",
-      "TweenInfo", "OverlapParams", "RaycastParams", "RaycastResult", "Axes", "Faces", "Font",
-      "Vector3int16", "Vector2int16", "NumberSequenceKeypoint", "ColorSequenceKeypoint",
-      "RBXScriptConnection", "RBXScriptSignal"
+      "AdReward", "Axes", "BrickColor", "CatalogSearchParams", "CFrame", "Collection",
+      "Color3", "ColorSequence", "ColorSequenceKeypoint", "Content", "DateTime",
+      "DockWidgetPluginGuiInfo", "Enum", "EnumItem", "Enums", "Faces", "FloatCurveKey",
+      "Font", "Instance", "NumberRange", "NumberSequence", "NumberSequenceKeypoint",
+      "OverlapParams", "Path2DControlPoint", "PathWaypoint", "PhysicalProperties",
+      "Random", "Ray", "RaycastParams", "RaycastResult", "RBXScriptConnection",
+      "RBXScriptSignal", "Rect", "Region3", "Region3int16", "RotationCurveKey",
+      "Secret", "SecurityCapabilities", "SharedTable", "TweenInfo", "UDim", "UDim2",
+      "User", "ValueCurveKey", "Vector2", "Vector2int16", "Vector3", "Vector3int16"
     ];
 
     const LUAU_RUNTIME_CONSTRUCTORS = LUAU_BUILTIN_TYPES.filter(name =>
-      !["EnumItem", "RaycastResult", "RBXScriptConnection", "RBXScriptSignal"].includes(name)
+      ["Axes", "BrickColor", "CFrame", "Color3", "ColorSequence", "DateTime", "Faces", "Font", "Instance", "NumberRange", "NumberSequence", "NumberSequenceKeypoint", "OverlapParams", "PhysicalProperties", "Random", "Ray", "RaycastParams", "Rect", "Region3", "TweenInfo", "UDim", "UDim2", "Vector2", "Vector3", "Vector3int16", "Vector2int16"].includes(name)
     );
 
     // Type names are suggestions, not runtime globals. Include all directly
@@ -4737,6 +4742,19 @@ end`;
         ? membersToCompletionMap(SERVICE_MEMBER_SETS[typeName], typeName) : null);
     }
 
+    // `:` is a method call, never a global-name search or property lookup.
+    // Internal Lua metamethod names are implementation details, not normal
+    // Instance methods in Roblox Studio's completion list.
+    function shouldSuggestMember(symbols, owner, operator, memberName, memberInfo) {
+      if (!memberName || /^__/.test(memberName)) return false;
+      if (operator !== ":") return true;
+      if (memberInfo?.kind !== "function" && memberInfo?.kind !== "method") return false;
+      // These tables are accessed with `.`, not by passing an implicit self.
+      if (LIBRARY_MEMBERS[owner] || symbols.namespaces[owner] || symbols.enums[owner] ||
+          symbols.classes[owner] || owner === "Enum" || ROBLOX_DATATYPE_STATIC[owner]) return false;
+      return true;
+    }
+
     function getChainedMembers(symbols, expression, cursorOffset) {
       // Resolve ordinary property chains such as part.CFrame.Position or
       // game.Workspace.CurrentCamera without pretending to be a full Luau analyzer.
@@ -7221,6 +7239,13 @@ end`;
             new monaco.Range(1, 1, position.lineNumber, position.column)
           );
 
+          const cursorOffset = model.getOffsetAt(position);
+          const masked = maskNonCode(model.getValue(), true);
+          const cursorIsNonCode = cursorOffset > 0 && masked[cursorOffset - 1] === " " &&
+            /\S/.test(lineBefore.slice(-1));
+          const robloxStringArgument = /(?:\bInstance\.new|\bgame:GetService|\w+:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*["'][A-Za-z_\w]*$/.test(lineBefore);
+          if (cursorIsNonCode && !robloxStringArgument) return { suggestions: [] };
+
           const attributeMatch = lineBefore.match(/@([A-Za-z_]*)$/);
 
           if (attributeMatch) {
@@ -7311,6 +7336,11 @@ end`;
           const isLaua = model.getLanguageId() === "laua";
           const typeContext = /(?:\b(?:type|export\s+type)\s+[A-Za-z_][A-Za-z_0-9]*(?:<[^>]*>)?\s*=|::|:|\||&)\s*[A-Za-z_0-9]*$/.test(lineBefore);
           const typedPrefix = word.word.toLowerCase();
+          // Engine classes and enums are fetched from the Roblox Client Tracker
+          // when needed. The local fallback is still usable offline.
+          if (typeContext && !ROBLOX_API.ready && typedPrefix.length >= 2) {
+            await ensureRobloxApiLoaded();
+          }
           const suggestions = [
             ...LUAU_KEYWORDS.map(name => makeKeyword(name)),
             ...(isLaua ? LAUA_KEYWORDS.map(name => makeKeyword(name, "Laua keyword")) : []),
@@ -7338,166 +7368,8 @@ end`;
             }
           }
 
-          const snippet = (label, insertText, detail, documentation, sortText = "5000_" + label) => ({
-            label,
-            kind: monaco.languages.CompletionItemKind.Snippet,
-            insertText,
-            insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-            detail,
-            documentation,
-            sortText,
-            range
-          });
-
-          suggestions.push(
-            snippet("if", "if ${1:condition} then\n\t$0\nend", "Luau snippet", "Create an if statement."),
-            snippet("if / else", "if ${1:condition} then\n\t${2}\nelse\n\t$0\nend", "Luau snippet", "Create an if/else statement."),
-            snippet("if / elseif / else", "if ${1:condition} then\n\t${2}\nelseif ${3:condition} then\n\t${4}\nelse\n\t$0\nend", "Luau snippet", "Create a full conditional chain."),
-            snippet("while", "while ${1:condition} do\n\t$0\nend", "Luau snippet", "Create a while loop."),
-            snippet("repeat until", "repeat\n\t$0\nuntil ${1:condition}", "Luau snippet", "Create a repeat-until loop."),
-            snippet("for numeric", "for ${1:i} = ${2:1}, ${3:10} do\n\t$0\nend", "Luau snippet", "Create a numeric for loop."),
-            snippet("for generic", "for ${1:key}, ${2:value} in ${3:table} do\n\t$0\nend", "Luau snippet", "Create a Luau generalized iteration loop."),
-            snippet("function", "function ${1:Name}(${2})\n\t$0\nend", "Luau snippet", "Create a function."),
-            snippet("local function", "local function ${1:Name}(${2})\n\t$0\nend", "Luau snippet", "Create a local function."),
-            snippet("typed function", "local function ${1:Name}(${2:value}: ${3:any}): ${4:any}\n\t$0\nend", "Luau snippet", "Create a typed Luau function."),
-            snippet("anonymous function", "function(${1})\n\t$0\nend", "Luau snippet", "Create an anonymous function."),
-            snippet("local variable", "local ${1:name} = ${2:value}", "Luau snippet", "Declare a local variable."),
-            snippet("typed local", "local ${1:name}: ${2:any} = ${3:value}", "Luau snippet", "Declare a typed local variable."),
-            snippet("type alias", "type ${1:Name} = ${2:any}", "Luau type snippet", "Declare a Luau type alias."),
-            snippet("export type", "export type ${1:Name} = ${2:any}", "Luau type snippet", "Declare an exported Luau type."),
-            snippet("table type", "type ${1:Name} = {\n\t${2:Field}: ${3:any},\n}", "Luau type snippet", "Declare a table type."),
-            snippet("generic type", "type ${1:Name}<${2:T}> = ${3:T}", "Luau type snippet", "Declare a generic type."),
-            snippet("pcall", "local ${1:success}, ${2:result} = pcall(function()\n\t$0\nend)", "Luau snippet", "Protected function call."),
-            snippet("xpcall", "local ${1:success}, ${2:result} = xpcall(function()\n\t$0\nend, function(${3:err})\n\treturn ${3:err}\nend)", "Luau snippet", "Protected call with an error handler."),
-            snippet("task.spawn", "task.spawn(function()\n\t$0\nend)", "Luau task snippet", "Spawn a task."),
-            snippet("task.defer", "task.defer(function()\n\t$0\nend)", "Luau task snippet", "Defer a task."),
-            snippet("task.delay", "task.delay(${1:1}, function()\n\t$0\nend)", "Luau task snippet", "Run code after a delay."),
-            snippet("require", "local ${1:Module} = require(${2:script.Parent.Module})", "Roblox snippet", "Require a ModuleScript."),
-            snippet("Instance.new", "local ${1:instance} = Instance.new(\"${2:Part}\")\n${1:instance}.Parent = ${3:workspace}", "Roblox snippet", "Create a Roblox Instance."),
-            snippet("event connection", "local ${1:connection} = ${2:event}:Connect(function(${3})\n\t$0\nend)", "Roblox snippet", "Connect to an event."),
-            snippet("FindFirstChild", "local ${1:object} = ${2:parent}:FindFirstChild(\"${3:Name}\")\nif not ${1:object} then return end", "Roblox snippet", "Find a child with a guard."),
-            snippet("WaitForChild", "local ${1:object} = ${2:parent}:WaitForChild(\"${3:Name}\")", "Roblox snippet", "Wait for a child."),
-            snippet("GetAttribute", "local ${1:value} = ${2:instance}:GetAttribute(\"${3:Attribute}\")", "Roblox snippet", "Read an attribute."),
-            snippet("SetAttribute", "${1:instance}:SetAttribute(\"${2:Attribute}\", ${3:value})", "Roblox snippet", "Set an attribute."),
-            snippet("Raycast", "local ${1:result} = workspace:Raycast(${2:origin}, ${3:direction}, ${4:params})", "Roblox snippet", "Perform a workspace raycast.")
-          );
-
-          suggestions.push(
-            snippet("do block", "do\n\t$0\nend", "Luau syntax", "Create an explicit scoped block."),
-            snippet("return", "return ${1:value}", "Luau syntax", "Return a value from a function."),
-            snippet("return multiple", "return ${1:first}, ${2:second}", "Luau syntax", "Return multiple values."),
-            snippet("break", "break", "Luau syntax", "Exit the current loop."),
-            snippet("continue", "continue", "Luau syntax", "Skip to the next loop iteration."),
-            snippet("if expression", "if ${1:condition} then ${2:value} else ${3:otherValue}", "Luau expression", "Luau if-then-else expression."),
-            snippet("if expression elseif", "if ${1:condition} then ${2:value} elseif ${3:condition} then ${4:value} else ${5:otherValue}", "Luau expression", "Luau if expression with elseif."),
-            snippet("numeric for step", "for ${1:i} = ${2:1}, ${3:10}, ${4:1} do\n\t$0\nend", "Luau syntax", "Numeric for loop with an explicit step."),
-            snippet("generalized iteration", "for ${1:key}, ${2:value} in ${3:container} do\n\t$0\nend", "Luau syntax", "Iterate directly over a Luau container."),
-            snippet("multiple locals", "local ${1:a}, ${2:b} = ${3:first}, ${4:second}", "Luau syntax", "Declare multiple local variables."),
-            snippet("multiple assignment", "${1:a}, ${2:b} = ${3:first}, ${4:second}", "Luau syntax", "Assign multiple values."),
-            snippet("const local", "const ${1:name} = ${2:value}", "Luau syntax", "Declare a const binding."),
-            snippet("const function", "const function ${1:Name}(${2})\n\t$0\nend", "Luau syntax", "Declare a const function."),
-            snippet("method", "function ${1:Object}:${2:Method}(${3})\n\t$0\nend", "Luau syntax", "Declare a colon method."),
-            snippet("dot function", "function ${1:Object}.${2:Function}(${3})\n\t$0\nend", "Luau syntax", "Declare a function on a table."),
-            snippet("typed method", "function ${1:Object}:${2:Method}(${3:value}: ${4:any}): ${5:any}\n\t$0\nend", "Luau syntax", "Declare a typed colon method."),
-            snippet("generic function", "local function ${1:Name}<${2:T}>(${3:value}: ${2:T}): ${2:T}\n\treturn ${3:value}\nend", "Luau generic syntax", "Declare a generic function."),
-            snippet("generic function two types", "local function ${1:Name}<${2:T}, ${3:U}>(${4:a}: ${2:T}, ${5:b}: ${3:U})\n\t$0\nend", "Luau generic syntax", "Declare a function with multiple generic parameters."),
-            snippet("explicit generic call", "${1:functionName}<<${2:Type}>>(${3})", "Luau generic syntax", "Explicitly instantiate a generic function."),
-            snippet("varargs function", "local function ${1:Name}(...)\n\t$0\nend", "Luau syntax", "Declare a varargs function."),
-            snippet("typed varargs", "local function ${1:Name}(...: ${2:any})\n\t$0\nend", "Luau type syntax", "Declare typed varargs."),
-            snippet("varargs expression", "...", "Luau syntax", "Use the current function's varargs."),
-            snippet("type cast", "${1:value} :: ${2:Type}", "Luau type syntax", "Cast/assert an expression to a type."),
-            snippet("optional type", "${1:Type}?", "Luau type syntax", "Create an optional type."),
-            snippet("union type", "${1:TypeA} | ${2:TypeB}", "Luau type syntax", "Create a union type."),
-            snippet("intersection type", "${1:TypeA} & ${2:TypeB}", "Luau type syntax", "Create an intersection type."),
-            snippet("typeof type", "typeof(${1:value})", "Luau type syntax", "Use the inferred type of an expression."),
-            snippet("function type", "(${1:arg}: ${2:Type}) -> ${3:ReturnType}", "Luau type syntax", "Write a function type."),
-            snippet("function type multiple", "(${1:TypeA}, ${2:TypeB}) -> ${3:ReturnType}", "Luau type syntax", "Write a multi-parameter function type."),
-            snippet("array type", "{${1:Type}}", "Luau type syntax", "Write an array-like table type."),
-            snippet("table indexer type", "{[${1:KeyType}]: ${2:ValueType}}", "Luau type syntax", "Write a table indexer type."),
-            snippet("table shape type", "{\n\t${1:Name}: ${2:Type},\n\t${3:Other}: ${4:Type},\n}", "Luau type syntax", "Write a table shape type."),
-            snippet("generic type alias", "type ${1:Name}<${2:T}> = ${3:T}", "Luau type syntax", "Declare a generic type alias."),
-            snippet("generic type default", "type ${1:Name}<${2:T} = ${3:any}> = ${2:T}", "Luau type syntax", "Declare a generic type alias with a default."),
-            snippet("export generic type", "export type ${1:Name}<${2:T}> = ${3:T}", "Luau type syntax", "Export a generic type alias."),
-            snippet("type function declaration", "type function ${1:Name}(${2})\n\t$0\nend", "Luau type syntax", "Declare a type function."),
-            snippet("export type function", "export type function ${1:Name}(${2})\n\t$0\nend", "Luau type syntax", "Declare an exported type function."),
-            snippet("table array", "{${1:first}, ${2:second}}", "Luau table syntax", "Create an array-style table."),
-            snippet("table dictionary", "{\n\t${1:key} = ${2:value},\n}", "Luau table syntax", "Create a record-style table."),
-            snippet("table computed key", "{\n\t[${1:key}] = ${2:value},\n}", "Luau table syntax", "Create a table with a computed key."),
-            snippet("metatable", "setmetatable(${1:{}}, ${2:metatable})", "Luau table syntax", "Set a metatable."),
-            snippet("__index metatable", "local ${1:Class} = {}\n${1:Class}.__index = ${1:Class}\n\nfunction ${1:Class}.new()\n\treturn setmetatable({}, ${1:Class})\nend", "Luau metatable pattern", "Create a basic metatable class pattern."),
-            snippet("compound +=", "${1:value} += ${2:amount}", "Luau operator", "Compound addition assignment."),
-            snippet("compound -=", "${1:value} -= ${2:amount}", "Luau operator", "Compound subtraction assignment."),
-            snippet("compound *=", "${1:value} *= ${2:amount}", "Luau operator", "Compound multiplication assignment."),
-            snippet("compound /=", "${1:value} /= ${2:amount}", "Luau operator", "Compound division assignment."),
-            snippet("compound //=", "${1:value} //= ${2:amount}", "Luau operator", "Compound floor-division assignment."),
-            snippet("compound %=", "${1:value} %= ${2:amount}", "Luau operator", "Compound modulo assignment."),
-            snippet("compound ^=", "${1:value} ^= ${2:amount}", "Luau operator", "Compound exponent assignment."),
-            snippet("compound ..=", "${1:value} ..= ${2:text}", "Luau operator", "Compound concatenation assignment."),
-            snippet("string interpolation", "`{${1:value}}`", "Luau string syntax", "Create an interpolated backtick string."),
-            snippet("interpolated text", "`${1:Text} {${2:value}}`", "Luau string syntax", "Create an interpolated string."),
-            snippet("long string", "[[\n$0\n]]", "Luau string syntax", "Create a long string."),
-            snippet("long comment", "--[[\n$0\n]]", "Luau comment syntax", "Create a block comment."),
-            snippet("long comment equals", "--[=[\n$0\n]=]", "Luau comment syntax", "Create a block comment that can contain ]]."),
-            snippet("coroutine create", "local ${1:thread} = coroutine.create(function()\n\t$0\nend)", "Luau coroutine", "Create a coroutine."),
-            snippet("coroutine resume", "local ${1:success}, ${2:result} = coroutine.resume(${3:thread})", "Luau coroutine", "Resume a coroutine."),
-            snippet("coroutine yield", "coroutine.yield(${1})", "Luau coroutine", "Yield the current coroutine."),
-            snippet("__index", "__index = ${1:value}", "Luau metatable syntax", "Define an __index metamethod."),
-            snippet("__newindex", "__newindex = function(${1:self}, ${2:key}, ${3:value})\n\t$0\nend", "Luau metatable syntax", "Define an __newindex metamethod."),
-            snippet("__call", "__call = function(${1:self}, ${2})\n\t$0\nend", "Luau metatable syntax", "Define an __call metamethod."),
-            snippet("__iter", "__iter = function(${1:self})\n\treturn next, ${1:self}\nend", "Luau iteration syntax", "Define generalized iteration through __iter.")
-          );
-
-          suggestions.push(
-            snippet("class", "class ${1:Name}\n\t$0\nend", "Laua class", "Create a Laua class."),
-            snippet("abstract class", "abstract class ${1:Name}\n\t$0\nend", "Laua class", "Create an abstract Laua class."),
-            snippet("class extends", "class ${1:Name} extends ${2:Base}\n\t$0\nend", "Laua class", "Create a Laua class that inherits from another class."),
-            snippet("constructor", "constructor(${1})\n\t$0\nend", "Laua class member", "Create a class constructor."),
-            snippet("new instance", "new ${1:ClassName}", "Laua expression", "Create a new Laua class instance with no constructor arguments."),
-            snippet("new instance with args", "new ${1:ClassName}(${2})", "Laua expression", "Create a new Laua class instance with constructor arguments."),
-            snippet("public field", "public ${1:Field} = ${2:value}", "Laua class member", "Declare a public class field."),
-            snippet("private field", "private ${1:Field} = ${2:value}", "Laua class member", "Declare a private class field."),
-            snippet("protected field", "protected ${1:Field} = ${2:value}", "Laua class member", "Declare a protected class field."),
-            snippet("static field", "static ${1:Field} = ${2:value}", "Laua class member", "Declare a static class field."),
-            snippet("public function", "public function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a public instance method."),
-            snippet("private function", "private function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a private instance method."),
-            snippet("protected function", "protected function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a protected instance method."),
-            snippet("static function", "static function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a static method."),
-            snippet("override function", "override function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Override a method from the parent class."),
-            snippet("abstract function", "abstract function ${1:Name}(${2})\nend", "Laua class member", "Declare an abstract method."),
-            snippet("public override function", "public override function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a public override method."),
-            snippet("super constructor", "super(${1})", "Laua inheritance", "Call the parent constructor."),
-            snippet("super method", "super:${1:Method}(${2})", "Laua inheritance", "Call a parent instance method."),
-            snippet("super static", "super.${1:Member}", "Laua inheritance", "Access a member on the parent class."),
-            snippet("namespace", "namespace ${1:Name}\n\t$0\nend", "Laua namespace", "Create a Laua namespace."),
-            snippet("return namespace", "return namespace ${1:Name}\n\t$0\nend", "Laua namespace", "Create and directly return a namespace."),
-            snippet("namespace function", "function ${1:Name}(${2})\n\t$0\nend", "Laua namespace member", "Create an exported namespace function."),
-            snippet("namespace local function", "local function ${1:Name}(${2})\n\t$0\nend", "Laua namespace member", "Create a private helper inside a namespace."),
-            snippet("enum", "enum ${1:Name}\n\t${2:First} = 0\n\t${3:Second} = 1\n\t${4:Third} = 2\nend", "Laua enum", "Create a Laua enum."),
-            snippet("enum auto values", "enum ${1:Name}\n\t${2:First}\n\t${3:Second}\n\t${4:Third}\nend", "Laua enum", "Create a Laua enum with automatic numeric values.")
-          );
-
-          // Opt-in Laua v3.41 constructs and common class features.
-          // Templates supplement literal keyword completions; they do not
-          // replace keywords or make these features appear in plain Luau.
-          suggestions.push(
-            snippet("schema definition", "schema ${1:PlayerData}\n\t${2:Name}: ${3:string}\nend", "Laua schema", "Define a runtime validation schema."),
-            snippet("network contract", "network ${1:Inventory}\n\tclient_to_server function ${2:Buy}(${3:itemId}: ${4:string})\n\tserver_to_client signal ${5:Updated}(${6:items}: {${7:string}})\nend", "Laua network", "Define a client/server RemoteEvent contract."),
-            snippet("match exhaustive", "match exhaustive ${1:value}\n\tcase ${2:Value}\n\t\t$0\nend", "Laua pattern matching", "Match exhaustively over enum or boolean values."),
-            snippet("cancellation scope", "using ${1:scope} = cancelScope()\n${1:scope}:OnCancel(function()\n\t$0\nend)", "Laua cancellation", "Track tasks and dispose a cancellation scope at function exit."),
-            snippet("signal declaration", "signal ${1:Changed}(${2:value}: ${3:number})", "Laua class member", "Declare a per-instance signal."),
-            snippet("lazy field", "lazy ${1:Items} = ${2:{}}", "Laua class member", "Initialize a field when first read."),
-            snippet("watch field", "watch ${1:Health}(${2:oldValue}, ${3:newValue})\n\t$0\nend", "Laua class member", "Run code after a watched field changes."),
-            snippet("getter", "get ${1:Value}()\n\treturn $0\nend", "Laua class member", "Declare a computed property getter."),
-            snippet("setter", "set ${1:Value}(${2:value})\n\t$0\nend", "Laua class member", "Declare a computed property setter.")
-          );
-
-          if (model.getLanguageId() === "lua") {
-            // Imported compiled ModuleScripts are ordinary Luau. Offer Roblox
-            // APIs and native snippets, but not Laua-only syntax expansions.
-            for (let i = suggestions.length - 1; i >= 0; i--) {
-              if (/^Laua(?:\s|$)/.test(suggestions[i].detail || "")) suggestions.splice(i, 1);
-            }
-          }
+          // Roblox Studio-style names only. Do not insert boilerplate templates,
+          // generalized-iteration snippets, or speculative multi-line code.
 
           const sourceSymbols = getProjectSymbols(model);
           // Laua instance methods use standard Luau `self`, not a separate
@@ -7652,7 +7524,8 @@ end`;
             if (members) {
               for (const [memberName, memberInfo] of Object.entries(members)) {
                 if (deprecatedFunctions.has(`${owner}.${memberName}`) || deprecatedFunctions.has(`${owner}:${memberName}`)) continue;
-                const isFunction = memberInfo.kind === "function";
+                if (!shouldSuggestMember(sourceSymbols, owner, operator, memberName, memberInfo)) continue;
+                const isFunction = memberInfo.kind === "function" || memberInfo.kind === "method";
                 const params = memberInfo.params?.trim() || "";
 
                 memberSuggestions.push({
@@ -7673,32 +7546,23 @@ end`;
               }
             }
 
-            // `name: Type` in a field or parameter declaration can resemble
-            // a colon method access. If there is no known receiver, fall
-            // through to the type/keyword catalog instead of returning [].
-            if (members || operator === ".") return { suggestions: memberSuggestions };
+            // An unresolved `object:` must NOT fall through to global names,
+            // which previously made game:print / game:__index appear.
+            // Only an actual type annotation may use the type-name catalog.
+            const annotationContext = operator === ":" && typeContext &&
+              (/^\s*(?:local|const|type|export\s+type)\s+[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9]*$/.test(lineBefore) ||
+               (isLaua && findClassAtOffset(sourceSymbols, cursorOffset) &&
+                // Prefer the explicit field-annotation form `Field: Type`.
+                // `object:Method` without whitespace is a method call.
+                /^\s*[A-Za-z_]\w*\s*:\s+[A-Za-z_0-9]*$/.test(lineBefore))) &&
+              owner !== "game" && owner !== "workspace" &&
+              !sourceSymbols.locals[owner] && !sourceSymbols.parameters[owner] &&
+              !sourceSymbols.variables[owner] && !sourceSymbols.classes[owner];
+            if (!annotationContext) return { suggestions: memberSuggestions };
           }
 
-          if (/\bnamespace\s+[A-Za-z_][A-Za-z0-9_]*[\s\S]*$/.test(textBefore)) {
-            suggestions.unshift(
-              snippet("namespace function", "function ${1:Name}(${2})\n\t$0\nend", "Laua namespace member", "Export a function from this namespace."),
-              snippet("namespace helper", "local function ${1:Name}(${2})\n\t$0\nend", "Laua namespace member", "Create a local namespace helper.")
-            );
-          }
-
-          if (/\bclass\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+extends\s+[A-Za-z_][A-Za-z0-9_.]*)?[\s\S]*$/.test(textBefore)) {
-            suggestions.unshift(
-              snippet("constructor", "constructor(${1})\n\t$0\nend", "Laua class member", "Create the class constructor."),
-              snippet("public function", "public function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a public instance method."),
-              snippet("private field", "private ${1:Field} = ${2:value}", "Laua class member", "Create a private field."),
-              snippet("static function", "static function ${1:Name}(${2})\n\t$0\nend", "Laua class member", "Create a static method.")
-            );
-          }
-
-          // Keep *all* real Luau/Laua words. Older builds discarded every
-          // snippet and accidentally omitted entire classes of built-ins.
-          // Context-aware member completion above remains separate, so
-          // `object.` only offers valid members of that object.
+          // Preserve genuine Studio/Laua symbols only. Deduplicate and filter
+          // by prefix so typing never floods the list with irrelevant items.
           const seenLabels = new Set();
           const completions = [];
           for (const item of suggestions) {
@@ -7765,100 +7629,95 @@ end`;
         }
       });
 
-      monaco.languages.registerInlineCompletionsProvider("laua", {
+      // Subtle, single-token ghost text, shared by Laua and ordinary Luau.
+      // No multiline templates or hallucinated variable/member names.
+      for (const languageId of ["laua", "lua"]) monaco.languages.registerInlineCompletionsProvider(languageId, {
         async provideInlineCompletions(model, position) {
           const line = model.getLineContent(position.lineNumber);
           const before = line.slice(0, position.column - 1);
-          const symbols = getProjectSymbols(model);
+          const partialMatch = before.match(/([A-Za-z_][A-Za-z_0-9]*)$/);
+          if (!partialMatch || partialMatch[1].length < 2) return { items: [] };
+          const partial = partialMatch[1];
+          const lower = partial.toLowerCase();
+          const source = model.getValue();
           const cursorOffset = model.getOffsetAt(position);
-
-          const makeItem = (startColumn, text) => ({
-            insertText: text,
-            range: new monaco.Range(
-              position.lineNumber,
-              startColumn,
-              position.lineNumber,
-              position.column
-            )
+          const masked = maskNonCode(source, true);
+          const isMasked = cursorOffset > 0 && masked[cursorOffset - 1] === " ";
+          const isLaua = model.getLanguageId() === "laua";
+          const typeContext = /(?:\b(?:type|export\s+type)\s+[A-Za-z_][A-Za-z_0-9]*(?:<[^>]*>)?\s*=|::|:|\||&)\s*[A-Za-z_0-9]*$/.test(before);
+          const makeSuggestion = name => ({
+            insertText: name,
+            range: new monaco.Range(position.lineNumber, position.column - partial.length, position.lineNumber, position.column)
           });
+          const choose = (names, important = []) => {
+            const all = [...new Set(names)].filter(name =>
+              typeof name === "string" && name.toLowerCase().startsWith(lower) && name.toLowerCase() !== lower);
+            if (!all.length) return { items: [] };
+            // Prefer exact case and common short roots (print over printidentity).
+            const rank = name => (name.startsWith(partial) ? 20 : 0) +
+              (important.includes(name) ? 15 : 0) - (name.length - partial.length) * 2;
+            all.sort((a, b) => rank(b) - rank(a) || a.length - b.length || a.localeCompare(b));
+            // If two unrelated identifiers are equally plausible, keep silent.
+            if (all.length > 1 && rank(all[0]) - rank(all[1]) < 5 &&
+              !all[1].toLowerCase().startsWith(all[0].toLowerCase())) return { items: [] };
+            return { items: [makeSuggestion(all[0])] };
+          };
 
-          const attributeInline = before.match(/@([A-Za-z_][A-Za-z0-9_]*)$/);
+          const attributeMatch = before.match(/@([A-Za-z_][A-Za-z_0-9]*)$/);
+          if (attributeMatch && !isMasked) return choose(LUAU_ATTRIBUTES.map(value => value.slice(1)));
+          const directiveMatch = before.match(/--!([A-Za-z_][A-Za-z_0-9]*)$/);
+          if (directiveMatch) return choose(LUAU_DIRECTIVES.map(value => value.slice(3)));
 
-          if (attributeInline && attributeInline[1].length >= 2) {
-            const partial = attributeInline[1];
-            const matches = LUAU_ATTRIBUTES.filter(attribute =>
-              attribute.slice(1).toLowerCase().startsWith(partial.toLowerCase()) &&
-              attribute.slice(1).toLowerCase() !== partial.toLowerCase()
-            );
-
-            if (matches.length === 1) {
-              return {
-                items: [makeItem(position.column - partial.length, matches[0].slice(1))]
-              };
-            }
+          const stringArgument = /(?:\bInstance\.new|\bgame:GetService|\w+:(?:IsA|FindFirstChildOfClass|FindFirstChildWhichIsA))\s*\(\s*["'][A-Za-z_\w]*$/.test(before);
+          if (isMasked && !stringArgument) return { items: [] };
+          if (stringArgument) {
+            if (!ROBLOX_API.ready) await ensureRobloxApiLoaded();
+            const matches = completeRobloxStringArgument(model, position, before);
+            return choose((matches?.suggestions || []).map(item => item.label));
           }
 
-          const directiveInline = before.match(/--!([A-Za-z_][A-Za-z0-9_]*)$/);
-
-          if (directiveInline && directiveInline[1].length >= 2) {
-            const partial = directiveInline[1];
-            const matches = LUAU_DIRECTIVES.filter(directive =>
-              directive.slice(3).toLowerCase().startsWith(partial.toLowerCase()) &&
-              directive.slice(3).toLowerCase() !== partial.toLowerCase()
-            );
-
-            if (matches.length === 1) {
-              return {
-                items: [makeItem(position.column - partial.length, matches[0].slice(3))]
-              };
-            }
-          }
-
-          const memberMatch = before.match(/([A-Za-z_][A-Za-z0-9_]*)\s*([.:])\s*([A-Za-z_][A-Za-z0-9_]*)$/);
-
+          const symbols = getProjectSymbols(model);
+          const memberMatch = before.match(/([A-Za-z_]\w*(?:\s*[.:]\s*[A-Za-z_]\w*)*)\s*([.:])\s*([A-Za-z_]\w*)$/);
           if (memberMatch) {
             const owner = memberMatch[1];
             const operator = memberMatch[2];
-            const partial = memberMatch[3];
-
-            if (partial.length >= 2) {
-              if ((owner === "game" || owner === "workspace") && !ROBLOX_API.ready) {
-                await ensureRobloxApiLoaded();
-              }
-
-              const members = getSymbolMembers(symbols, owner, operator, cursorOffset);
-
-              if (members) {
-                const matches = Object.keys(members).filter(name =>
-                  name.toLowerCase().startsWith(partial.toLowerCase()) &&
-                  name.toLowerCase() !== partial.toLowerCase()
-                );
-
-                if (matches.length === 1) {
-                  const member = matches[0];
-                  return { items: [makeItem(position.column - partial.length, member)] };
-                }
-              }
+            if (!ROBLOX_API.ready && (owner === "game" || owner === "workspace" || owner === "Enum" ||
+               symbols.locals[owner]?.service || symbols.locals[owner]?.robloxClass)) {
+              await ensureRobloxApiLoaded();
             }
+            if (isBufferVariable(symbols, owner)) return { items: [] };
+            const members = owner.includes(".") || owner.includes(":")
+              ? getChainedMembers(symbols, owner, cursorOffset)
+              : getSymbolMembers(symbols, owner, operator, cursorOffset);
+            if (!members) return { items: [] };
+            const methodNames = Object.keys(members).filter(name =>
+              shouldSuggestMember(symbols, owner, operator, name, members[name]));
+            return choose(methodNames);
           }
 
-          const newMatch = before.match(/\bnew\s+([A-Za-z_][A-Za-z0-9_]*)$/);
+          const classMatch = before.match(/\bnew\s+[A-Za-z_]\w*$/);
+          if (classMatch && isLaua) return choose(Object.keys(symbols.classes));
 
-          if (newMatch && newMatch[1].length >= 2) {
-            const partial = newMatch[1];
-            const matches = Object.keys(symbols.classes).filter(name =>
-              name.toLowerCase().startsWith(partial.toLowerCase()) &&
-              name.toLowerCase() !== partial.toLowerCase()
-            );
-
-            if (matches.length === 1) {
-              return { items: [makeItem(position.column - partial.length, matches[0])] };
-            }
+          if (typeContext) {
+            if (!ROBLOX_API.ready && partial.length >= 2) await ensureRobloxApiLoaded();
+            return choose([
+              ...LUAU_TYPE_WORDS, ...LUAU_BUILTIN_TYPES,
+              ...Object.keys(symbols.classes), ...(ROBLOX_API.ready ? ROBLOX_API.classes.keys() : [])
+            ], ["number", "string", "boolean", "Secret"]);
           }
 
-          return { items: [] };
+          const keywords = isLaua ? [...LUAU_KEYWORDS, ...LAUA_KEYWORDS] : LUAU_KEYWORDS;
+          const builtinNames = [
+            ...keywords, ...LUAU_GLOBAL_FUNCTIONS, ...LUAU_GLOBAL_OBJECTS,
+            ...LUAU_LIBRARIES, ...LUAU_RUNTIME_CONSTRUCTORS, ...LUAU_GLOBAL_CONSTANTS,
+            ...(isLaua ? LAUA_GLOBAL_FUNCTIONS : []),
+            ...Object.keys(symbols.locals), ...Object.keys(symbols.localFunctions),
+            ...Object.keys(symbols.parameters), ...Object.keys(symbols.namespaces),
+            ...Object.keys(symbols.classes), ...Object.keys(symbols.enums)
+          ];
+          if (isLaua && findClassAtOffset(symbols, cursorOffset)) builtinNames.push("self");
+          return choose(builtinNames, ["print", "warn", "local", "function", "return", "require", "game", "workspace", "task"]);
         },
-
         freeInlineCompletions() {}
       });
 
@@ -8733,7 +8592,7 @@ end`;
         insertSpaces: true,
         quickSuggestions: { other: true, comments: false, strings: false },
         suggestOnTriggerCharacters: true,
-        snippetSuggestions: "top",
+        snippetSuggestions: "none",
         suggestSelection: "first",
         wordBasedSuggestions: "off",
         parameterHints: { enabled: true, cycle: true },
