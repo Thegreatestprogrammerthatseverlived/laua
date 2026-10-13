@@ -1011,12 +1011,12 @@ local part = message[1:7]`;
             if (li < 0) break;
             continue;
           }
-          const fieldMatch = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=]+)?\s*=\s*(.+)$/);
+          const fieldMatch = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^\s=][^=]*)?\s*=\s*(.+)$/) || text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^\s=][^=]*$/);
           if (fieldMatch) {
             if (modifiers.has("override") || modifiers.has("abstract") || modifiers.has("final")) throw new Error(`Invalid modifier for field '${fieldMatch[1]}'`);
             if (declaredNames.has(fieldMatch[1])) throw new Error(`Duplicate class member '${fieldMatch[1]}'`);
             declaredNames.add(fieldMatch[1]);
-            (isStatic ? statics : fields).push({ name: fieldMatch[1], value: fieldMatch[2] });
+            (isStatic ? statics : fields).push({ name: fieldMatch[1], value: fieldMatch[2] ?? null });
             if (attrs.length) throw new Error("Attributes only apply to functions");
             li++;
             continue;
@@ -1067,9 +1067,9 @@ local part = message[1:7]`;
         const plainClass = !base && !isAbstract && !isFinal && !getters.length && !setters.length && !lazyFields.length && !watchers.length && !ctor?.attributes && methods.every(member => !member.abstract && !member.final && !member.override);
         if (plainClass) {
           let output = `local ${name}: {[string]: any} = {}\n${name}.__index = ${name}\n`;
-          for (const field of statics) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const field of statics) if (field.value !== null) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
           output += `function ${name}.__init(self: any${ctor?.params?.trim() ? ", " + ctor.params : ""})\n`;
-          for (const field of fields) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
           for (const item of signals) output += `    self.${item.name} = __lauaSignal.new(${item.types.length ? '{' + item.types.map(t => JSON.stringify(t)).join(', ') + '}' : ''})\n`;
           const initBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
           if (initBody) output += initBody + "\n";
@@ -1097,11 +1097,11 @@ local part = message[1:7]`;
           output += `${name}.__index = ${name}\n${name}.__abstract = ${isAbstract}\n${name}.__final = ${isFinal}\n`;
           const ownFinals = methods.filter(method => method.final).map(method => `[${JSON.stringify(method.name)}] = true`).join(', ');
           output += `${name}.__finalMethods = ${base ? `setmetatable({${ownFinals}}, {__index = ${base}.__finalMethods or {}})` : `{${ownFinals}}`}\n`;
-          for (const field of statics) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const field of statics) if (field.value !== null) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
           const arglist = ctor?.params?.trim() ? ', ' + ctor.params : '';
           output += `function ${name}.__init(self: any${arglist})\n`;
           if (parentInit) output += `    ${parentInit}\n`;
-          for (const field of fields) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
           for (const signal of signals) output += `    self.${signal.name} = __lauaSignal.new(${signal.types.length ? '{' + signal.types.map(t => JSON.stringify(t)).join(', ') + '}' : ''})\n`;
           const init = normalizeBlockIndent(transpileCore(constructorBody));
           if (init) output += init + '\n';
@@ -1194,11 +1194,12 @@ local part = message[1:7]`;
           const body = normalizeBlockIndent(transpileCore(base ? replaceSuperReferences(item.body, base) : item.body), '    ');
           generated += `${name}.__watchers[${JSON.stringify(item.name)}] = function(self, ${item.params})\n${body ? body + '\n' : ''}end\n`;
         }
-        for (const f of statics) generated += `${name}.${f.name} = ${transpileCore(f.value)}\n`;
+        for (const f of statics) if (f.value !== null) generated += `${name}.${f.name} = ${transpileCore(f.value)}\n`;
         const arglist = ctor ? ctor.params : "...";
         generated += `\nfunction ${name}.__init(self: any${arglist.trim() ? ", " + arglist : ""})\n`;
         if (parentInit) generated += `    ${parentInit}\n`;
         for (const f of fields) {
+          if (f.value === null) continue;
           if (watchers.some(item => item.name === f.name)) generated += `    self.__lauaValues[${JSON.stringify(f.name)}] = ${transpileCore(f.value)}\n`;
           else generated += `    self.${f.name} = ${transpileCore(f.value)}\n`;
         }
@@ -2869,13 +2870,13 @@ local part = message[1:7]`;
           try{end=findMatchingEndByLines(source,line.start+masked.slice(line.start,line.end).indexOf('class')).end;}catch{continue;}
           const info={base:cls[2]||null,start:line.start,end,instance:new Map(),statics:new Map(),ctor:null};classes.set(cls[1],info);
           const body=source.slice(line.end+1,end), bodyMasked=maskNonCode(body);
-          const field=/^[ \t]*(?:(?:public|private|protected|static|override|final|abstract)\s+)*(?:(async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)|constructor\s*\(([^\n)]*)\)|(?:signal|lazy|get|set)\s+(\w+)\s*(?:\(([^\n)]*)\))?|([A-Za-z_]\w*)\s*(?::\s*[^=\n]+)?\s*=)/gm;
+          const field=/^[ \t]*(?:(?:public|private|protected|static|override|final|abstract)\s+)*(?:(async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)|constructor\s*\(([^\n)]*)\)|(?:signal|lazy|get|set)\s+(\w+)\s*(?:\(([^\n)]*)\))?|([A-Za-z_]\w*)\s*(?::\s*[^=\n]+)?\s*=|([A-Za-z_]\w*)\s*:\s*[^=\n]+$)/gm;
           let m;while((m=field.exec(bodyMasked))){
             const lineEnd=bodyMasked.indexOf('\n',m.index), prefix=bodyMasked.slice(m.index,lineEnd===-1?bodyMasked.length:lineEnd);
             if(/^\s*(?:local|return|self\.|if\b|for\b)/.test(prefix))continue;
             const staticMember=/\bstatic\b/.test(prefix.split(/\b(?:function|signal|lazy|get|set)\b/)[0]);
             if(m[4]){info.ctor=signature(m[4]);continue;}
-            const name=m[2]||m[5]||m[7];if(!name)continue;
+            const name=m[2]||m[5]||m[7]||m[8];if(!name)continue;
             (staticMember?info.statics:info.instance).set(name,{kind:m[2]?'method':m[5]&&prefix.includes('signal')?'signal':'field',params:m[2]?signature(m[3]):m[5]&&prefix.includes('signal')?signature(m[6]||''):null});
           }
         }
@@ -3332,7 +3333,6 @@ end`;
       }
       return style==='Compact' ? compactGeneratedOutput(output) : output;
     }
-
     function buildLauaSymbolIndex(source) {
       const symbols = {
         namespaces: {},
