@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.41"}
+local Transpiler = {Version = "3.42"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -954,7 +954,8 @@ local function transpileClasses(source: string): string
                 continue
             end
             local field, value = remainder:match("^([%a_][%w_]*)%s*=%s*(.+)$")
-            if not field then field, value = remainder:match("^([%a_][%w_]*)%s*:%s*.-%s*=%s*(.+)$") end
+            if not field then field, value = remainder:match("^([%a_][%w_]*)%s*:%s*[^%s=].-%s*=%s*(.+)$") end
+            if not field then field = remainder:match("^([%a_][%w_]*)%s*:%s*[^%s=].-%s*$") end
             if not field then error(`Invalid class member: {headerText}`) end
             if names[field] then error(`Duplicate class member '{field}'`) end
             if modifiers.final or modifiers.override or modifiers.abstract then error(`Invalid modifier for field '{field}'`) end
@@ -1037,9 +1038,9 @@ local function transpileClasses(source: string): string
         end
         if plainClass then
             local simple = {"local " .. name .. ": {[string]: any} = {}", name .. ".__index = " .. name}
-            for _, field in statics do table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end
+            for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
             table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
-            for _, field in fields do table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end
+            for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
             for _, item in signals do table.insert(simple, `    self.{item.Name} = __lauaSignal.new({item.Types or ""})`) end
             local simpleCtor = normalized(transpileSource(ctorBody), "    ")
             if simpleCtor ~= "" then table.insert(simple, simpleCtor) end
@@ -1084,10 +1085,10 @@ local function transpileClasses(source: string): string
             end
             local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
             table.insert(simple, `{name}.__finalMethods = {base and "setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})" or finalTable}`)
-            for _, field in statics do table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end
+            for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
             table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             if parentInit then table.insert(simple, "    " .. parentInit) end
-            for _, field in fields do table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end
+            for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
             for _, item in signals do table.insert(simple, `    self.{item.Name} = __lauaSignal.new({item.Types or ""})`) end
             local init = normalized(transpileSource(ctorBody), "    ")
             if init ~= "" then table.insert(simple, init) end
@@ -1209,10 +1210,11 @@ local function transpileClasses(source: string): string
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
         end
-        for _, field in statics do table.insert(generated, `{name}.{field.Name} = {transpileSource(field.Value)}`) end
+        for _, field in statics do if field.Value ~= nil then table.insert(generated, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
         table.insert(generated, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
         if parentInit then table.insert(generated, "    " .. parentInit) end
         for _, field in fields do
+            if field.Value == nil then continue end
             if watchers[field.Name] then
                 table.insert(generated, `    self.__lauaValues["{field.Name}"] = {transpileSource(field.Value)}`)
             else
@@ -3050,7 +3052,7 @@ local function validateLauaSemantics(source: string)
                 else
                     local signal, signalParams = clean:match("^signal%s+([%a_][%w_]*)%s*%(([^)]*)%)")
                     if not signal then signal = clean:match("^signal%s+([%a_][%w_]*)") end
-                    local field = clean:match("^([%a_][%w_]*)%s*:%s*.+%s*=") or clean:match("^([%a_][%w_]*)%s*=")
+                    local field = clean:match("^([%a_][%w_]*)%s*:%s*.+%s*=") or clean:match("^([%a_][%w_]*)%s*:%s*%S.-%s*$") or clean:match("^([%a_][%w_]*)%s*=")
                     local member = signal or field
                     if member then
                         local target = isStatic and info.Static or info.Instance
@@ -3388,6 +3390,7 @@ local function validateTypedSemantics(source: string)
                 if child.Start <= line.Start or child.Start >= ending.Start then continue end
                 local row = trim(child.Text)
                 local field, annotation = row:match("^([%a_][%w_]*)%s*:%s*([%a_][%w_]*%??)%s*=")
+                if not field then field, annotation = row:match("^([%a_][%w_]*)%s*:%s*([%a_][%w_]*%??)%s*$") end
                 if field and annotation then classFields[classname][field] = normalType(annotation) end
             end
         end
