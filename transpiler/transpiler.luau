@@ -948,7 +948,7 @@ local function transpileClasses(source: string): string
             table.insert(simple, "end")
             table.insert(simple, `function {name}.new(...: any): any`)
             if prefix == "abstract" then table.insert(simple, `    error("Cannot instantiate abstract class '{name}'")`) end
-            table.insert(simple, `    local self: any = setmetatable({}, {name})`)
+            table.insert(simple, "    local self: any = setmetatable({}, " .. name .. ")")
             table.insert(simple, `    {name}.__init(self, ...)`)
             table.insert(simple, "    return self")
             table.insert(simple, "end")
