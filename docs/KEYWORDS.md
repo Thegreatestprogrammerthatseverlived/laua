@@ -1,20 +1,12 @@
-# Laua Keywords and Syntax Words — v3.41
+# Laua Keywords and Syntax Words — v3.46
 
-Laua (*Lawah*) transpiles `.laua` source into Roblox `.luau`. This reference covers the **40 distinct Laua-specific syntax words** present in the v3.41 website/playground list, including the five introduced in v3.41. For complete examples and rules, see [Documentation.md](Documentation.md) and [SYNTAX.md](SYNTAX.md).
+Laua (pronounced **lau-wuh**) is a Luau **transpiler**. This inventory is generated from the **37 distinct names** in the v3.46 playground’s `LAUA_LANGUAGE_FEATURES` registry and checked against the shipped `playground.html`. Refer to [SYNTAX.md](SYNTAX.md) and [Documentation.md](Documentation.md) for accepted grammar and limitations.
 
-> **Source and verification:** Checked against the v3.41 release's `index.html` syntax-word list, `compiler.js`, `transpiler.luau` source, `docs/V341_FEATURE_GUIDE.md`, and the v3.41 tests. The website list has **41 entries but only 40 unique spellings** because `exhaustive` occurs twice. This is a duplicate list entry, **not** a second keyword. Website/standalone JavaScript parity was tested in the release; native Luau and Roblox Studio execution were **not** verified.
+> **Scope:** This is the Laua-specific editor/syntax vocabulary. Roblox API names, ordinary Luau words, contextual runtime helper calls, and aliases are separate. Syntax highlighting does not imply that a token is globally reserved or valid in every context. Native execution in Roblox Studio has not been verified.
 
-## What counts as a Laua syntax word?
+## Complete inventory — 37 words
 
-Many entries below are **contextual words**, not globally reserved identifiers. For instance, `constructor` belongs in a class, `from` belongs in an import, and `exhaustive` follows `match`. The syntax-highlighting list is **not** a complete formal grammar, and merely highlighting a token does not guarantee that every use of it will transpile.
-
-Ordinary Luau (`local`, `function`, `if`, `then`, `end`, `for`, `while`, `return`, `type`, `export type`, `continue`, and Roblox APIs) is available separately and is **not** part of this inventory.
-
-## Complete inventory — 40 unique words
-
-The table follows the v3.41 playground list, with the newly added words marked **v3.41**.
-
-| # | Word | Role and accepted context | Example or note |
+| # | Word | Meaning | Example or note |
 | ---: | --- | --- | --- |
 | 1 | `class` | Define a Laua class. | `class Enemy ... end` |
 | 2 | `extends` | Specify a direct superclass. | `class Boss extends Enemy` |
@@ -26,141 +18,135 @@ The table follows the v3.41 playground list, with the newly added words marked *
 | 8 | `new` | Instantiate a Laua class. | `new Enemy()` |
 | 9 | `namespace` | Define a named namespace table. | `namespace MathTools ... end` |
 | 10 | `super` | Call an immediate parent initializer or member. | `super(...)`, `super.Move(...)` |
-| 11 | `abstract` | Mark an abstract class or method. | `abstract class Entity ... end` |
-| 12 | `override` | Identify an overriding inherited method. | `override function Move() ... end` |
-| 13 | `enum` | Define an enum table. | `enum State ... end` |
-| 14 | `final` | Restrict class extension or method override. | `final class Root ... end` |
-| 15 | `get` | Define a computed getter. | `get IsAlive() ... end` |
-| 16 | `set` | Define a managed setter. | `set Health(value) ... end` |
-| 17 | `defer` | Run cleanup at the enclosing function's exit. | `defer ... end` |
-| 18 | `using` | Register a resource for function-exit disposal. | `using scope = cancelScope()` |
-| 19 | `async` | Define an asynchronous function. | `async function Fetch() ... end` |
-| 20 | `await` | Wait for supported asynchronous results. | `local value = await Fetch()` |
-| 21 | `match` | Start a pattern-match statement. | `match status ... end` |
-| 22 | `case` | Start a match branch. | `case State.Running` |
-| 23 | `default` | Declare a fallback match branch. | `default` |
-| 24 | **`exhaustive`** | **v3.41:** opt in to completeness checks after `match`. | `match exhaustive state` |
-| 25 | `import` | Import supported exports from a module. | `import {Value} from "./Data"` |
-| 26 | `from` | Specify an import's relative source. | `from "./Data"` |
-| 27 | `operator` | Define supported class metamethod operators. | `operator +(other) ... end` |
-| 28 | `signal` | Define a local per-instance class signal. | `signal Changed(value: number)` |
+| 11 | `self` | Contextual current instance inside Laua constructors and instance methods. | `self.Health = health`; not a global object |
+| 12 | `abstract` | Mark an abstract class or method. | `abstract class Entity ... end` |
+| 13 | `override` | Identify an overriding inherited method. | `override function Move() ... end` |
+| 14 | `enum` | Define an enum table. | `enum State ... end` |
+| 15 | `final` | Restrict class extension or method override. | `final class Root ... end` |
+| 16 | `get` | Define a computed property getter. | `get Health() ... end` |
+| 17 | `set` | Define a managed property setter. | `set Health(value) ... end` |
+| 18 | `defer` | Run cleanup at the enclosing function's exit. | `defer ... end` |
+| 19 | `using` | Register a resource for function-exit disposal. | `using scope = cancelScope()` |
+| 20 | `async` | Define an asynchronous function. | `async function Fetch() ... end` |
+| 21 | `await` | Wait for supported asynchronous results. | `local value = await Fetch()` |
+| 22 | `match` | Start a pattern-match statement. | `match status ... end` |
+| 23 | `case` | Start a match branch. | `case State.Running` |
+| 24 | `default` | Declare a fallback match branch. | `default` |
+| 25 | `exhaustive` | **v3.41:** opt in to completeness checks after `match`. | `match exhaustive state` |
+| 26 | `import` | Import supported exports from a module. | `import {Value} from "./Data"` |
+| 27 | `from` | Specify an import's relative source. | `from "./Data"` |
+| 28 | `operator` | Define supported class metamethod operators. | `operator +(other) ... end` |
 | 29 | `lazy` | Define lazily initialized class data or lazy module import. | `lazy Cache = Create()` |
 | 30 | `watch` | Define a managed-property change observer. | `watch Health(before, after) ... end` |
 | 31 | `export` | Export a supported module declaration. | `export class Account ... end` |
 | 32 | `as` | Rename a named import. | `import {Create as Make} from "./Module"` |
-| 33 | `memo` | Define a named memoized function. | `memo function Square(x) ... end` |
+| 33 | `memo` | Declare a memoized function. | `memo function F(x) ... end`; `memo.clear(F)` resets a cache |
 | 34 | `is` | Test Laua class membership/inheritance. | `object is Enemy` |
 | 35 | `inline` | Request restricted inline specialization. | `inline function Double(x) ... end` |
-| 36 | `const` | Recognized declaration word with implementation limitations. | See [the `const` note](#const-declaration-caveat) |
-| 37 | **`schema`** | **v3.41:** declare a runtime data-shape validator. | `schema PlayerData ... end` |
-| 38 | **`network`** | **v3.41:** declare a typed RemoteEvent contract. | `network Inventory ... end` |
-| 39 | **`client_to_server`** | **v3.41:** mark a client-to-server `network` function event. | `client_to_server function Buy(id: string)` |
-| 40 | **`server_to_client`** | **v3.41:** mark a server-to-client `network` signal event. | `server_to_client signal Updated(id: string)` |
+| 36 | `const` | Immutable declaration token recognized by the editor/lint system. | `const MAX = 100`; reassignment checking is subject to scope analysis |
+| 37 | `schema` | Define a runtime data-shape validator. | `schema PlayerData ... end` |
 
-**Count:** 35 pre-v3.41 unique syntax words + 5 added in v3.41 = **40 unique syntax words**. The playground currently duplicates `exhaustive` at the end of its list, for 41 raw entries.
+## Context and examples
 
-## The five new v3.41 words
+### Classes, instances and `self`
 
-### `schema`: opt-in runtime validation
+```laua
+class Entity
+    public Health: number
+
+    constructor(health: number)
+        self.Health = health
+    end
+
+    function GetHealth(): number
+        return self.Health
+    end
+end
+
+local entity = new Entity(100)
+print(entity:GetHealth())
+```
+
+`self` is contextual: constructors and instance methods receive an implicit instance. A `static function` does not receive one. In v3.46, known instance methods must be called using `obj:Method(...)`, or with explicit receiver as `obj.Method(obj, ...)`. An argument-free `obj.Method()` is rejected where the analyzer can prove it omits the instance. Getter/setter versus method collisions across known inheritance are also rejected.
+
+### Runtime schemas and exhaustive matching
 
 ```laua
 schema PlayerData
     Name: string
     Health: number
-    Inventory: {string}?
 end
 
-local ok, message = PlayerData.Validate({Name = "Alex", Health = 100})
-local data = PlayerData.Assert({Name = "Alex", Health = 100})
+local valid, reason = PlayerData.Validate({Name = "Alex", Health = 100})
+local value = PlayerData.Assert({Name = "Alex", Health = 100})
 ```
 
-A schema produces `.Validate(value)` returning `(boolean, string?)` and `.Assert(value)` returning the value or throwing an error. A trailing type `?` permits absence; supported field types are restricted to documented primitives, selected Roblox types, homogeneous arrays, and previously declared schemas. Fields are **one per line**. Extra fields are allowed; schemas do not check authorization, minimum/maximum values, size limits, cycles, or ownership. Generic and union schema declarations are not supported by v3.41.
+`schema` checks supported field types and optional fields; it is not permission validation and accepts additional keys. `match exhaustive ...` checks coverage for recognized enum/boolean cases, not arbitrary union-type exhaustiveness.
 
-### `network`, `client_to_server`, and `server_to_client`: RemoteEvent contracts
+### Memoization and clearing cached results
 
 ```laua
-schema Purchase
-    ItemId: string
-    Quantity: number
+memo function Square(x: number): number
+    return x * x
 end
 
-network Inventory
-    client_to_server function Buy(purchase: Purchase)
-    server_to_client signal Updated(items: {string})
-end
-
-Inventory.Bind(game:GetService("ReplicatedStorage"):WaitForChild("InventoryRemotes"))
+print(Square(4))
+memo.clear(Square) -- Clear this function’s cache
+memo.clear()       -- Clear all memo caches in this script
 ```
 
-These declarations emit a `Bind(folder)` API and named wrappers such as `Inventory.SendBuy`, `Inventory.OnBuy`, `Inventory.SendUpdated`, and `Inventory.OnUpdated`. `Bind` caches **existing** matching `RemoteEvent` children; it does not create them. A client-to-server listener receives the `Player` first. Incoming data is validated against declared types, but the server must still check permissions, quantities, rates, balances, and game rules. The source form documented and tested for v3.41 is **`client_to_server function`** and **`server_to_client signal`**; do not assume every direction/declaration pairing is supported.
+`memo.clear` is an API call, **not an additional keyword**. It resets cached results without replacing the memoized function. Clearing a specific cache expects a memoized function; unrelated functions are not valid targets. `memo` does not automatically bound caches or invalidate them when other state changes.
 
-### `exhaustive`: opt-in enum/boolean coverage checks
+### Imports and exports
 
 ```laua
-enum State
-    Idle
-    Running
-    Dead
+-- PlayerData.laua
+export class PlayerData
+    Health: number = 100
 end
 
-local state: State = State.Idle
-match exhaustive state
-    case State.Idle
-        print("Idle")
-    case State.Running
-        print("Running")
-    case State.Dead
-        print("Dead")
-end
+-- In another .laua source file
+import {PlayerData as Data} from "./PlayerData"
+local player = new Data()
 ```
 
-`exhaustive` detects missing or duplicate cases for recognized enum members and boolean subjects, including some invalid enum member references. Guarded cases require `default`; other patterns may also need a `default` when complete coverage cannot be proved. The analysis runs **during transpilation** and does not add a runtime exhaustiveness helper. It does **not** provide complete matching for arbitrary union types or nested patterns.
+`as` renames the local imported binding. Exported named values appear in the returned module table, such as `return {PlayerData = PlayerData}`. The web playground does not automatically create Roblox ModuleScripts; use the project workflow or place transpiled modules in the correct Roblox hierarchy.
 
-## Other syntax that is **not** a keyword
+## Helpers, syntax operators, and directives (not extra Laua keywords)
 
-| Form | Role and boundary |
+| Token or API | Function |
 | --- | --- |
-| `cancelScope()` | **v3.41 helper call, not a keyword.** Creates a cancellation scope with `:Spawn(fn)`, `:OnCancel(fn)`, `:Cancel()`, and `:Dispose()`. Cancellation of unrelated promises/async work is not automatic. |
-| `?.`, `?.[key]`, `?.:Method()` | Optional member, index, and method access with `nil` short-circuiting. |
-| `??`, `??=` | Nil-only coalescing or assignment; `false` is not treated as missing. |
-| `?` in `local value = result?` | Early return for supported local/const assignment forms; distinct from optional types `T?`. |
-| `=>` | One-expression arrow functions. |
-| `\|>` | Supported single-line function pipelines. |
-| `{...left, ...right}` | Table spread, currently limited to supported spread-only literals. |
-| `text[1:3]` | Inclusive 1-based string/buffer slice, within supported receiver grammar. |
-| `local {Health, Name: Label} = data` | Single-level table destructuring with optional rename. |
-| `function F(x = 10)` | Default parameter values, used when the argument is `nil`/omitted. |
-| `table.map`, `table.filter`, `table.reduce`, `table.findWhere` | Laua-recognized helper calls; not new standard Luau `table` functions. |
-| `--#if DEBUG`, `--#else`, `--#end` | Transpilation-time branches, governed by the `Mode` option. |
-| `@nolint("UnusedLocal")` | Selected lint-suppression annotation; the v3.41 JavaScript preflight can mistakenly flag it as an unknown call. |
+| `memo.clear(F)` / `memo.clear()` | Clear one or all memoized caches in the current script. |
+| `cancelScope()` | Opt-in cancellation and cleanup helper with `:Spawn`, `:OnCancel`, `:Cancel`, `:Dispose`. |
+| `?.`, `?.[key]`, `?.:Method()` | Nil-safe access on supported receivers. |
+| `??`, `??=` | Nil-only fallback operators, not boolean `or`. |
+| `value?` on supported declarations | Early return if nil (limited syntax). |
+| `=>`, `|>` | One-expression arrow functions and supported pipeline syntax. |
+| `{...left, ...right}` | Restricted table spread syntax. |
+| `items[1:3]` | Inclusive slicing of supported string/buffer receivers. |
+| `table.map`, `table.filter`, `table.reduce`, `table.findWhere` | Laua table extensions, **not** ordinary Roblox Luau table-library APIs. |
+| `--#if`, `--#else`, `--#end` | Conditional transpilation directives. |
+| `--!strict`, `--!nonstrict`, `--!nocheck` | Luau mode directives, separate from Laua keywords. |
 
-### Native Luau words and annotations
+## Retired Laua syntax in v3.46
 
-`and`, `break`, `continue`, `do`, `else`, `elseif`, `end`, `false`, `for`, `function`, `if`, `in`, `local`, `nil`, `not`, `or`, `repeat`, `return`, `then`, `true`, `type`, `until`, and `while` are ordinary Lua/Luau syntax, **not Laua-exclusive features**. Luau directives such as `--!strict`, `--!nonstrict`, `--!nocheck`, `--!native`, and `--!optimize` are also separate from Laua keywords.
+The former **custom-language** `signal`, `network`, `client_to_server`, and `server_to_client` constructs are removed from the syntax registry, autocomplete, and transpilation paths. The words may be used as ordinary identifiers where valid. Roblox `RBXScriptSignal`, `BindableEvent`, `RemoteEvent`, and built-in event methods remain available as normal Roblox APIs. No special deprecation or “feature removed” diagnostic is emitted.
 
-`self` is the normal instance receiver used in generated class methods: **use `self`, not `this`**. `self` is an identifier, not a new Laua language keyword. `cancelScope`, `Validate`, `Assert`, `Bind`, and `SendBuy` are generated/runtime API names, not reserved syntax words.
+## Names not intended for user declarations
 
-## Known caveats
+v3.46 diagnoses user declarations colliding with its internal runtime identifiers, including `Promise`, `Promises`, `LauaPromiseStatus`, `LauaPackedValues`, `LauaPromiseState`, `LauaCore`, and names prefixed `__laua`. Avoid these identifiers for user-defined bindings. This is not a complete assertion about every identifier in future releases.
 
-### `const` declaration caveat
+## Ordinary Luau words and type notes
 
-`const` already appears in Laua's syntax-word list and parts of its checking logic, but the **packaged v3.41 standalone JavaScript transpiler** may emit plain `const MAX = 100` unchanged, rather than convert it into a Luau `local` declaration. Plain `const` is not native Luau declaration syntax. This is a **v3.41 implementation discrepancy**, not a proposal to add `const` as a new feature. See [Documentation.md §15.1](Documentation.md#151-const-and-known-preflight-gaps).
+Keywords such as `local`, `function`, `return`, `if`, `else`, `end`, `while`, `type`, and `continue` belong to Luau. The playground also recognizes Roblox globals, types, services and class members when its API data is available. The v3.46 playground highlights `self` with Laua syntax, but it is still emitted as the standard Luau instance receiver.
 
-### Scope and completeness limitations
+`const` appears in the v3.46 syntax registry and the transpiler may preserve its original token in the emitted text; the playground implements selected reassignment linting. Do not confuse editor checks with verified native Luau execution—check resulting source with your target Studio toolchain.
 
-- `private`, `protected`, `abstract`, `override`, and `final` can carry static and/or runtime checks, but visibility modifiers are not Roblox security boundaries.
-- A `network` declaration currently has a limited grammar; certain same-file references such as `return Inventory` may be incorrectly rejected by JavaScript semantic preflight even when the generated binding exists.
-- `namespace` supports a declaration and a directly returned namespace from a function; not every namespace-expression form is recognized.
-- The transpiler uses source-level transformations and semantic preflight, **not** a complete AST/type solver. Diagnostics can be conservative or incomplete, especially for complex nested expressions and cross-file cases.
-- The new project tool is invoked using `node project-transpiler.cjs ./src ./out Compact`; its import analysis is limited, and its line source maps leave rewritten/ambiguous lines unmapped. These are **tool features, not syntax keywords**.
-- Interfaces, traits, arbitrary named arguments, fully generic schemas, and automatic creation of Roblox RemoteEvents are **not** v3.41 syntax features.
+## Related files
 
-## Related documentation
+- [SYNTAX.md](SYNTAX.md) — grammar and short examples
+- [Documentation.md](Documentation.md) — full behavior, limitations and usage
+- [GitHub repository](https://github.com/Thegreatestprogrammerthatseverlived/laua)
+- [Website](https://laua.dev)
 
-- [Full documentation](Documentation.md)
-- [Syntax reference](SYNTAX.md)
-- `docs/V341_FEATURE_GUIDE.md` inside the v3.41 release package
-- [Laua GitHub repository](https://github.com/Thegreatestprogrammerthatseverlived/laua)
-- [Laua website](https://laua.dev)
-
-**Version:** v3.41. **Terminology:** Laua is a **transpiler**, not a separate runtime. The v3.41 package does not establish native Luau or Roblox Studio execution verification.
+**Release:** v3.46. **Native Luau / Roblox Studio execution:** not verified by the recorded automated tests.

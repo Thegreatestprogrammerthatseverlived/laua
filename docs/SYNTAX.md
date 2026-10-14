@@ -1,8 +1,8 @@
-# Laua Syntax Reference — v3.41
+# Laua Syntax Reference — v3.46
 
-> **Target:** Laua **v3.41**, transpiling `.laua` into Roblox `.luau` (release dated October 12, 2026). This is a syntax quick reference; see [Documentation.md](Documentation.md) for behavior, setup, API details, and limitations. Laua is a **transpiler**, not a new runtime or game engine.
+> **Target:** Laua **v3.46**, transpiling `.laua` into Roblox `.luau`. This is a syntax quick reference; see [Documentation.md](Documentation.md) for behavior, setup, API details, and limitations. Laua is a **transpiler**, not a new runtime or game engine.
 >
-> **Verification:** Examples are based on the shipped v3.41 source, feature guide, and regression tests. Website/standalone JavaScript parity is tested; the native Luau transpiler has **not** been executed in Roblox Studio. Examples containing deliberate errors are marked as such.
+> **Verification:** Examples are based on the shipped v3.46 source, changelog, and regression tests. Website/standalone JavaScript parity is tested; the native Luau transpiler has **not** been executed in Roblox Studio. Examples containing deliberate errors are marked as such.
 
 ## Contents
 
@@ -13,7 +13,7 @@
 5. [Pattern matching](#5-pattern-matching)
 6. [Expressions and collections](#6-expressions-and-collections)
 7. [Functions and transpilation-time syntax](#7-functions-and-transpilation-time-syntax)
-8. [New in v3.41: contracts and schemas](#8-new-in-v341-contracts-and-schemas)
+8. [Schemas and v3.46 language cleanup](#8-schemas-and-v346-language-cleanup)
 9. [Project tool and source-map syntax](#9-project-tool-and-source-map-syntax)
 10. [Options, diagnostics, and compatibility](#10-options-diagnostics-and-compatibility)
 
@@ -22,7 +22,7 @@
 - All ordinary supported **Luau** syntax (for example `local`, `function`, `if`, `for`, `--!strict`, Luau types, `task`, and Roblox APIs) remains available, subject to Laua's source-transform limitations.
 - Laua **syntax words** can be contextual; a word shown here is not necessarily globally reserved.
 - Laua code snippets are **input**, not code to paste directly into an untranspiled Roblox Script.
-- **v3.41** introduces `schema`, `network`, `client_to_server`, `server_to_client`, `exhaustive` and the `cancelScope()` helper, plus a separate multi-file project tool.
+- `schema`, `exhaustive`, `cancelScope()` and the multi-file project tool remain supported. The former custom `signal` and `network` features have been **removed** in v3.46.
 - Runtime helpers are added only for code that requires them. Static `match exhaustive` checking does not add a runtime helper.
 
 ## 2. Classes and members
@@ -80,13 +80,12 @@ print((new Enemy()):Describe())
 
 `super(...)` calls the immediate superclass's initializer inside a child constructor. `super.Method(...)` or `super:Method(...)` calls an inherited instance method and forwards `self`; static and explicit receiver cases have different rules.
 
-### Properties, observers, and signals
+### Properties, lazy values, and watchers
 
 ```laua
 class HealthState
     Health: number = 100
     lazy Inventory = {"Bandage"}
-    signal Changed(value: number)
 
     get IsAlive()
         return self.Health > 0
@@ -102,7 +101,7 @@ class HealthState
 end
 ```
 
-`get` is a computed getter; `set` intercepts assignment to its named property; `lazy` caches an initializer on first read; `watch` observes managed property changes. A declared `signal` is a **local, per-instance** event, not a RemoteEvent.
+`get` is a computed getter; `set` intercepts assignment to its named property; `lazy` caches an initializer on first read; `watch` observes managed property changes. Use Roblox events (`RBXScriptSignal`, `RemoteEvent`, or `BindableEvent`) rather than the removed Laua `signal` declaration.
 
 ### Operators and instance test
 
@@ -188,22 +187,19 @@ Other recognized forms include `import Module from "./Module"` and `import lazy 
 
 ## 4. Events, async, and cleanup
 
-### Signals
+### Roblox events and connections
+
+The custom Laua `signal` declaration was removed in v3.46. Existing Roblox events and their `:Connect(...)` callbacks are unchanged:
 
 ```laua
-class Counter
-    signal Updated(value: number)
-end
-
-local counter = new Counter()
-local connection = counter.Updated:Connect(function(value)
-    print(value)
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+    if gameProcessed then return end
+    print(input.KeyCode)
 end)
-counter.Updated:Fire(5)
-connection:Disconnect()
 ```
 
-Signal API: `:Connect(callback)`, `:Once(callback)`, `:Fire(...)`, `:Wait()`, `:Destroy()`; connection API: `:Disconnect()`. Signal callbacks are scheduled asynchronously.
+The playground can offer callback parameter hints when Roblox API metadata is available. Its more demanding strict-annotation policy is a playground lint feature, not a promise of identical Roblox Studio type inference.
 
 ### Async functions
 
@@ -331,16 +327,20 @@ local function Multiplier(amount: number = 2)
     return amount
 end
 
-memo function Square(x)
+memo function Square(x: number): number
     return x * x
 end
+
+print(Square(4))
+memo.clear(Square)
+memo.clear()
 
 inline function Increment(x)
     return x + 1
 end
 ```
 
-Default parameters use their declared expression when the caller supplies `nil`/omits the argument. `memo` caches named function results without automatic expiration. `inline` is a **restricted** static specialization, not a universal inliner.
+Default parameters use their declared expression when the caller supplies `nil`/omits the argument. `memo` caches named function results; `memo.clear(MyFunction)` clears a specific cache and `memo.clear()` clears all memo caches in the current script. Neither form removes the function or sets a cache size limit. `inline` is a **restricted** static specialization, not a universal inliner.
 
 ### Conditional transpilation
 
@@ -361,13 +361,17 @@ Modes: `Development`, `Debug`, `Release`. Branches are decided when transpiling,
 local unused = 10
 ```
 
-`@nolint` is intended for selected editor lint warnings. **Known limitation:** the v3.41 JavaScript semantic preflight may incorrectly report `Unknown function 'nolint'`; see [Documentation.md](Documentation.md#151-const-and-known-preflight-gaps). It is not a universal syntax/type-error suppression.
+`@nolint` is intended for selected editor lint warnings. **Known limitation:** the browser/JavaScript semantic preflight may require an isolated workaround for certain annotations; see [Documentation.md](Documentation.md#151-const-and-semantic-preflight-notes). It is not a universal syntax/type-error suppression.
 
-### `const`
+### `const`, instance method calls and reserved names
 
-`const` is recognized by the Laua syntax/highlighting and semantic passes; it also participates in limited early-return syntax (`const x = value?`). **Important packaged v3.41 behavior:** direct JavaScript transpilation of plain `const x = 1` currently leaves the `const` token in the generated output, rather than lowering it to valid Luau or enforcing runtime immutability. Do not treat plain `const` as deployment-ready until this is corrected and checked across transpiler targets.
+`const` is recognized in the editor and forwarded by the transpiler where supported. The playground checks selected attempted reassignments; inspect generated output in your target Studio toolchain instead of assuming complete cross-tool immutability enforcement.
 
-## 8. New in v3.41: contracts and schemas
+Inside a Laua class, methods implicitly receive `self`. Call `entity:Move()` or explicitly `entity.Move(entity)`; `entity.Move()` is rejected for a known instance method because it omits `self`. A subclass cannot silently replace an inherited getter/setter with an ordinary method (or vice versa). These checks apply to statically recognized Laua classes; fully dynamic receivers remain less predictable.
+
+Internal runtime bindings such as `Promise`, `Promises`, `LauaCore`, `LauaPromiseStatus`, and `__laua...` names are reserved against conflicting user declarations in v3.46. Prefer your own distinct names.
+
+## 8. Schemas and v3.46 language cleanup
 
 ### Runtime schema declaration
 
@@ -386,27 +390,19 @@ local data = Purchase.Assert({ItemId = "Sword", Quantity = 1})
 
 `Validate(value)` returns `(boolean, string?)` and reports the first invalid field; `Assert(value)` returns the input on success or throws on failure. This validates **shape/types**, not authorization or size/range limits.
 
-### Typed network contract declaration
+### Removed custom signal/network declarations
+
+The previous Laua-language declarations `signal`, `network`, `client_to_server`, and `server_to_client` have been removed. They are **not** Laua keywords or generated helper contracts in v3.46. Former syntax names can be used as ordinary identifiers when valid. Roblox's own networking and event objects still work:
 
 ```laua
-schema BuyRequest
-    ItemId: string
-    Count: number
-end
-
-network Shop
-    client_to_server function Buy(request: BuyRequest)
-    server_to_client signal Receipt(message: string)
-end
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remote = ReplicatedStorage:WaitForChild("InventoryRemote")
+Remote.OnServerEvent:Connect(function(player: Player, itemId: string)
+    print(player, itemId)
+end)
 ```
 
-| Source declaration | Generated entry points | Execution direction |
-| --- | --- | --- |
-| `client_to_server function Buy(request: BuyRequest)` | `Shop.SendBuy(request)`, `Shop.OnBuy(callback)` | Send on client, listen on server; callback gets `player` first. |
-| `server_to_client signal Receipt(message: string)` | `Shop.SendReceipt(player, message)`, `Shop.OnReceipt(callback)` | Send on server, listen on client. |
-| `network Shop ... end` | `Shop.Bind(folder)` | Call once on each side to find and cache matching RemoteEvents. |
-
-Before invoking any generated `Send...` or `On...` method, call `Shop.Bind(folder)` with a **pre-existing Roblox Instance** containing `RemoteEvent` children named `Buy` and `Receipt`. Contracts do **not** create RemoteEvents or synchronize ModuleScripts for you. Incoming payloads receive type checks, but the server must still verify permissions, balances, bounds, spam/rate limits, ownership, and game rules.
+This example assumes server execution and an existing `RemoteEvent`; add server-side authorization and payload validation for real gameplay.
 
 ## 9. Project tool and source-map syntax
 
@@ -454,10 +450,10 @@ console.log(generated, compilationStats(source, generated));
 
 ### Current boundaries
 
-- The JavaScript implementations have tested parity with each other. Native `transpiler.luau` contains corresponding v3.41 lowering, but **was not run** in a native Luau/Roblox Studio environment for this release.
+- The JavaScript implementations have tested parity with each other. Native `transpiler.luau` contains corresponding v3.46 lowering, but **was not run** in a native Luau/Roblox Studio environment for this release.
 - Laua's analyzer is not a full AST/control-flow type checker, and its project checker handles a conservative subset of module expressions.
-- `match exhaustive` checks simple enum/boolean cases; schemas and network declarations have a deliberately limited grammar.
+- `match exhaustive` checks recognized enum/boolean cases; schemas have a deliberately limited grammar.
 - Source maps skip transformed lines; generated Luau still requires Roblox Studio Script Analysis and runtime tests.
-- See [Documentation.md](Documentation.md) and `V341_FEATURE_GUIDE.md` (in the v3.41 release ZIP) for full descriptions and important security warnings.
+- See [Documentation.md](Documentation.md), [KEYWORDS.md](KEYWORDS.md) and the v3.46 validation report for full descriptions and security boundaries.
 
-**Related:** [Full documentation](Documentation.md) · Feature guide: `docs/V341_FEATURE_GUIDE.md` (in the v3.41 release ZIP) · [Laua repository](https://github.com/Thegreatestprogrammerthatseverlived/laua) · [Website](https://laua.dev)
+**Related:** [Full documentation](Documentation.md) · [Keywords](KEYWORDS.md) · [Laua repository](https://github.com/Thegreatestprogrammerthatseverlived/laua) · [Website](https://laua.dev)

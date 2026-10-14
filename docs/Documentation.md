@@ -1,25 +1,25 @@
-# Laua Documentation — v3.41
+# Laua Documentation — v3.46
 
-Laua (*Lawah*) is a **source-to-source transpiler for Roblox Luau**. You write `.laua` files using ordinary Luau plus additional constructs; the transpiler produces `.luau` source for Roblox. Laua is **not** a separate Roblox game engine, virtual machine, or security sandbox.
+Laua (pronounced **lau-wuh**) is a **source-to-source transpiler for Roblox Luau**. You write `.laua` files using ordinary Luau plus additional constructs; the transpiler produces `.luau` source for Roblox. Laua is **not** a separate Roblox game engine, virtual machine, or security sandbox.
 
-**Version:** v3.41 — October 12, 2026. This reference is grounded in the v3.41 release ZIP's JavaScript transpiler, native Luau source, feature guide, tests, changelog, and handoff. The older v3.37 documentation does **not** cover all of this release's capabilities.
+**Version:** v3.46 — October 14, 2026. This reference is grounded in the v3.46 release sources, tests, changelog and validation report. Earlier v3.41 feature guides are historical; some described features were removed in this version.
 
-> **Verification boundary:** The release reports successful Node.js tests and JavaScript/website transpiler parity, plus Lua 5.3 **compatibility** smoke tests. The native Luau transpiler and generated output were **not executed in Roblox Studio** for the v3.41 release. Treat networking, cancellation, and runtime APIs as requiring Studio client/server verification before production use.
+> **Verification boundary:** The v3.46 release records 23 passing executable Node test scripts, JavaScript/website transpiler parity, and selected Lua 5.3 compatibility comparisons. **Native Luau transpiler execution in Roblox Studio was not verified.** Roblox networking, cancellation, and generated runtime behavior require their own Studio testing before production use.
 
-**Other references:** [Syntax quick reference](SYNTAX.md) · v3.41 feature guide (`docs/V341_FEATURE_GUIDE.md` in the release ZIP) · [Repository](https://github.com/Thegreatestprogrammerthatseverlived/laua) · [Playground](https://laua.dev)
+**Other references:** [Syntax quick reference](SYNTAX.md) · [Keyword inventory](KEYWORDS.md) · [Repository](https://github.com/Thegreatestprogrammerthatseverlived/laua) · [Playground](https://laua.dev)
 
 ## Table of contents
 
 1. [Install, transpile, and run](#1-install-transpile-and-run)
 2. [Transpiler targets and options](#2-transpiler-targets-and-options)
 3. [Classes, members, and inheritance](#3-classes-members-and-inheritance)
-4. [Property system, signals, and operators](#4-property-system-signals-and-operators)
+4. [Property system and managed fields](#4-property-system-and-managed-fields)
 5. [Namespaces, enums, modules, and exports](#5-namespaces-enums-modules-and-exports)
 6. [Async, await, defer, and using](#6-async-await-defer-and-using)
 7. [Expressions, functions, and collection helpers](#7-expressions-functions-and-collection-helpers)
 8. [Match and exhaustive match](#8-match-and-exhaustive-match)
 9. [Runtime schemas (v3.41)](#9-runtime-schemas-v341)
-10. [Networking contracts (v3.41)](#10-networking-contracts-v341)
+10. [Retired custom networking and Roblox events (v3.46)](#10-retired-custom-networking-and-roblox-events-v346)
 11. [Cancellation scopes (v3.41)](#11-cancellation-scopes-v341)
 12. [Multi-file project transpilation (v3.41)](#12-multi-file-project-transpilation-v341)
 13. [Source maps and error reporting (v3.41)](#13-source-maps-and-error-reporting-v341)
@@ -32,18 +32,18 @@ Laua (*Lawah*) is a **source-to-source transpiler for Roblox Luau**. You write `
 
 ## 1. Install, transpile, and run
 
-### 1.1 Obtain the v3.41 package
+### 1.1 Obtain the v3.46 package
 
-The release ZIP includes the transpilers, browser playground, manual Studio verification script, examples, tests, and `docs/V341_FEATURE_GUIDE.md`. In the repository or extracted release root:
+The v3.46 release ZIP includes native and JavaScript transpilers, the browser playground, a manual Studio verification harness, examples, and regression tests. The older `docs/V341_FEATURE_GUIDE.md` is historical and describes removed features; use these v3.46 docs instead. In the repository or extracted release root:
 
 | File | Purpose |
 | --- | --- |
 | `compiler.js` | Standalone JavaScript **transpiler** (historical filename; not a separate language runtime). |
-| `index.html` | Self-contained web playground with its own embedded JavaScript transpiler core; deployed as `playground.html` on the site. |
-| `transpiler.luau` | Native Luau ModuleScript transpiler, marked v3.41. Its v3.41 execution is **unverified**. |
+| `playground.html` | Preferred self-contained web playground with an embedded JavaScript transpiler core; `index.html` can be a hosting alias. |
+| `transpiler.luau` | Native Luau ModuleScript transpiler, marked v3.46. Native execution in Roblox Studio is **unverified**. |
 | `project-transpiler.cjs` | Opt-in multi-file transpilation, module checks, conservative cross-file diagnostics, and line maps. |
 | `Studio-Verification.luau` | Script for a developer to run in Roblox Studio; its presence is not proof of Studio validation. |
-| `docs/V341_FEATURE_GUIDE.md` | Detailed guide to the six new v3.41 additions. |
+| `docs/Documentation.md`, `docs/SYNTAX.md`, `docs/KEYWORDS.md` | Current v3.46 references. |
 | `tests/` | Regression, feature, stress, browser-parity, and compatibility-runtime checks. |
 
 You do **not** install a separate Laua virtual machine into your game. The transpiled `.luau` code is what Roblox executes.
@@ -95,13 +95,13 @@ local generated = Transpiler.Transpile(input, {Mode = "Development", OutputStyle
 print(generated)
 ```
 
-The snippet assumes your ModuleScript was named `Transpiler`. **This call produces source, not a new running Script**. Do not paste raw `class`, `schema`, or `network` declarations into a regular Script unless they have first been transpiled.
+The snippet assumes your ModuleScript was named `Transpiler`. **This call produces source, not a new running Script**. Do not paste raw `class` or `schema` declarations into a regular Script unless they have first been transpiled.
 
 **Native parity caution:** The release contains matching intended transformations in `transpiler.luau`, but running it and comparing exact results with JavaScript remains separate verification work.
 
 ### 1.4 Playground and project workflows
 
-The web playground at [laua.dev](https://laua.dev) contains the embedded transpiler and editing tools. In the v3.41 package the page is `index.html`; deploy it as `playground.html` if maintaining the existing site's route. It can transpile source in the browser without running Roblox game code.
+The web playground at [laua.dev](https://laua.dev) contains the embedded transpiler and editing tools. The preferred distributed page is `playground.html`; hosts that expect `index.html` need a corresponding entry point or routing configuration. It can transpile source in the browser without running Roblox game code.
 
 For multiple `.laua` files, use the opt-in project transpiler described in [section 12](#12-multi-file-project-transpilation-v341). The generated relative imports require a matching Roblox ModuleScript hierarchy; the project CLI does not itself deploy to the DataModel.
 
@@ -123,7 +123,7 @@ Invalid modes and output styles raise an error. Syntax checks still apply with `
 
 ### 2.2 Three implementation targets
 
-The v3.41 package has (1) a standalone JavaScript transpiler, (2) the JavaScript transpiler embedded in the web page, and (3) the independent native Luau transpiler. The standalone and embedded JavaScript cores were compared byte-for-byte by release tests. **That does not establish native Luau behavior or diagnostic parity.**
+The v3.46 package has (1) a standalone JavaScript transpiler, (2) the JavaScript transpiler embedded in the web page, and (3) the independent native Luau transpiler. The standalone and embedded JavaScript cores were compared byte-for-byte by release tests. **That does not establish native Luau behavior or diagnostic parity.**
 
 When changing language behavior, update and test every relevant target. A documentation-only change does not increment the transpiler version.
 
@@ -243,7 +243,7 @@ Supported operator symbols are translated to matching Luau metamethods: `+`, `-`
 
 ---
 
-## 4. Property system, signals, and operators
+## 4. Property system and managed fields
 
 ### 4.1 Getters, setters, lazy fields, and watchers
 
@@ -273,28 +273,19 @@ end
 
 The v3.38/v3.39 lowerings established per-instance lazy state and optimized away unused property machinery for simple class hierarchies. The feature set remains sensitive to Luau metatable semantics: a raw field that shadows a managed property can bypass `__newindex`. Test repeated writes, inheritance, lazy initialization failures, and side effects in Studio.
 
-### 4.2 Signals are local events
+### 4.2 Roblox events remain available
+
+Laua v3.46 removed its **custom class `signal` declaration**. This does not remove Roblox's event APIs; ordinary `RBXScriptSignal`, `BindableEvent`, and `RemoteEvent` usage works as usual:
 
 ```laua
-class DamageTracker
-    signal Damaged(amount: number, reason: string?)
-
-    function Damage(amount: number)
-        self.Damaged:Fire(amount, nil)
-    end
-end
-
-local tracker = new DamageTracker()
-local connection = tracker.Damaged:Connect(function(amount, reason)
-    print(amount, reason)
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+    if gameProcessed then return end
+    print(input.KeyCode)
 end)
-tracker:Damage(15)
-connection:Disconnect()
 ```
 
-Signals expose `:Connect`, `:Once`, `:Fire`, `:Wait`, and `:Destroy`; connected handles have `:Disconnect`. Signals are **pure-Luau per-instance events**, not RemoteEvents, BindableEvents, or third-party signal packages. `:Fire` schedules connected callbacks through task scheduling, so synchronous callback timing is not guaranteed.
-
-For **client/server** traffic, use the separate `network` feature in [section 10](#10-networking-contracts-v341) or ordinary Roblox RemoteEvents.
+No Laua-specific signal object is generated for this example. The playground can display expected callback parameter names/types from available Roblox API metadata. Those hints and the browser linter are **editor tooling**, not substitute security or runtime type guarantees.
 
 ---
 
@@ -510,16 +501,20 @@ These are Laua-recognized helper calls and lower to its embedded Core functional
 ### 7.5 Named memoization and limited inline substitution
 
 ```laua
-memo function Square(x)
+memo function Square(x: number): number
     return x * x
 end
+
+print(Square(4))
+memo.clear(Square) -- Clear Square only
+memo.clear()       -- Clear every memo cache in this script
 
 inline function AddOne(x)
     return x + 1
 end
 ```
 
-`memo` caches named-function results by arguments; it does not automatically invalidate or bound the cache, so avoid memoizing side-effectful or time-dependent functions. `inline` only specializes a restricted group of simple top-level functions; it does not inline arbitrary closures or complex bodies.
+`memo` caches named-function results by arguments. v3.46 adds `memo.clear(Fn)` to reset the cache of one memoized function and `memo.clear()` to reset all memo caches in the script. A specific target must be a memoized function. Clearing does **not** replace the function, limit cache growth, or automatically invalidate results when outside state changes. Avoid memoizing side-effectful or time-dependent operations. `inline` only specializes restricted simple top-level functions; it does not inline arbitrary closures or complex bodies.
 
 ### 7.6 Transpilation-time branches
 
@@ -662,99 +657,38 @@ Type validation **does not** check string lengths, quantity bounds, payload size
 
 ---
 
-## 10. Networking contracts (v3.41)
+## 10. Retired custom networking and Roblox events (v3.46)
 
-### 10.1 Define the contract
+### 10.1 Removed Laua language constructs
 
-```laua
-schema BuyRequest
-    ItemId: string
-    Quantity: number
-end
+The custom `network` contract and `signal` declarations, along with contextual `client_to_server` and `server_to_client`, are **not supported in v3.46**. Their dedicated runtime helper generation, keyword entries and autocomplete templates were removed. Laua does not reserve those names solely because an older version used them; they may be ordinary identifiers in valid expressions. The transpiler intentionally does **not** generate a migration warning or automatic replacement for old contract syntax.
 
-network Inventory
-    client_to_server function Buy(request: BuyRequest)
-    server_to_client signal Updated(items: {string})
-end
-```
+Do not use the `network Inventory ... end` or `signal Updated(...)` examples found in historical v3.41 documentation; they no longer describe the current release.
 
-A `network` block recognizes **one directional event declaration per line**. A current v3.41 issue affects returning the generated contract table from the same file: `return Inventory` can be incorrectly rejected by the default JavaScript semantic preflight as an unknown variable. To produce a ModuleScript with that return, transpile with `SemanticCheck: false` for the affected file, inspect the resulting Luau, and run Studio Script Analysis. Do **not** disable checking across unrelated files as a general solution. The `network` declaration itself transpiles under default options.
+### 10.2 Normal Roblox RemoteEvents and signals
 
-```laua
--- Place after the contract if returning it as a ModuleScript.
--- v3.41: requires the targeted SemanticCheck: false workaround.
-return Inventory
-```
-
-A contract declaration has **one directional event per line**:
-
-```text
-network ContractName
-    client_to_server function EventName(arg: Type, optional: Type?)
-    server_to_client signal EventName(arg: Type)
-end
-```
-
-Each event name must be unique within the block. Parameters use the same limited named type syntax as schema fields, including `{T}` and a trailing `?`. This is not a general RPC system with synchronous request/response values: both forms generate **RemoteEvent-based one-way messaging**.
-
-### 10.2 Generated API
-
-For the `Inventory` example, the generated table includes:
-
-| API | Where to call it | Result |
-| --- | --- | --- |
-| `Inventory.Bind(folder)` | Client and server (once each in their own execution context) | Finds and caches matching `RemoteEvent`s. |
-| `Inventory.SendBuy(request)` | Client | Calls the `Buy` RemoteEvent's `FireServer`. |
-| `Inventory.OnBuy(callback)` | Server | Returns an `RBXScriptConnection` to `OnServerEvent`. Callback receives `(player, request)`. |
-| `Inventory.SendUpdated(player, items)` | Server | Calls the `Updated` RemoteEvent's `FireClient`. |
-| `Inventory.OnUpdated(callback)` | Client | Returns an `RBXScriptConnection` to `OnClientEvent`. Callback receives `(items)`. |
-
-**Before use, create the RemoteEvents yourself**: the folder passed to `Bind` must already contain `Buy` and `Updated`, both instances of `RemoteEvent`. `Bind` waits for these children and checks their class. It caches references on the generated contract table; send/listen functions do **not** repeat `WaitForChild` on each invocation. The transpiler does not automatically create Roblox Instances, establish server/client scripts, or replicate generated files.
-
-### 10.3 Minimal usage pattern
-
-Transpile a module containing the `network` declaration and have both execution sides require the generated module through a matching Roblox hierarchy.
-
-**Server-side pseudocode using the generated module:**
+Use ordinary Roblox APIs. For example, assuming an existing `RemoteEvent` named `InventoryRemote` in `ReplicatedStorage`:
 
 ```luau
-local Inventory = require(script.Parent.Inventory)
-local folder = game:GetService("ReplicatedStorage"):WaitForChild("InventoryRemotes")
-Inventory.Bind(folder)
+-- Server Script
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local remote = ReplicatedStorage:WaitForChild("InventoryRemote")
 
-Inventory.OnBuy(function(player, request)
-    -- REQUIRED: server-side checks for ownership, pricing, balance,
-    -- item existence, quantity bounds, and rate limiting.
-    print(player, request.ItemId, request.Quantity)
+remote.OnServerEvent:Connect(function(player, itemId)
+    if typeof(itemId) ~= "string" then return end
+    -- Validate permissions, price, ownership and rate limits on the server.
+    print(player, itemId)
 end)
 ```
 
-**Client-side pseudocode using the generated module:**
-
 ```luau
-local Inventory = require(script.Parent.Inventory)
-local folder = game:GetService("ReplicatedStorage"):WaitForChild("InventoryRemotes")
-Inventory.Bind(folder)
-Inventory.SendBuy({ItemId = "Sword", Quantity = 1})
+-- LocalScript
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local remote = ReplicatedStorage:WaitForChild("InventoryRemote")
+remote:FireServer("Sword")
 ```
 
-The pseudocode assumes the folder, remote children, and ModuleScript already exist and are replicated to the client. The actual `require` path must match your project. Do not share authority-sensitive client state with the server without validating it.
-
-### 10.4 What is validated—and what is not
-
-The **incoming** event listener checks parameter types and ignores a payload that fails its declared predicate. **Module return caveat:** `return Inventory` is affected by the current JavaScript preflight limitation documented in section 10.1; the client/server ModuleScript examples below assume you've transpiled a module that successfully returns this table. The sending wrapper emits Luau type annotations, but that is **not** a trustworthy boundary: an exploiter can invoke the underlying RemoteEvent directly. A valid number could still be negative, infinitely large, unaffordable, or unauthorized.
-
-Server handlers must independently validate:
-
-1. Identity and permissions based on the Roblox-supplied `player`, not a client claim.
-2. Payload shape **and** numeric/string limits (finite values, positive quantities, maximum sizes).
-3. Inventory/account state and prices from trusted server data.
-4. Cooldowns, rate limits, and replay/duplicate-action behavior.
-5. Existence and ownership of referenced items or objects.
-
-`network` is currently experimental until live Roblox client/server behavior has been tested. `OnBuy` and `OnUpdated` are different environments; invoking the wrong generated `Send...` method in the wrong environment results in a Roblox API error.
-
----
+This is standard Roblox Luau, not new Laua syntax. Laua's API-aware autocomplete and linting may suggest the events, but full API completion depends on a successfully loaded Roblox API database. Client input is untrusted: types alone do not authorize a purchase or prevent abuse.
 
 ## 11. Cancellation scopes (v3.41)
 
@@ -871,7 +805,7 @@ For errors, the project tool uses codes such as `LAUA_IMPORT_NOT_FOUND`, `LAUA_I
 
 A project build emits line-based maps under names such as `main.luau.map.json`. A generated line is mapped only if it matches a source line **exactly**, is not ambiguous, and preserves source order. Synthesized or transformed lines are deliberately `null` rather than being assigned an invented source line.
 
-This conservative approach is especially important for code expanded from `class`, `network`, `schema`, and other Laua constructs. A single Laua line can become many Luau lines; v3.41 does **not** supply reliable character-level maps of such generated regions.
+This conservative approach is especially important for code expanded from `class`, `schema`, and other Laua constructs. A single Laua line can become many Luau lines; the current project tool does **not** supply reliable character-level maps of such generated regions.
 
 ### 13.2 Mapping APIs
 
@@ -900,11 +834,10 @@ In v3.40, semantic diagnostics were expanded to include selected typed fields, a
 
 ### 14.1 Existing optimizations
 
-Laua v3.41 retains several optimizations from earlier releases:
+Laua v3.46 retains optimizations from earlier releases and adds the v3.45 class-output changes:
 
-- **No unused runtime families:** core/signal/async helpers are generated only when the source actually requires them, with selective helper insertion where supported.
-- **Compact class lowering:** Simple classes and class hierarchies that have no managed property requirements avoid generating the full getter/setter/lazy/watch metatable machinery.
-- **Networking handle caching:** `RemoteEvent`s are found and checked at `Bind`, rather than on every send/listen call.
+- **No unused runtime families:** shared core and async helpers are injected only when source code requires them, with selective helper insertion where supported.
+- **Feature-selective class lowering (v3.45):** Classes and known inheritance chains only emit getter, setter, lazy, watcher, abstract and final infrastructure when required. Inherited accessors retain needed dispatch; unknown/external parent types use conservative behavior.
 - **Static exhaustive checks:** `match exhaustive` requires no extra runtime helper beyond existing match lowering.
 - **Cancellation helper injection:** `cancelScope()` helper code is only emitted when its call syntax is used.
 - **Conservative output formatting:** `OutputStyle: 'Compact'` removes selected unnecessary whitespace/comments, not arbitrary syntax.
@@ -913,7 +846,7 @@ Do not remove class field initializers simply because a later constructor assign
 
 ### 14.2 Benchmark interpretation
 
-The v3.41 package includes `benchmark-v341-results.json` and test scripts for synthetic source size/timing. The release records transpilation of a 100,000-line synthetic program in the JavaScript environment, but those results only measure **transpilation throughput**. They do **not** establish Roblox client/server runtime speed or memory usage for generated code.
+The package includes benchmark output files and test scripts for synthetic source size/timing. The release records transpilation of a 100,000-line synthetic program in the JavaScript environment, but those results only measure **transpilation throughput**. They do **not** establish Roblox client/server runtime speed or memory usage for generated code.
 
 Use `compilationStats(input, output)` for source/output byte and line comparisons. Benchmark representative real projects separately, and compare behavior before optimizing code with side effects.
 
@@ -921,20 +854,15 @@ Use `compilationStats(input, output)` for source/output byte and line comparison
 
 ## 15. Static diagnostics and limitations
 
-### 15.1 `const` and known preflight gaps
+### 15.1 `const` and semantic preflight notes
 
-`const` is present in Laua's syntax word list and is recognized in some semantic/annotation and early-return handling. **However, this precise v3.41 standalone JavaScript behavior was verified against the packaged file:**
+The v3.46 editor includes `const` in its syntax registry and applies selected reassignment lint checks. The standalone transpiler preserves some `const` declarations in the emitted source; it does **not** replace those tokens with `local`. Because the native Studio execution and complete `const` semantics were not verified in this release, review the output with the target Luau tooling rather than equating syntax highlighting or linting with guaranteed runtime enforcement.
 
-```laua
-const MAX_HEALTH = 100
-print(MAX_HEALTH)
-```
+Likewise, the browser and JavaScript semantic passes are conservative, not a complete control-flow or whole-project type checker. `SemanticCheck: false` can bypass selected semantic preflight errors; it does not fix invalid grammar or guarantee runnable generated Luau. Do not disable it as a blanket workaround in production.
 
-The emitted JavaScript-transpiler output **still contains** `const MAX_HEALTH = 100`. Since plain `const` is not ordinary Luau declaration syntax, the current package does **not** establish a complete, deployable constant declaration lowering/immutability guarantee. Do not rely on it for generated Roblox Scripts until repaired and tested across targets. This is a documented implementation discrepancy, not a recommendation to drop the planned `const` feature.
+**v3.46 class diagnostics:** Statically resolved instance-method calls require receiver forwarding (`object:Method()` or `object.Method(object)`); omitting `self` with `object.Method()` raises a diagnostic. Known inherited getter/setter-versus-method collisions also produce errors. Some dynamic aliases and runtime-only class relationships remain beyond these checks.
 
-The same preflight can misclassify `return Inventory` (and some other direct references) following a `network` declaration because the generated binding has not been incorporated into its symbol scan.
-
-Likewise, the v3.41 JavaScript semantic preflight may still diagnose an otherwise recognized `@nolint("UnusedLocal")` form as an unknown `nolint` call. `SemanticCheck: false` can permit the later syntax rewrite, but also relaxes other valuable diagnostics. Use it only as an isolated workaround and verify output.
+**v3.46 reserved identifiers:** The source rejects user bindings that collide with generated runtime names such as `Promise`, `Promises`, `LauaPromiseStatus`, `LauaPackedValues`, `LauaPromiseState`, `LauaCore`, and `__laua`-prefixed names. Rename those bindings; this policy is specific to the current implementation.
 
 ### 15.2 Known syntax boundaries
 
@@ -943,7 +871,7 @@ The current transpiler combines token-aware validation with source-level transfo
 - Deeply nested/ambiguous expression forms and unusual long literals can expose transformation or analysis gaps.
 - `match` cannot produce a value as a general expression; exhaustive checking is limited to known enum/boolean cases.
 - Schema declarations do not have unions/maps/defaults/generics or built-in range/size checks.
-- Networking contracts do not create RemoteEvents, generate full request/response RPC, or enforce server authorization.
+- Custom `network` and `signal` declarations were removed in v3.46; use Roblox APIs directly.
 - `cancelScope()` does not automatically track every async/await operation.
 - Source maps omit rewritten lines and have no full column-level mapping.
 - Project-wide analysis doesn't completely resolve complex module scopes, imports, or types.
@@ -964,12 +892,17 @@ Do not infer a feature's existence from another language's syntax or from a play
 
 ### 16.1 Run the release suites
 
-From the extracted v3.41 release root:
+From the extracted v3.46 release root:
 
 ```sh
 node --check compiler.js
 node --check project-transpiler.cjs
 node tests/release-integrity.cjs
+node tests/feature-retirement-v346.cjs
+node tests/class-calls-v346.cjs
+node tests/memo-and-reserved-v346.cjs
+node tests/lean-class-v345.cjs
+node tests/nested-auto-end-v345.cjs
 node tests/features-v341.cjs
 node tests/stress-v341.cjs
 node tests/runtime-v341.cjs
@@ -986,23 +919,20 @@ node tests/expanded-stress.cjs
 
 `tests/runtime-v341.cjs` uses the `luatex` executable for **Lua 5.3 compatibility runtime tests**; it is optional when that executable is unavailable. Those tests are not native Luau/Studio execution.
 
-### 16.2 Reported release results
+### 16.2 Recorded v3.46 verification
 
-The shipped `V341_VALIDATION.md` records:
+The v3.46 package's `V346_VALIDATION.md` reports:
 
-| Suite | Reported result |
-| --- | --- |
-| New v3.41 feature/project/fuzz/browser tests | **555** checks |
-| Scaled stress suite | **2,112** checks |
-| v3.40 semantic regressions | **172** |
-| v3.39 correctness regressions | **800** |
-| Inheritance regressions | **537** |
-| Deep inheritance regressions | **34** |
-| v3.37 targeted tests | **438** |
-| Earlier semantic regressions | **737** |
-| Expanded stress suite | **4,249** |
+| Test group | Recorded result |
+| --- | ---: |
+| Executable Node test scripts | **23 passed** |
+| Expanded transpiler stress cases | **4,249 / 4,249** |
+| Custom keyword retirement checks | **62** |
+| Class-call, inherited accessor collision and location assertions | **1,738** |
+| Memo-cache clearing and reserved-name assertions | **645** |
+| Cross-feature diagnostic assertions | **8,683** |
 
-Also tested in the release: a 200-file project graph, 220-schema source, 1,000 generated schema cases, enum-exhaustiveness fuzzing, a set of isolated invalid cases, and JavaScript/website core identity. Compatible Lua 5.3 smoke tests covered schema fields, mocked RemoteEvents and cancellation behavior. These results are **release records**; they do not certify all combinations, native Luau parity, or Roblox Studio execution.
+The package also records JavaScript/website transpiler parity and HTML inline-script syntax checks. These are **recorded automated test results**, not a claim of full native Luau or Roblox Studio execution parity. Historic test filenames such as `features-v341.cjs` remain, but obsolete feature assertions have been updated.
 
 ### 16.3 Native Studio validation remains necessary
 
@@ -1010,9 +940,9 @@ Before shipping a generated game module:
 
 1. Transpile the same fixtures with standalone JavaScript and the **native** ModuleScript; compare semantics and diagnostics.
 2. Run Roblox Studio **Script Analysis** on generated Scripts and ModuleScripts.
-3. Test inherited properties, async cleanup, optional access, and network contracts inside actual server and client contexts.
-4. Test remote payloads from an intentionally untrusted client, including wrong types, negative/extreme values, repeated calls and unauthorized requests.
-5. Verify ModuleScript paths, existing RemoteEvent names, `Bind` timing, and connection cleanup.
+3. Test inherited properties, async cleanup, optional access, memo caches and class-call validation on representative generated code.
+4. Independently test ordinary Roblox RemoteEvents from untrusted clients, including wrong types, negative/extreme values, repeated calls and unauthorized requests.
+5. Verify ModuleScript `require` paths, event names, and connection cleanup manually in Studio.
 6. Run generated output under representative real-game workloads; compare size, memory, and runtime behavior.
 
 Do not describe a feature as Studio-verified until it has actually been run there.
@@ -1023,15 +953,23 @@ Do not describe a feature as Studio-verified until it has actually been run ther
 
 ### “The source transpiles, but Roblox reports a syntax error”
 
-Inspect the generated `.luau`, not only the original `.laua`. Run Studio Script Analysis. Source-level transformations may emit unsupported patterns; the current JavaScript package also has a documented plain `const` lowering gap. If possible, build a minimal reproduction and record both the source and output.
+Inspect the generated `.luau`, not only the original `.laua`. Run Studio Script Analysis. Source-level transformations may emit unsupported patterns; review preserved syntax such as `const` against the target toolchain. If possible, build a minimal reproduction and record both the source and output.
 
-### “My `network` listener never fires”
+### “Why isn't custom `network` or `signal` syntax recognized?”
 
-Check that you made a **RemoteEvent** with the exact event name, placed it inside the folder passed to `Bind` on both sides, called the appropriate `On...` function in the correct client/server context, and did not discard/disconnect the returned connection. An invalid typed payload is ignored by the generated receiving wrapper. Also verify actual replication and `require` locations in Studio.
+Those Laua features were retired in v3.46. Use standard Roblox `RemoteEvent`, `BindableEvent`, and `RBXScriptSignal` APIs. Older v3.41 examples do not apply to this release.
+
+### “Why is `obj.Move()` rejected?”
+
+An instance method expects `self`; call `obj:Move()` or supply it explicitly as `obj.Move(obj)`. A static class method is different and can use `Class.Method()` without an instance receiver.
+
+### “How do I clear cached `memo` results?”
+
+Call `memo.clear(MyMemoizedFunction)` to clear one cache, or `memo.clear()` to clear all memoized caches in the same script. Clearing a cache keeps the function callable and its next call recomputes results.
 
 ### “Why did my schema accept an unexpected field?”
 
-Extra keys are intentionally accepted by v3.41 `schema`. Add your own strict allowed-key and domain-specific validation when needed. A valid type does not imply an authorized action.
+Extra keys are intentionally accepted by the current `schema` implementation. Add your own strict allowed-key and domain-specific validation when needed. A valid type does not imply an authorized action.
 
 ### “Why doesn't cancellation stop all my async work?”
 
@@ -1051,4 +989,4 @@ Keep the `.laua` files in version control, deploy only generated `.luau` to exec
 
 ---
 
-**Next development version:** v3.42 (unless Laua undergoes a separately agreed major rework). This documentation update describes **v3.41** and does not itself change the transpiler implementation or version.
+**Current documented release:** v3.46. **Next regular update:** v3.47. This documentation update does not itself modify any transpiler implementation.
