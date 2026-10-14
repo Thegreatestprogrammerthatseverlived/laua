@@ -1,6 +1,6 @@
-local Transpiler = {Version = "3.44"}
+local Transpiler = {Version = "3.46"}
 
--- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
+-- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
 local LAUA_ASYNC_RUNTIME_SOURCE = [====[
 type LauaPromiseStatus = "Pending" | "Fulfilled" | "Rejected"
@@ -212,7 +212,7 @@ function LauaCore.memo(callback: (...any) -> ...any): (...any) -> ...any
     local root: {[any]: any} = {}
     local nilKey = {}
     local terminal = {}
-    return function(...)
+    local wrapped = function(...)
         local node: {[any]: any} = root
         for index = 1, select("#", ...) do
             local key = select(index, ...)
@@ -234,6 +234,28 @@ function LauaCore.memo(callback: (...any) -> ...any): (...any) -> ...any
         end
         return table.unpack(cached, 1, cached.n)
     end
+    if LauaCore._memoResets == nil then
+        LauaCore._memoResets = setmetatable({}, {__mode = "k"})
+    end
+    LauaCore._memoResets[wrapped] = function()
+        root = {}
+    end
+    return wrapped
+end
+
+-- Clear one memoized function or every memo cache in this script.
+-- Clearing resets the cache, not the memoized function's identity.
+function LauaCore.clearMemo(callback: ((...any) -> ...any)?): boolean
+    local resets = LauaCore._memoResets
+    if resets == nil then return false end
+    if callback ~= nil then
+        local reset = resets[callback]
+        if reset == nil then error("memo.clear expects a memoized function", 2) end
+        reset()
+        return true
+    end
+    for _, reset in resets do reset() end
+    return true
 end
 
 LauaCore.table = {}
@@ -287,175 +309,6 @@ function LauaCore.lazyModule(resolve: () -> any): any
 end
 
 return LauaCore
-]====]
-
-local LAUA_SIGNAL_RUNTIME_SOURCE = [====[
-type LauaSignalConnection = {
-    Connected: boolean,
-    Disconnect: (LauaSignalConnection) -> (),
-    _owner: LauaSignalState?,
-    _callback: ((...any) -> ())?,
-    _once: boolean,
-    _next: LauaSignalConnection?,
-    _prev: LauaSignalConnection?,
-}
-
-type LauaSignalState = {
-    _head: LauaSignalConnection?,
-    _tail: LauaSignalConnection?,
-    _waiters: {thread},
-    _retired: {LauaSignalConnection},
-    _dispatchDepth: number,
-    _destroyed: boolean,
-    _types: {string}?,
-}
-
-local Signal: any = {}
-Signal.__index = Signal
-
-local function disconnect(self: LauaSignalConnection)
-    if not self.Connected then return end
-    self.Connected = false
-    local owner = self._owner
-    self._owner = nil
-    self._callback = nil
-    if not owner then return end
-
-    local previous = self._prev
-    local following = self._next
-    if previous then previous._next = following else owner._head = following end
-    if following then following._prev = previous else owner._tail = previous end
-    self._prev = nil
-
-    -- A Fire may still be walking this connection. Preserve its next link
-    -- until the outermost dispatch completes, then release the reference.
-    if owner._dispatchDepth > 0 then
-        table.insert(owner._retired, self)
-    else
-        self._next = nil
-    end
-end
-
-function Signal.new(typeNames: {string}?)
-    local state: LauaSignalState = {
-        _head = nil,
-        _tail = nil,
-        _waiters = {},
-        _retired = {},
-        _dispatchDepth = 0,
-        _destroyed = false,
-        _types = typeNames,
-    }
-    return setmetatable(state, Signal)
-end
-
-function Signal.Connect(self: LauaSignalState, callback: (...any) -> (), once: boolean?): LauaSignalConnection
-    assert(not self._destroyed, "Cannot connect to a destroyed signal")
-    assert(type(callback) == "function", "Connect expects a function")
-    local previous = self._tail
-    local connection: LauaSignalConnection = {
-        Connected = true,
-        Disconnect = disconnect,
-        _owner = self,
-        _callback = callback,
-        _once = once == true,
-        _next = nil,
-        _prev = previous,
-    }
-    if previous then previous._next = connection else self._head = connection end
-    self._tail = connection
-    return connection
-end
-
-function Signal.Once(self: LauaSignalState, callback: (...any) -> ()): LauaSignalConnection
-    return Signal.Connect(self, callback, true)
-end
-
-function Signal.Fire(self: LauaSignalState, ...)
-    assert(not self._destroyed, "Cannot fire a destroyed signal")
-    local types = self._types
-    if types then
-        assert(select("#", ...) == #types, "Signal argument count mismatch")
-        for index, name in types do
-            local value = select(index, ...)
-            local optional = name:sub(-1) == "?"
-            local typeName = optional and name:sub(1, -2) or name
-            if value ~= nil or not optional then
-                local actualType = typeof(value)
-                if actualType ~= typeName then
-                    if not (actualType == "Instance" and (value :: Instance):IsA(typeName)) then
-                        error("Signal expected " .. typeName .. " at argument " .. index, 2)
-                    end
-                end
-            end
-        end
-    end
-
-    -- Capture only pre-existing waiters. A listener that starts waiting
-    -- during this Fire must wait for the next Fire, not this one.
-    local waiters: {thread}? = nil
-    if #self._waiters > 0 then
-        waiters = self._waiters
-        self._waiters = {}
-    end
-
-    -- Snapshot the current tail so listeners added during this Fire don't
-    -- receive the already-in-progress event. No listener array is allocated.
-    local node = self._head
-    local last = self._tail
-    self._dispatchDepth += 1
-    while node do
-        local following = node._next
-        if node.Connected then
-            local callback = node._callback
-            if node._once then node:Disconnect() end
-            if callback then task.spawn(callback, ...) end
-        end
-        if node == last then break end
-        node = following
-    end
-    self._dispatchDepth -= 1
-    if self._dispatchDepth == 0 then
-        for _, removed in self._retired do removed._next = nil end
-        table.clear(self._retired)
-    end
-
-    -- Waiters are one-shot. This branch allocates nothing when unused.
-    if waiters then
-        for _, thread in waiters do task.spawn(thread, true, ...) end
-    end
-end
-
-function Signal.Wait(self: LauaSignalState)
-    assert(not self._destroyed, "Cannot wait on a destroyed signal")
-    local current = coroutine.running()
-    assert(current, "Signal:Wait requires a running coroutine")
-    table.insert(self._waiters, current)
-    local result = table.pack(coroutine.yield())
-    if not result[1] then error("Signal destroyed while waiting", 2) end
-    return table.unpack(result, 2, result.n)
-end
-
-function Signal.Destroy(self: LauaSignalState)
-    if self._destroyed then return end
-    self._destroyed = true
-    local node = self._head
-    while node do
-        local following = node._next
-        node:Disconnect()
-        node = following
-    end
-    self._head = nil
-    self._tail = nil
-    self._types = nil
-    if #self._waiters > 0 then
-        local waiters = self._waiters
-        self._waiters = {}
-        for _, thread in waiters do task.spawn(thread, false) end
-    end
-end
-
-return Signal
 ]====]
 
 
@@ -552,7 +405,7 @@ end
 
 local function blockStart(line: string): boolean
     if line:match("^abstract%s+class%s+") or line:match("^final%s+class%s+") or line:match("^class%s+") then return true end
-    if line:match("^namespace%s+") or line:match("^return%s+namespace%s+") or line:match("^enum%s+") or line:match("^match%s+") or line:match("^schema%s+") or line:match("^network%s+") then return true end
+    if line:match("^namespace%s+") or line:match("^return%s+namespace%s+") or line:match("^enum%s+") or line:match("^match%s+") or line:match("^schema%s+") then return true end
     if line:match("^constructor%s*%(") or line:match("^defer%s*$") or line:match("^operator%s+") or line:match("^watch%s+[%a_][%w_]*%s*%(") then return true end
     if line:match("^async%s+function%s+") or line:match("^local%s+async%s+function%s+") then return true end
     if line:match("^get%s+[%a_][%w_]*%s*%(") or line:match("^set%s+[%a_][%w_]*%s*%(") then return true end
@@ -796,6 +649,9 @@ local LAUA_METHOD_KINDS = {"async function", "function", "get", "set"}
 local function transpileClasses(source: string): string
     local allocationRequirements: {[string]: {Values: boolean, Initialized: boolean}} = {}
     local hookFreeClasses: {[string]: boolean} = {}
+    local featureRequirements: {[string]: {Getters: boolean, Setters: boolean, Lazy: boolean, Watchers: boolean}} = {}
+    local finalMethodRequirements: {[string]: boolean} = {}
+    local finalClassFlags: {[string]: boolean} = {}
     local searchFrom = 1
     while true do
         local start = findKeyword(source, "class", nil, searchFrom)
@@ -823,7 +679,7 @@ local function transpileClasses(source: string): string
         local body = source:sub(headerEnd + 1, closing.Start - 1)
         local lines = splitLines(body)
         local blockLines = splitLines(maskNonCode(body))
-        local fields, statics, methods, getters, setters, operators, signals, lazies, watchers = {}, {}, {}, {}, {}, {}, {}, {}, {}
+        local fields, statics, methods, getters, setters, operators, lazies, watchers = {}, {}, {}, {}, {}, {}, {}, {}
         local attributes = {}
         local names = {}
         local ctor = nil
@@ -900,24 +756,6 @@ local function transpileClasses(source: string): string
                 if names[lazyName] or lazies[lazyName] then error(`Duplicate member '{lazyName}'`) end
                 names[lazyName] = true
                 lazies[lazyName] = lazyValue
-                index += 1
-                continue
-            end
-            local signalName, signalParams = remainder:match("^signal%s+([%a_][%w_]*)%s*%(([^)]*)%)$")
-            if not signalName then signalName = remainder:match("^signal%s+([%a_][%w_]*)$") end
-            if signalName then
-                if names[signalName] then error(`Duplicate class member '{signalName}'`) end
-                if next(modifiers) then error("Signals cannot have modifiers") end
-                names[signalName] = true
-                local types = {}
-                if signalParams and trim(signalParams) ~= "" then
-                    for part in signalParams:gmatch("[^,]+") do
-                        local typeName = trim(part):match("^[%a_][%w_]*%s*:%s*([%a_][%w_]*%??)$")
-                        if not typeName then error("Signals require typed named parameters") end
-                        table.insert(types,'"' .. typeName .. '"')
-                    end
-                end
-                table.insert(signals, {Name = signalName, Types = #types > 0 and ("{" .. table.concat(types, ", ") .. "}") or nil})
                 index += 1
                 continue
             end
@@ -1027,6 +865,21 @@ local function transpileClasses(source: string): string
         allocationRequirements[name] = {Values = needsValues, Initialized = needsInitialized}
         local hookFree = #getters == 0 and #setters == 0 and next(lazies) == nil and next(watchers) == nil and (base == nil or hookFreeClasses[base] == true)
         hookFreeClasses[name] = hookFree
+        -- Only emit metadata and dispatch handlers used by known inheritance chains.
+        -- Preserve full hooks for unknown/external base classes.
+        local inheritedFeatures = base and featureRequirements[base] or nil
+        local unknownBase = base ~= nil and inheritedFeatures == nil
+        local usesGetters = #getters > 0 or unknownBase or (inheritedFeatures ~= nil and inheritedFeatures.Getters)
+        local usesSetters = #setters > 0 or unknownBase or (inheritedFeatures ~= nil and inheritedFeatures.Setters)
+        local usesLazy = next(lazies) ~= nil or unknownBase or (inheritedFeatures ~= nil and inheritedFeatures.Lazy)
+        local usesWatchers = next(watchers) ~= nil or unknownBase or (inheritedFeatures ~= nil and inheritedFeatures.Watchers)
+        featureRequirements[name] = {Getters = usesGetters, Setters = usesSetters, Lazy = usesLazy, Watchers = usesWatchers}
+        local parentFinalMethods = base ~= nil and (finalMethodRequirements[base] == nil or finalMethodRequirements[base])
+        local needsFinalMethods = parentFinalMethods
+        for _, method in methods do if method.Final then needsFinalMethods = true end end
+        finalMethodRequirements[name] = needsFinalMethods
+        local checkFinalParent = base ~= nil and finalClassFlags[base] ~= false
+        finalClassFlags[name] = prefix == "final"
 
         -- A plain class does not need getter, setter, watcher, or lazy-property hooks.
         -- Keep __init so later subclasses can safely call the parent initializer.
@@ -1041,7 +894,6 @@ local function transpileClasses(source: string): string
             for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
             table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
-            for _, item in signals do table.insert(simple, `    self.{item.Name} = __lauaSignal.new({item.Types or ""})`) end
             local simpleCtor = normalized(transpileSource(ctorBody), "    ")
             if simpleCtor ~= "" then table.insert(simple, simpleCtor) end
             table.insert(simple, "end")
@@ -1071,30 +923,31 @@ local function transpileClasses(source: string): string
         if hookFree then
             local simple = {}
             if base then
-                table.insert(simple, `if {base}.__final then error("Cannot extend final class '{base}'") end`)
+                if checkFinalParent then table.insert(simple, `if {base}.__final then error("Cannot extend final class '{base}'") end`) end
                 table.insert(simple, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
             else
                 table.insert(simple, "local " .. name .. ": {[string]: any} = {}")
             end
             table.insert(simple, `{name}.__index = {name}`)
-            table.insert(simple, `{name}.__abstract = {tostring(prefix == "abstract")}`)
-            table.insert(simple, `{name}.__final = {tostring(prefix == "final")}`)
-            local finalEntries = {}
-            for _, method in methods do
-                if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
+            if prefix == "abstract" then table.insert(simple, `{name}.__abstract = true`) end
+            if prefix == "final" then table.insert(simple, `{name}.__final = true`) end
+            if needsFinalMethods then
+                local finalEntries = {}
+                for _, method in methods do
+                    if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
+                end
+                local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
+                table.insert(simple, `{name}.__finalMethods = {base and "setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})" or finalTable}`)
             end
-            local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
-            table.insert(simple, `{name}.__finalMethods = {base and "setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})" or finalTable}`)
             for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
             table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             if parentInit then table.insert(simple, "    " .. parentInit) end
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
-            for _, item in signals do table.insert(simple, `    self.{item.Name} = __lauaSignal.new({item.Types or ""})`) end
             local init = normalized(transpileSource(ctorBody), "    ")
             if init ~= "" then table.insert(simple, init) end
             table.insert(simple, "end")
             table.insert(simple, `function {name}.new(...: any): any`)
-            table.insert(simple, `    if {name}.__abstract then error("Cannot instantiate abstract class '{name}'") end`)
+            if prefix == "abstract" then table.insert(simple, `    error("Cannot instantiate abstract class '{name}'")`) end
             table.insert(simple, `    local self: any = setmetatable({}, {name})`)
             table.insert(simple, `    {name}.__init(self, ...)`)
             table.insert(simple, "    return self")
@@ -1106,7 +959,7 @@ local function transpileClasses(source: string): string
                 table.insert(simple, "end")
             end
             for _, method in methods do
-                if base then table.insert(simple, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
+                if base and parentFinalMethods then table.insert(simple, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
                 local methodBody = base and replaceSuper(method.Body, base, not method.Static) or method.Body
                 if maskNonCode(methodBody):find("super%s*%(") then error("super(...) can only be called in constructors") end
                 methodBody = normalized(transpileSource(methodBody), "    ")
@@ -1124,82 +977,80 @@ local function transpileClasses(source: string): string
 
         local generated = {}
         if base then
-            table.insert(generated, `if {base}.__final then error("Cannot extend final class '{base}'") end`)
+            if checkFinalParent then table.insert(generated, `if {base}.__final then error("Cannot extend final class '{base}'") end`) end
             table.insert(generated, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
         else
             table.insert(generated, "local " .. name .. ": {[string]: any} = {}")
         end
-        table.insert(generated, `{name}.__final = {tostring(prefix == "final")}`)
-        table.insert(generated, `{name}.__abstract = {tostring(prefix == "abstract")}`)
-        local finalEntries = {}
-        for _, method in methods do
-            if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
-        end
-        local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
-        local finalMethods = base and ("setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})") or finalTable
-        table.insert(generated, `{name}.__finalMethods = {finalMethods}`)
-        table.insert(generated, name .. ".__getters = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__getters or {}})") or "{}"))
-        table.insert(generated, name .. ".__setters = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__setters or {}})") or "{}"))
-        table.insert(generated, name .. ".__lazy = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__lazy or {}})") or "{}"))
-        table.insert(generated, name .. ".__watchers = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__watchers or {}})") or "{}"))
-        table.insert(generated, name .. ".__watchedFields = " .. (base and ("setmetatable({}, {__index = " .. base .. ".__watchedFields or {}})") or "{}"))
-        for watchName in watchers do table.insert(generated, `{name}.__watchedFields["{watchName}"] = true`) end
-        table.insert(generated, `{name}.__index = function(self: any, key: any)`)
-        table.insert(generated, `    local getter: ((any) -> any)? = {name}.__getters[key]`)
-        table.insert(generated, `    if getter then return getter(self) end`)
-        table.insert(generated, `    local lazy: ((any) -> any)? = {name}.__lazy[key]`)
-        table.insert(generated, `    if lazy then`)
-        table.insert(generated, `        if not self.__lauaInitialized[key] then`)
-        table.insert(generated, `            self.__lauaInitialized[key] = true`)
-        table.insert(generated, `            local ok, value = pcall(lazy, self)`)
-        table.insert(generated, `            if not ok then self.__lauaInitialized[key] = nil; error(value, 0) end`)
-        table.insert(generated, `            self.__lauaValues[key] = value`)
-        table.insert(generated, `        end`)
-        table.insert(generated, `        return self.__lauaValues[key]`)
-        table.insert(generated, `    end`)
-        table.insert(generated, `    if {name}.__watchedFields[key] then return self.__lauaValues[key] end`)
-        table.insert(generated, `    return {name}[key]`)
-        table.insert(generated, `end`)
-        table.insert(generated, `{name}.__newindex = function(self: any, key: any, value: any)`)
-        table.insert(generated, `    local setter: ((any, any) -> ())? = {name}.__setters[key]`)
-        table.insert(generated, `    if setter then setter(self, value); return end`)
-        table.insert(generated, `    if {name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end`)
-        table.insert(generated, `    if {name}.__watchedFields[key] or {name}.__lazy[key] then`)
-        table.insert(generated, `        local oldValue = self.__lauaValues[key]`)
-        table.insert(generated, `        if {name}.__lazy[key] and not self.__lauaInitialized[key] then self.__lauaInitialized[key] = true end`)
-        table.insert(generated, `        self.__lauaValues[key] = value`)
-        table.insert(generated, `        local watcher: ((any, any, any) -> ())? = {name}.__watchers[key]`)
-        table.insert(generated, `        if watcher and oldValue ~= value then watcher(self, oldValue, value) end`)
-        table.insert(generated, `        return`)
-        table.insert(generated, `    end`)
-        table.insert(generated, `    rawset(self, key, value)`)
-        table.insert(generated, `end`)
-        if not base and next(lazies) == nil and next(watchers) == nil then
-            -- No lazy or watched state: don't check these metadata tables per access.
-            local readStart = `{name}.__index = function(self: any, key: any)`
-            local writeStart = `{name}.__newindex = function(self: any, key: any, value: any)`
-            local startRead, startWrite, endWrite = nil, nil, nil
-            for position, line in generated do
-                if line == readStart then startRead = position end
-                if line == writeStart then startWrite = position end
-                if startWrite and position > startWrite and line == "end" then endWrite = position; break end
+        if prefix == "final" then table.insert(generated, `{name}.__final = true`) end
+        if prefix == "abstract" then table.insert(generated, `{name}.__abstract = true`) end
+        if needsFinalMethods then
+            local finalEntries = {}
+            for _, method in methods do
+                if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
             end
-            if not startRead or not startWrite or not endWrite then error("Laua internal class generation mismatch") end
-            local replacement = {}
-            for position = 1, startRead - 1 do table.insert(replacement, generated[position]) end
-            table.insert(replacement, readStart)
-            table.insert(replacement, `    local getter: ((any) -> any)? = {name}.__getters[key]`)
-            table.insert(replacement, "    if getter then return getter(self) end")
-            table.insert(replacement, `    return {name}[key]`)
-            table.insert(replacement, "end")
-            table.insert(replacement, writeStart)
-            table.insert(replacement, `    local setter: ((any, any) -> ())? = {name}.__setters[key]`)
-            table.insert(replacement, "    if setter then setter(self, value); return end")
-            table.insert(replacement, `    if {name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end`)
-            table.insert(replacement, "    rawset(self, key, value)")
-            table.insert(replacement, "end")
-            for position = endWrite + 1, #generated do table.insert(replacement, generated[position]) end
-            generated = replacement
+            local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
+            local finalMethods = base and ("setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})") or finalTable
+            table.insert(generated, `{name}.__finalMethods = {finalMethods}`)
+        end
+        local function inherited(tableName: string): string
+            return base and ("setmetatable({}, {__index = " .. base .. "." .. tableName .. " or {}})") or "{}"
+        end
+        if usesGetters then table.insert(generated, `{name}.__getters = {inherited("__getters")}`) end
+        if usesSetters then table.insert(generated, `{name}.__setters = {inherited("__setters")}`) end
+        if usesLazy then table.insert(generated, `{name}.__lazy = {inherited("__lazy")}`) end
+        if usesWatchers then
+            table.insert(generated, `{name}.__watchers = {inherited("__watchers")}`)
+            table.insert(generated, `{name}.__watchedFields = {inherited("__watchedFields")}`)
+            for watchName in watchers do table.insert(generated, `{name}.__watchedFields["{watchName}"] = true`) end
+        end
+        if not usesGetters and not usesLazy and not usesWatchers then
+            table.insert(generated, `{name}.__index = {name}`)
+        else
+            table.insert(generated, `{name}.__index = function(self: any, key: any)`)
+            if usesGetters then
+                table.insert(generated, `    local getter: ((any) -> any)? = {name}.__getters[key]`)
+                table.insert(generated, "    if getter then return getter(self) end")
+            end
+            if usesLazy then
+                table.insert(generated, `    local lazy: ((any) -> any)? = {name}.__lazy[key]`)
+                table.insert(generated, "    if lazy then")
+                table.insert(generated, "        if not self.__lauaInitialized[key] then")
+                table.insert(generated, "            self.__lauaInitialized[key] = true")
+                table.insert(generated, "            local ok, value = pcall(lazy, self)")
+                table.insert(generated, "            if not ok then self.__lauaInitialized[key] = nil; error(value, 0) end")
+                table.insert(generated, "            self.__lauaValues[key] = value")
+                table.insert(generated, "        end")
+                table.insert(generated, "        return self.__lauaValues[key]")
+                table.insert(generated, "    end")
+            end
+            if usesWatchers then table.insert(generated, `    if {name}.__watchedFields[key] then return self.__lauaValues[key] end`) end
+            table.insert(generated, `    return {name}[key]`)
+            table.insert(generated, "end")
+        end
+        if usesSetters or usesGetters or usesLazy or usesWatchers then
+            table.insert(generated, `{name}.__newindex = function(self: any, key: any, value: any)`)
+            if usesSetters then
+                table.insert(generated, `    local setter: ((any, any) -> ())? = {name}.__setters[key]`)
+                table.insert(generated, "    if setter then setter(self, value); return end")
+            end
+            if usesGetters then table.insert(generated, `    if {name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end`) end
+            if usesLazy or usesWatchers then
+                local tracked = usesLazy and `{name}.__lazy[key]` or ""
+                if usesWatchers then tracked = (tracked ~= "" and tracked .. " or " or "") .. `{name}.__watchedFields[key]` end
+                table.insert(generated, `    if {tracked} then`)
+                table.insert(generated, "        local oldValue = self.__lauaValues[key]")
+                if usesLazy then table.insert(generated, `        if {name}.__lazy[key] and not self.__lauaInitialized[key] then self.__lauaInitialized[key] = true end`) end
+                table.insert(generated, "        self.__lauaValues[key] = value")
+                if usesWatchers then
+                    table.insert(generated, `        local watcher: ((any, any, any) -> ())? = {name}.__watchers[key]`)
+                    table.insert(generated, "        if watcher and oldValue ~= value then watcher(self, oldValue, value) end")
+                end
+                table.insert(generated, "        return")
+                table.insert(generated, "    end")
+            end
+            table.insert(generated, "    rawset(self, key, value)")
+            table.insert(generated, "end")
         end
         for lazyName, lazyValue in lazies do
             table.insert(generated, `{name}.__lazy["{lazyName}"] = function(self: any) return {transpileSource(lazyValue)} end`)
@@ -1221,12 +1072,11 @@ local function transpileClasses(source: string): string
                 table.insert(generated, `    self.{field.Name} = {transpileSource(field.Value)}`)
             end
         end
-        for _, item in signals do table.insert(generated, `    self.{item.Name} = __lauaSignal.new({item.Types or ""})`) end
         local innerCtor = normalized(transpileSource(ctorBody), "    ")
         if innerCtor ~= "" then table.insert(generated, innerCtor) end
         table.insert(generated, "end")
         table.insert(generated, `function {name}.new(...: any): any`)
-        table.insert(generated, `    if {name}.__abstract then error("Cannot instantiate abstract class '{name}'") end`)
+        if prefix == "abstract" then table.insert(generated, `    error("Cannot instantiate abstract class '{name}'")`) end
         local instanceSlots = {}
         if needsValues then table.insert(instanceSlots, "__lauaValues = {}") end
         if needsInitialized then table.insert(instanceSlots, "__lauaInitialized = {}") end
@@ -1256,7 +1106,7 @@ local function transpileClasses(source: string): string
             table.insert(generated, "end")
         end
         for _, method in methods do
-            if base then table.insert(generated, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
+            if base and parentFinalMethods then table.insert(generated, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
             if base and method.Override then table.insert(generated, `if not {base}.{method.Name} then error("No inherited method '{method.Name}' to override") end`) end
             local nested = base and replaceSuper(method.Body, base, not method.Static) or method.Body
             table.insert(generated, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")}){method.ReturnType ~= "" and ": " .. method.ReturnType or ""}`)
@@ -1957,8 +1807,28 @@ local function transpileMemo(source: string): string
         local finish = findBlock(rewritten, first)
         local indent = source:sub(lineStart, first-1)
         local wrapper = '\n' .. indent .. funcName .. ' = __lauaCore.memo(' .. funcName .. ')'
-        source = rewritten:sub(1, finish.Finish) .. wrapper .. rewritten:sub(finish.Finish + 1)
+        local tail = rewritten:sub(finish.Finish + 1)
+        if #tail > 0 and tail:sub(1, 1) ~= "\n" then wrapper ..= "\n" end
+        source = rewritten:sub(1, finish.Finish) .. wrapper .. tail
         position = first + #funcName
+    end
+end
+
+-- Convert Laua's cache-control operator without touching strings/comments.
+local function transpileMemoClear(source: string): string
+    local position = 1
+    while true do
+        local masked = maskNonCode(source)
+        local first, last = masked:find("memo%s*%.%s*clear%s*%(", position)
+        if not first then return source end
+        local before = masked:sub(first - 1, first - 1)
+        if before:match("[%w_%.:]") then
+            position = last + 1
+            continue
+        end
+        local replacement = "__lauaCore.clearMemo("
+        source = source:sub(1, first - 1) .. replacement .. source:sub(last + 1)
+        position = first + #replacement
     end
 end
 
@@ -2478,7 +2348,7 @@ end
 -- Initialize runtime tables directly and isolate private bindings with do blocks.
 -- This avoids the one-shot function allocation/call without exposing internals.
 local function runtimeDoBlock(name: string, alias: string, body: string): string
-    local oldDeclaration = alias == "Async" and "local Async: any = {}" or (alias == "Signal" and "local Signal: any = {}" or "local LauaCore = {}")
+    local oldDeclaration = alias == "Async" and "local Async: any = {}" or "local LauaCore = {}"
     local newDeclaration = "local " .. alias .. ": {[string]: any} = " .. name
     local declarationAt = body:find(oldDeclaration, 1, true)
     assert(declarationAt == 1 or (declarationAt ~= nil and body:sub(1, declarationAt - 1):find("^type ")), "Missing runtime library declaration")
@@ -2497,9 +2367,6 @@ local function insertEmbeddedRuntimes(source: string): string
     end
     if masked:find("__lauaCore.", 1, true) and not masked:find("local%s+__lauaCore%f[%W]") then
         table.insert(fragments, runtimeDoBlock("__lauaCore", "LauaCore", compactCoreRuntime(source)))
-    end
-    if masked:find("__lauaSignal.", 1, true) and not masked:find("local%s+__lauaSignal%f[%W]") then
-        table.insert(fragments, runtimeDoBlock("__lauaSignal", "Signal", LAUA_SIGNAL_RUNTIME_SOURCE))
     end
     if #fragments == 0 then return source end
 
@@ -2889,6 +2756,7 @@ local function validateClassContracts(source: string)
         local body = source:sub(row.Finish + 1, ending.Start - 1)
         local bodyLines = splitLines(maskNonCode(body))
         local members = {}
+        local properties = {}
         local nextAllowed = 1
         for _, memberRow in bodyLines do
             if memberRow.Start < nextAllowed then continue end
@@ -2904,13 +2772,19 @@ local function validateClassContracts(source: string)
             if memberName then
                 members[memberName] = {Final = modifiers.final == true, Override = modifiers.override == true, Static = modifiers.static == true, At = row.Finish + memberRow.Start}
             end
+            local getter = text:match("^get%s+([%a_][%w_]*)%s*%(")
+            local setter = text:match("^set%s+([%a_][%w_]*)%s*%(")
+            if getter or setter then
+                local propertyName = getter or setter
+                properties[propertyName] = {At = row.Finish + memberRow.Start, Kind = getter and "getter" or "setter"}
+            end
             if memberName or text:match("^constructor%s*%(") or text:match("^watch%s+[%a_][%w_]*%s*%(") or text:match("^get%s+[%a_][%w_]*%s*%(") or text:match("^set%s+[%a_][%w_]*%s*%(") or text:match("^operator%s+") then
                 local at = memberRow.Start + (memberRow.Text:find("%S") or 1) - 1
                 local ok, closing = pcall(findBlock, body, at, bodyLines)
                 if ok then nextAllowed = closing.Finish + 1 end
             end
         end
-        classes[className] = {Base = base, Final = classModifier == "final", Methods = members, At = row.Start}
+        classes[className] = {Base = base, Final = classModifier == "final", Methods = members, Properties = properties, At = row.Start}
     end
     for className, info in classes do
         local baseInfo = info.Base and classes[info.Base]
@@ -2932,12 +2806,39 @@ local function validateClassContracts(source: string)
                 if record.Methods[memberName] then inherited = record.Methods[memberName]; break end
                 ancestor = record.Base
             end
+            if not member.Static then
+                local ancestorName = info.Base
+                local propertySeen = {}
+                while ancestorName and classes[ancestorName] and not propertySeen[ancestorName] do
+                    propertySeen[ancestorName] = true
+                    if classes[ancestorName].Properties[memberName] then
+                        fail(`Method '{className}.{memberName}' conflicts with inherited getter/setter '{ancestorName}.{memberName}'. Rename one member.`, member.At)
+                    end
+                    ancestorName = classes[ancestorName].Base
+                end
+            end
             if inherited and inherited.Final then fail(`Cannot override final method '{memberName}' in class '{className}'.`, member.At) end
             if member.Override and not inherited and (not info.Base or classes[info.Base]) then
                 fail(`Method '{className}.{memberName}' is marked override but no ancestor defines it.`, member.At)
             end
             if member.Override and inherited and member.Static ~= inherited.Static then
                 fail(`Override '{className}.{memberName}' changes static/instance method kind.`, member.At)
+            end
+        end
+        for propertyName, property in info.Properties do
+            local own = info.Methods[propertyName]
+            if own and not own.Static then
+                fail(`Getter/setter '{className}.{propertyName}' conflicts with a same-name instance method.`, property.At)
+            end
+            local ancestorName = info.Base
+            local visited = {}
+            while ancestorName and classes[ancestorName] and not visited[ancestorName] do
+                visited[ancestorName] = true
+                local inherited = classes[ancestorName].Methods[propertyName]
+                if inherited and not inherited.Static then
+                    fail(`Getter/setter '{className}.{propertyName}' conflicts with inherited method '{ancestorName}.{propertyName}'. Rename one member.`, property.At)
+                end
+                ancestorName = classes[ancestorName].Base
             end
         end
     end
@@ -3050,13 +2951,10 @@ local function validateLauaSemantics(source: string)
                     local target = isStatic and info.Static or info.Instance
                     target[methodName] = {Kind = "method", Params = params}
                 else
-                    local signal, signalParams = clean:match("^signal%s+([%a_][%w_]*)%s*%(([^)]*)%)")
-                    if not signal then signal = clean:match("^signal%s+([%a_][%w_]*)") end
                     local field = clean:match("^([%a_][%w_]*)%s*:%s*.+%s*=") or clean:match("^([%a_][%w_]*)%s*:%s*%S.-%s*$") or clean:match("^([%a_][%w_]*)%s*=")
-                    local member = signal or field
-                    if member then
+                    if field then
                         local target = isStatic and info.Static or info.Instance
-                        target[member] = {Kind = signal and "signal" or "field", Params = signal and signalParams or nil}
+                        target[field] = {Kind = "field"}
                     end
                 end
             end
@@ -3184,7 +3082,7 @@ local function validateLauaSemantics(source: string)
         return best and best.Class or nil
     end
     local knownCalls = {}
-    for word in ("if while for until repeat return function constructor signal get set new super async await select continue else elseif then do end not and or"):gmatch("[%a_][%w_]*") do knownCalls[word] = true end
+    for word in ("if while for until repeat return function constructor get set new super async await select continue else elseif then do end not and or"):gmatch("[%a_][%w_]*") do knownCalls[word] = true end
     knownCalls.cancelScope = true
     for name in globals do knownCalls[name] = true end
     for name in functions do knownCalls[name] = true end
@@ -3218,7 +3116,7 @@ local function validateLauaSemantics(source: string)
         for startPos, name in code:gmatch("()([%a_][%w_]*)%s*%(") do
             local before = code:sub(1, startPos - 1)
             local prev = before:match("(%S)%s*$")
-            if prev ~= "." and prev ~= ":" and not before:match("function%s*$") and not before:match("new%s*$") and not before:match("constructor%s*$") and not before:match("signal%s*$") and not before:match("watch%s*$") and not before:match("get%s*$") and not before:match("set%s*$") then
+            if prev ~= "." and prev ~= ":" and not before:match("function%s*$") and not before:match("new%s*$") and not before:match("constructor%s*$") and not before:match("watch%s*$") and not before:match("get%s*$") and not before:match("set%s*$") then
                 if not knownCalls[name] then fail(`Unknown function '{name}'.`, line.Start + startPos - 1) end
             end
         end
@@ -3266,9 +3164,41 @@ local function validateLauaSemantics(source: string)
             if namespaces[owner] and not namespaces[owner][member] then fail(`Namespace '{owner}' has no exported member '{member}'.`, line.Start) end
             if className then
                 local found = memberOf(className, member, isStatic)
+                if not found and isStatic and delimiter == "." then found = memberOf(className, member, false) end
                 if not found and owner == "self" and code:find("self%." .. member .. "%s*=") then continue end
                 if not found then fail(`Instance '{className}' has no member '{member}'.`, line.Start) end
                 if delimiter == ":" and found.Kind ~= "method" then fail(`'{className}.{member}' is not a method.`, line.Start) end
+            end
+        end
+        -- Instance-method dot calls require an explicit first argument for self.
+        -- This is source Laua preflight only; unknown/dynamic receivers are not guessed.
+        for startAt, owner, member in code:gmatch("()([%a_][%w_]*)%s*%.%s*([%a_][%w_]*)%s*%(") do
+            local className = resolveTypedOwner(owner, line.Start)
+            local fromClass = classes[owner] ~= nil
+            if fromClass then className = owner end
+            if owner == "self" then
+                for cls, info in classes do
+                    if line.Start > info.Start and line.Start < info.Finish then className = cls; break end
+                end
+            end
+            local instanceMember = className and memberOf(className, member, false)
+            local staticMember = className and memberOf(className, member, true)
+            if instanceMember and instanceMember.Kind == "method" and (not fromClass or not staticMember) then
+                local open = code:find("%(", startAt)
+                local close = open and findCloseParen(code, open)
+                if open and close then
+                    local raw = source:sub(line.Start, line.Finish)
+                    local args = raw:sub(open + 1, close - 1)
+                    if trim(args) == "" then
+                        fail(`Instance method '{className}.{member}' called with '.' without self. Use {owner}:{member}(...) or pass an explicit first argument.`, line.Start + startAt - 1)
+                    end
+                    local parts = paramParts(args)
+                    if #parts == 0 or trim(parts[1]) == "" then
+                        fail(`Instance method '{className}.{member}' needs a first self argument.`, line.Start + startAt - 1)
+                    end
+                    table.remove(parts, 1)
+                    checkCall(className .. "." .. member, instanceMember.Params, table.concat(parts, ", "), line.Start + startAt - 1)
+                end
             end
         end
         for startAt, owner, member in code:gmatch("()([%a_][%w_]*)%s*:%s*([%a_][%w_]*)%s*%(") do
@@ -3286,21 +3216,6 @@ local function validateLauaSemantics(source: string)
                     local raw = source:sub(line.Start, line.Finish)
                     checkCall(className .. "." .. member, info.Params, raw:sub(opening + 1, closing - 1), line.Start + startAt - 1)
                 end
-            end
-        end
-        for owner, signalName, args in code:gmatch("([%a_][%w_]*)%.([%a_][%w_]*)%s*:%s*Fire%s*%(([^)]*)%)") do
-            local className = resolveTypedOwner(owner, line.Start)
-            local signal = className and memberOf(className, signalName, false)
-            if signal and signal.Kind == "signal" and signal.Params then
-                local raw = source:sub(line.Start, line.Finish)
-                local open = code:find(owner .. "%s*%.%s*" .. signalName .. "%s*:%s*Fire%s*%(")
-                local rawArgs = args
-                if open then
-                    local startAt = code:find("%(", open)
-                    local closeAt = code:find("%)", startAt or open)
-                    if startAt and closeAt then rawArgs = raw:sub(startAt + 1, closeAt - 1) end
-                end
-                checkCall(className .. "." .. signalName .. " signal", signal.Params, rawArgs, line.Start)
             end
         end
         for fname, args in code:gmatch("([%a_][%w_]*)%s*%(([^)]*)%)") do
@@ -3535,7 +3450,6 @@ local function nativeTranspileContracts(source: string): string
     local replacements = {}
     for _, line in lines do
         local kind, name = trim(line.Text):match("^(schema)%s+([%a_][%w_]*)$")
-        if not kind then kind, name = trim(line.Text):match("^(network)%s+([%a_][%w_]*)$") end
         if not kind then continue end
         local closing = findBlock(source, line.Start, lines)
         local rows = splitLines(source:sub(line.Finish + 2, closing.Start - 1))
@@ -3565,57 +3479,6 @@ local function nativeTranspileContracts(source: string): string
             table.insert(out,'    if not ok then error(message, 2) end')
             table.insert(out,'    return value')
             table.insert(out,'end')
-        else
-            table.insert(out, "local " .. name .. " = {}")
-            table.insert(out, `function {name}.Bind(folder: Instance)`)
-            table.insert(out,'    assert(typeof(folder) == "Instance", "Network requires a RemoteEvent folder")')
-            local events = {}
-            local setup = {}
-            for _, row in rows do
-                local original = trim(row.Text)
-                if original == "" or original:match("^%-%-") then continue end
-                local direction, flavor, event, params = original:match("^(client_to_server)%s+(function)%s+([%a_][%w_]*)%s*%((.*)%)$")
-                if not direction then direction,flavor,event,params=original:match("^(server_to_client)%s+(signal)%s+([%a_][%w_]*)%s*%((.*)%)$") end
-                if not direction or events[event] then error(`Invalid or duplicate network declaration '{original}'`) end
-                events[event] = true
-                local fields = contractParams(params)
-                table.insert(setup, `    {name}.__{event} = folder:WaitForChild("{event}")`)
-                table.insert(setup, `    assert({name}.__{event}:IsA("RemoteEvent"), "Network expects a RemoteEvent")`)
-                local typed,names = {},{}
-                for _, p in fields do
-                    table.insert(typed, `{p.Name}: {p.Type}{p.Optional and "?" or ""}`)
-                    table.insert(names,p.Name)
-                end
-                local types = table.concat(typed,', ')
-                local arguments = table.concat(names,', ')
-                local client = direction == "client_to_server"
-                local sendParams = client and types or ('player: Player' .. (types ~= '' and ', ' .. types or ''))
-                local sendArgs = client and arguments or ('player' .. (arguments ~= '' and ', ' .. arguments or ''))
-                table.insert(out, `function {name}.Send{event}({sendParams})`)
-                table.insert(out, `    assert({name}.__folder ~= nil, "Bind network first")`)
-                table.insert(out, `    local remote = {name}.__{event}`)
-                table.insert(out,`    remote:{client and 'FireServer' or 'FireClient'}({sendArgs})`)
-                table.insert(out,'end')
-                table.insert(out, `function {name}.On{event}(callback: {client and '(Player, ...any) -> ()' or '(...any) -> ()'}): RBXScriptConnection`)
-                table.insert(out, `    assert({name}.__folder ~= nil, "Bind network first")`)
-                table.insert(out, `    local remote = {name}.__{event}`)
-                local recvParams = client and ('player: Player' .. (types ~= '' and ', ' .. types or '')) or types
-                table.insert(out, `    return remote.{client and 'OnServerEvent' or 'OnClientEvent'}:Connect(function({recvParams})`)
-                for _, p in fields do
-                    local guard = p.Optional and `{p.Name} ~= nil and ` or ''
-                    table.insert(out, `        if {guard}not ({contractPredicate(p.Name, p.Type)}) then return end`)
-                end
-                local received = client and ('player' .. (arguments ~= '' and ', ' .. arguments or '')) or arguments
-                table.insert(out, `        callback({received})`)
-                table.insert(out,'    end)')
-                table.insert(out,'end')
-            end
-            if next(events) == nil then error(`Network '{name}' needs events`) end
-            -- Bind executes before generated send/listen methods; place its
-            -- event initialization at the front of the contract declaration.
-            table.insert(setup, `    {name}.__folder = folder`)
-            table.insert(setup, 'end')
-            for index = #setup, 1, -1 do table.insert(out, 4, setup[index]) end
         end
         table.insert(replacements, {First=line.Start, Last=closing.Finish, Text=table.concat(out,'\n')})
     end
@@ -3736,7 +3599,7 @@ local function nativeMaskContractBodies(source: string): string
     local lines=splitLines(masked)
     for _,line in lines do
         local code=trim(line.Text)
-        if not code:match('^schema%s+[%a_][%w_]*$') and not code:match('^network%s+[%a_][%w_]*$') then continue end
+        if not code:match('^schema%s+[%a_][%w_]*$') then continue end
         local ending=findBlock(source,line.Start,lines)
         table.insert(ranges,{First=line.Start,Last=ending.Finish})
     end
@@ -3748,6 +3611,81 @@ local function nativeMaskContractBodies(source: string): string
     return source
 end
 
+-- Guard generated implementation names against user declarations, including
+-- nested scopes. Deliberately inspect declarations only, not field access or
+-- string/comment contents.
+local LAUA_RESERVED_SYMBOLS = {
+    Promise = true, Promises = true, LauaPromiseStatus = true,
+    LauaPackedValues = true, LauaPromiseState = true,
+    LauaCore = true,
+}
+
+local function validateReservedBindings(source: string)
+    local masked = maskNonCode(source)
+    local function check(name: string?, at: number?)
+        if not name or not at then return end
+        if not (name:sub(1, 6) == "__laua" or LAUA_RESERVED_SYMBOLS[name]) then return end
+        local prefix = source:sub(1, at - 1)
+        local _, lineCount = prefix:gsub("\n", "\n")
+        local column = at - (prefix:match(".*()\n") or 0)
+        error(`Laua semantic error (line {lineCount + 1}, column {column}): '{name}' is reserved for Laua internals. Rename the declared symbol.`)
+    end
+    local position = 1
+    while position <= #masked do
+        local ending = masked:find("\n", position, true) or (#masked + 1)
+        local row = masked:sub(position, ending - 1)
+        local function checkCaptured(pattern: string)
+            local before, name = row:match(pattern)
+            if name then
+                local at = row:find(name, #before + 1, true)
+                if at then check(name, position + at - 1) end
+            end
+        end
+        for _, pattern in {
+            "^(.-)%f[%w]local%s+function%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]function%s+([%a_][%w_]*)%s*%(",
+            "^(.-)%f[%w]class%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]namespace%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]enum%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]schema%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]type%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]import%s+([%a_][%w_]*)%s+from",
+            "^(.-)%f[%w]as%s+([%a_][%w_]*)",
+            "^(.-)%f[%w]for%s+([%a_][%w_]*)",
+        } do checkCaptured(pattern) end
+        -- Local/const/using declarations can contain multiple names.
+        for _, decl in {"local", "const", "using"} do
+            local restStart, restEnd = row:find("%f[%w]" .. decl .. "%s+")
+            if restEnd then
+                local tail = row:sub(restEnd + 1)
+                if tail:sub(1, 8) ~= "function" then
+                    local names = tail:match("^([%a_][%w_]*[%s,%w_]*)") or ""
+                    for token in names:gmatch("[%a_][%w_]*") do
+                        local at = row:find(token, restEnd + 1, true)
+                        if at then check(token, position + at - 1) end
+                    end
+                end
+            end
+        end
+        -- Function/constructor parameters, excluding annotations.
+        local params = row:match("%f[%w]function%s*[%w_%.:]*%s*%(([^)]*)")
+            or row:match("%f[%w]constructor%s*%(([^)]*)")
+        if params then
+            local open = row:find("%(", 1)
+            local at = (open or 0) + 1
+            for argument in (params .. ","):gmatch("(.-),") do
+                local name = argument:match("^%s*([%a_][%w_]*)")
+                if name then
+                    local index = row:find(name, at, true)
+                    if index then check(name, position + index - 1) end
+                end
+                at += #argument + 1
+            end
+        end
+        position = ending + 1
+    end
+end
+
 function Transpiler.Transpile(source: string, options: any?): string
     assert(type(source) == "string", "Expected Laua source string")
     local mode = type(options) == "table" and options.Mode or "Development"
@@ -3757,21 +3695,23 @@ function Transpiler.Transpile(source: string, options: any?): string
 
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     validateExpressionSyntax(source)
-    local checkSource = (source:find('schema', 1, true) or source:find('network', 1, true)) and nativeMaskContractBodies(source) or source
+    local checkSource = (source:find('schema', 1, true)) and nativeMaskContractBodies(source) or source
     if type(options) ~= "table" or options.SemanticCheck ~= false then
+        validateReservedBindings(source)
         validateClassContracts(checkSource)
         validateLauaSemantics(checkSource)
         validateTypedSemantics(checkSource)
     end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
     if source:find("match exhaustive", 1, true) then source = nativeExhaustiveMatches(source) end
-    if source:find("schema", 1, true) or source:find("network", 1, true) then source = nativeTranspileContracts(source) end
+    if source:find("schema", 1, true) then source = nativeTranspileContracts(source) end
     if source:find("cancelScope", 1, true) then source = nativeCancelScopes(source) end
     if source:find("inline", 1, true) then source = transpileInlineFunctions(source) end
     validateKnownVisibility(source)
     validatePendingFeatures(source)
     if source:find("|>", 1, true) then source = transpilePipelines(source) end
     if source:find("memo", 1, true) then source = transpileMemo(source) end
+    if source:find("memo", 1, true) then source = transpileMemoClear(source) end
     if source:find("%f[%w]is%f[%W]") then source = transpileIsOperator(source) end
     if source:find("=>", 1, true) or source:find("...", 1, true) or source:find("[", 1, true) or source:find("table.", 1, true) or source:find("import", 1, true) or source:find("@nolint", 1, true) then
         source = transpileAdditionalSyntax(source)
