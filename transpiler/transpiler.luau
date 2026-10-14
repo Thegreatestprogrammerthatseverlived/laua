@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.46"}
+local Transpiler = {Version = "3.47"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -2844,9 +2844,10 @@ local function validateClassContracts(source: string)
     end
 end
 
-local function validateLauaSemantics(source: string)
-    if source:find("local __laua", 1, true) then return end
+local function validateLauaSemantics(source: string): {any}
+    if source:find("local __laua", 1, true) then return {} end
     local masked = maskNonCode(source)
+    local getterRewrites = {}
     local classes: {[string]: any} = {}
     local enums: {[string]: {[string]: boolean}} = {}
     local namespaces: {[string]: {[string]: boolean}} = {}
@@ -2945,6 +2946,10 @@ local function validateLauaSemantics(source: string)
                 end
                 local ctor = clean:match("^constructor%s*%(([^)]*)%)")
                 if ctor then info.Constructor = ctor end
+                local getter = clean:match("^get%s+([%a_][%w_]*)%s*%(")
+                local setter = clean:match("^set%s+([%a_][%w_]*)%s*%(")
+                if getter then info.Instance[getter] = {Kind = "getter"} end
+                if setter and not info.Instance[setter] then info.Instance[setter] = {Kind = "setter"} end
                 local methodName, params = clean:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)")
                 if not methodName then methodName, params = clean:match("^async%s+function%s+([%a_][%w_]*)%s*%(([^)]*)%)") end
                 if methodName then
@@ -3167,7 +3172,7 @@ local function validateLauaSemantics(source: string)
                 if not found and isStatic and delimiter == "." then found = memberOf(className, member, false) end
                 if not found and owner == "self" and code:find("self%." .. member .. "%s*=") then continue end
                 if not found then fail(`Instance '{className}' has no member '{member}'.`, line.Start) end
-                if delimiter == ":" and found.Kind ~= "method" then fail(`'{className}.{member}' is not a method.`, line.Start) end
+                if delimiter == ":" and found.Kind ~= "method" and found.Kind ~= "getter" then fail(`'{className}.{member}' is not a method.`, line.Start) end
             end
         end
         -- Instance-method dot calls require an explicit first argument for self.
@@ -3209,7 +3214,14 @@ local function validateLauaSemantics(source: string)
                 end
             end
             local info = className and memberOf(className, member, false)
-            if info and info.Kind == "method" then
+            if info and info.Kind == "getter" then
+                local opening = code:find("%(", startAt)
+                local closing = opening and findCloseParen(code, opening)
+                if not closing then fail(`Unclosed getter access '{className}.{member}'.`, line.Start + startAt - 1) end
+                local raw = source:sub(line.Start, line.Finish)
+                if trim(raw:sub(opening + 1, closing - 1)) ~= "" then fail(`Getter '{className}.{member}' takes no arguments.`, line.Start + startAt - 1) end
+                table.insert(getterRewrites, {First = line.Start + startAt - 1, Last = line.Start + closing - 1, Text = owner .. "." .. member})
+            elseif info and info.Kind == "method" then
                 local opening = code:find("%(", startAt)
                 local closing = opening and findCloseParen(code, opening)
                 if opening and closing then
@@ -3224,6 +3236,7 @@ local function validateLauaSemantics(source: string)
             end
         end
     end
+    return getterRewrites
 end
 
 -- v3.40 conservative native checks. Do not invent types for dynamic expressions.
@@ -3696,11 +3709,16 @@ function Transpiler.Transpile(source: string, options: any?): string
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     validateExpressionSyntax(source)
     local checkSource = (source:find('schema', 1, true)) and nativeMaskContractBodies(source) or source
+    local getterRewrites = {}
     if type(options) ~= "table" or options.SemanticCheck ~= false then
         validateReservedBindings(source)
         validateClassContracts(checkSource)
-        validateLauaSemantics(checkSource)
+        getterRewrites = validateLauaSemantics(checkSource)
         validateTypedSemantics(checkSource)
+    end
+    for index = #getterRewrites, 1, -1 do
+        local edit = getterRewrites[index]
+        source = replaceRange(source, edit.First, edit.Last, edit.Text)
     end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
     if source:find("match exhaustive", 1, true) then source = nativeExhaustiveMatches(source) end
