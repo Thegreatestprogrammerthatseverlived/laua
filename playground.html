@@ -450,8 +450,12 @@
         members[name] = {
           kind: owner === "math" && ["pi", "huge"].includes(name) || owner === "utf8" && name === "charpattern" ? "field" : "function",
           params: definition?.[0] || "",
-          detail: definition?.[1] || `${owner} standard library${HIDDEN_DEPRECATED_BUILTINS.has(`${owner}.${name}`) ? " (deprecated)" : ""}`,
-          documentation: definition?.[1] || `Luau ${owner}.${name}`
+          detail: definition?.[1] || (LAUA_CORE_AVAILABLE.has(`${owner}.${name}`)
+            ? `Laua ${owner} extension (transpiled helper)`
+            : `${owner} standard library${HIDDEN_DEPRECATED_BUILTINS.has(`${owner}.${name}`) ? " (deprecated)" : ""}`),
+          documentation: definition?.[1] || (LAUA_CORE_AVAILABLE.has(`${owner}.${name}`)
+            ? `Laua ${owner}.${name}: transpiled to a Laua runtime helper; not a standard Luau library method.`
+            : `Luau ${owner}.${name}`)
         };
       }
       return members;
@@ -2143,6 +2147,17 @@ local part = message[1:7]`;
     const LAUA_CORE_DECLARATIONS = [...LAUA_CORE_RUNTIME_SOURCE.matchAll(/^function LauaCore\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)(?:<[^>\n]+>)?\(/gm)];
     const LAUA_CORE_AVAILABLE = new Set(LAUA_CORE_DECLARATIONS.map(match => match[1]));
 
+    // Laua library extensions are part of the language, even when the
+    // standard Luau/Roblox API dump does not contain them. Derive the names
+    // from the embedded helpers so lowering, lint and autocomplete agree.
+    const LAUA_TABLE_EXTENSION_NAMES = [...LAUA_CORE_AVAILABLE]
+      .filter(name => name.startsWith("table."))
+      .map(name => name.slice("table.".length))
+      .filter(name => /^[A-Za-z_]\w*$/.test(name));
+    for (const name of LAUA_TABLE_EXTENSION_NAMES) {
+      if (!LIBRARY_MEMBERS.table.includes(name)) LIBRARY_MEMBERS.table.push(name);
+    }
+
     function compactLauaCoreRuntime(source) {
       const masked = maskNonCode(source);
       if (/\b__lauaCore\s*\[/.test(masked)) return LAUA_CORE_RUNTIME_SOURCE;
@@ -2238,7 +2253,7 @@ local part = message[1:7]`;
           if (!slice[3] && !slice[4]) throw new Error('Slice requires at least one bound');
           raw = `${slice[1]}__lauaCore.slice(${slice[2]}, ${slice[3]||'nil'}, ${slice[4]||'nil'})${slice[5]}`;
         }
-        if (raw.includes('table.')) for (const name of ['filter','map','reduce','findWhere']) {
+        if (raw.includes('table.')) for (const name of LAUA_TABLE_EXTENSION_NAMES) {
           if (!raw.includes('table.' + name)) continue;
           const regex = new RegExp('\\btable\\.'+name+'\\s*\\\(', 'g');
           const code = maskNonCode(raw);
@@ -6893,6 +6908,227 @@ end`;
       }
     }
 
+    // Conservative, scope-aware strict type pass. This is intentionally separate
+    // from the transpiler: unknown/dynamic Roblox types are never guessed.
+    // It supplements the lightweight nonstrict checks and honors --!nocheck.
+    function lintPlaygroundStrictTypes(source, masked, directives, pushMarker) {
+      if (directives.mode !== "strict") return;
+      const rows = source.split("\n"), codeRows = masked.split("\n");
+      const scopes = [{ kind: "root", variables: new Map(), result: null, name: null }];
+      const signatures = new Map();
+      const typeAliases = new Map();
+      let offset = 0;
+      const primitive = new Set(["number", "string", "boolean", "nil", "thread", "table", "function", "buffer"]);
+      const splitTypes = (text, separator) => {
+        const output = []; let depth = 0, quote = null, from = 0;
+        for (let i = 0; i < text.length; i++) {
+          const c = text[i];
+          if (quote) { if (c === "\\") i++; else if (c === quote) quote = null; continue; }
+          if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
+          if ('([{<'.includes(c)) depth++;
+          if (')}]>'.includes(c)) depth = Math.max(0, depth - 1);
+          if (!depth && c === separator) { output.push(text.slice(from, i).trim()); from = i + 1; }
+        }
+        output.push(text.slice(from).trim());
+        return output;
+      };
+      const trimType = value => (value || "").trim().replace(/\s+/g, " ");
+      const getVar = name => {
+        for (let i = scopes.length - 1; i >= 0; i--) if (scopes[i].variables.has(name)) return scopes[i].variables.get(name);
+        return null;
+      };
+      const pushScope = (kind, result = null, name = null) => { scopes.push({kind, variables: new Map(), result, name}); };
+      const popScope = () => { if (scopes.length > 1) scopes.pop(); };
+      const literal = value => /^(['"`])(?:[\s\S]*)\1$/.test(value);
+      const valueType = (expression, depth = 0) => {
+        if (depth > 4) return null;
+        const value = expression.trim().replace(/;\s*$/, "");
+        if (!value) return null;
+        if (/^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) return "number";
+        if (literal(value)) return JSON.stringify(value.slice(1, -1));
+        if (value === "true" || value === "false") return "boolean";
+        if (value === "nil") return "nil";
+        if (/^\{/.test(value)) return "table";
+        if (/^function\b/.test(value) || /^\([^)]*\)\s*=>/.test(value)) return "function";
+        if (/^[A-Za-z_]\w*$/.test(value)) return getVar(value)?.type || null;
+        if (/^\b(?:not)\s+/.test(value)) return "boolean";
+        if (/^typeof\s*\(/.test(value) || /^type\s*\(/.test(value)) return "string";
+        const call = /^([A-Za-z_]\w*)\s*\([^\n]*\)$/.exec(value);
+        if (call && signatures.has(call[1])) return signatures.get(call[1]).result;
+        // Numeric expressions only infer when BOTH sides are known numeric.
+        const op = /^(.+?)\s*([+*\/-])\s*(.+)$/.exec(value);
+        if (op && !/\b(?:and|or)\b/.test(value)) {
+          const l = valueType(op[1], depth + 1), r = valueType(op[3], depth + 1);
+          if (l === "number" && r === "number") return "number";
+        }
+        if (/\s(?:==|~=|<=|>=|<|>)\s/.test(value)) return "boolean";
+        return null;
+      };
+      const compatible = (expected, actual, depth = 0) => {
+        if (!expected || !actual || depth > 6) return true;
+        const wanted = trimType(expected);
+        if (wanted === "any" || wanted === "unknown" || actual === "any" || actual === "unknown") return true;
+        if (typeAliases.has(wanted)) return compatible(typeAliases.get(wanted), actual, depth + 1);
+        if (typeAliases.has(actual)) return compatible(wanted, typeAliases.get(actual), depth + 1);
+        const actualVariants = splitTypes(actual, '|');
+        if (actualVariants.length > 1) return actualVariants.every(type => compatible(wanted, type, depth + 1));
+        if (actual.endsWith('?')) return compatible(wanted, actual.slice(0, -1), depth + 1) && compatible(wanted, "nil", depth + 1);
+        const variants = splitTypes(wanted, '|');
+        if (variants.length > 1) return variants.some(type => compatible(type, actual, depth + 1));
+        if (wanted.endsWith('?')) return actual === "nil" || compatible(wanted.slice(0, -1), actual, depth + 1);
+        if (wanted === actual) return true;
+        if (wanted === "string" && /^"/.test(actual)) return true;
+        if (wanted === "table" && actual === "table") return true;
+        // A broad annotation (Instance, custom class, array, structural table)
+        // cannot be disproven by this lightweight expression inference.
+        if (!primitive.has(wanted) && !/^['"`]/.test(wanted)) return true;
+        if (wanted.startsWith('"') || wanted.startsWith("'")) return JSON.stringify(wanted.slice(1, -1)) === actual;
+        if (!primitive.has(actual) && !/^"/.test(actual)) return true;
+        return false;
+      };
+      const showType = type => type && /^"/.test(type) ? "string" : type;
+      const report = (rowOffset, row, name, message, rule) => {
+        const column = row.indexOf(name);
+        if (column < 0) return;
+        pushMarker(rowOffset + column, rowOffset + column + name.length, monaco.MarkerSeverity.Error, message, "type", rule);
+      };
+      const parseArgs = declaration => splitTypes(declaration, ',').map(text => {
+        const match = /^([A-Za-z_]\w*)\s*(?::\s*(.+))?$/.exec(text.trim());
+        if (!match) return null;
+        const defaultAt = match[2] ? splitTypes(match[2], '=') : [];
+        return {name: match[1], type: defaultAt.length ? trimType(defaultAt[0]) : null, defaulted: defaultAt.length > 1};
+      }).filter(Boolean);
+      // Pre-index signatures and simple type aliases. Do not analyze dynamic
+      // generic/structural aliases as though they were primitive types.
+      for (let i = 0; i < rows.length; i++) {
+        const line = rows[i];
+        if (!codeRows[i]?.trim()) continue;
+        const alias = /^\s*(?:export\s+)?type\s+([A-Za-z_]\w*)\s*=\s*(.+)$/.exec(line);
+        if (alias) typeAliases.set(alias[1], alias[2].trim());
+        const match = /^\s*(?:(?:export|local|public|private|static|override|final|abstract|async)\s+)*function\s+([A-Za-z_]\w*)\s*\(([^()]*)\)\s*(?::\s*([^=\n]+?))?\s*$/.exec(line);
+        if (match) signatures.set(match[1], {params:parseArgs(match[2]),variadic: /\.\.\./.test(match[2]),result:trimType(match[3] || "") || null});
+      }
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i], code = codeRows[i] || "", trimmed = code.trim();
+        const start = offset;
+        offset += row.length + 1;
+        if (!trimmed) continue;
+        const bareEnd = /^end\b/.test(trimmed), bareUntil = /^until\b/.test(trimmed);
+        if (bareEnd || bareUntil) { popScope(); continue; }
+        if (/^(?:else|elseif)\b/.test(trimmed)) {
+          const current = scopes[scopes.length - 1];
+          if (current.kind === "if") current.variables.clear();
+        }
+        // Dominating nil guards allow subsequent reads of an optional variable.
+        const guard = /^\s*if\s+(?:not\s+([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*==\s*nil|nil\s*==\s*([A-Za-z_]\w*))\s+then\s+return(?:\s+[^\n]+)?\s+end\s*$/.exec(code);
+        if (guard) {
+          const name = guard[1] || guard[2] || guard[3];
+          const variable = getVar(name);
+          if (variable?.type?.endsWith('?')) scopes[scopes.length-1].variables.set(name,{type:variable.type.slice(0,-1)});
+          continue;
+        }
+        const functionHeader = /^\s*(?:(?:export|local|public|private|protected|static|override|final|abstract|async)\s+)*function\s+([A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)?)\s*\(([^()]*)\)\s*(?::\s*([^=\n]+?))?\s*$/.exec(row);
+        const constructorHeader = /^\s*constructor\s*\(([^()]*)\)/.exec(row);
+        if (functionHeader || constructorHeader) {
+          const name = functionHeader?.[1] || "constructor";
+          const params = parseArgs(functionHeader ? functionHeader[2] : constructorHeader[1]);
+          const result = functionHeader ? trimType(functionHeader[3] || "") || null : null;
+          pushScope("function", result, name);
+          for (const param of params) scopes[scopes.length - 1].variables.set(param.name, {type: param.type});
+          if (name === "constructor" || name.includes(":")) scopes[scopes.length - 1].variables.set("self", {type:null});
+          continue;
+        }
+        // Block frames keep annotated local variables from leaking outward.
+        if (/^\s*(?:class|namespace|enum|schema|network|match)\b/.test(trimmed)) { pushScope("block"); continue; }
+        if (/^\s*if\b[\s\S]*\bthen\s*$/.test(code) || /^\s*(?:for|while)\b[\s\S]*\bdo\s*$/.test(code) || /^\s*(?:do|repeat)\s*$/.test(code)) {
+          const isIf = /^\s*if\b/.test(code);
+          pushScope(isIf ? "if" : "block");
+          if (isIf) {
+            const positive = /^\s*if\s+(?:([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*~=\s*nil)\s+then\s*$/.exec(code);
+            if (positive) {
+              const name = positive[1] || positive[2]; const variable = getVar(name);
+              if (variable?.type?.endsWith('?')) scopes[scopes.length-1].variables.set(name,{type:variable.type.slice(0,-1)});
+            }
+          }
+          continue;
+        }
+        const local = /^\s*(?:local|const)\s+([A-Za-z_]\w*)\s*(?::\s*([^=]+?))?\s*=\s*(.+)$/.exec(row);
+        if (local && /^\s*(?:local|const)\b/.test(code)) {
+          const name = local[1], expected = local[2] ? trimType(local[2]) : null;
+          const rhs = local[3], actual = valueType(rhs);
+          // Literal mismatches are already checked by lintPlaygroundTypes;
+          // this is for scoped identifiers and inferred expressions.
+          const symbolicExpected = expected && (typeAliases.has(expected) || expected.includes('|'));
+          if (expected && actual && (symbolicExpected || (!literal(rhs.trim()) && !/^-?\d/.test(rhs.trim()))) && !compatible(expected, actual)) {
+            report(start, row, name, `Strict type mismatch: '${name}' expects '${expected}', got '${showType(actual)}' from '${rhs.trim()}'.`, "StrictAssignment");
+          }
+          scopes[scopes.length - 1].variables.set(name, {type:expected || actual});
+        } else {
+          const assignment = /^\s*([A-Za-z_]\w*)\s*=(?!=)\s*(.+)$/.exec(row);
+          if (assignment && /^\s*[A-Za-z_]\w*\s*=(?!=)/.test(code)) {
+            const variable = getVar(assignment[1]), actual = valueType(assignment[2]);
+            if (variable?.type && actual && !literal(assignment[2].trim()) && !/^-?\d/.test(assignment[2].trim()) && !compatible(variable.type, actual)) {
+              report(start, row, assignment[1], `Strict type mismatch: '${assignment[1]}' expects '${variable.type}', got '${showType(actual)}'.`, "StrictAssignment");
+            }
+          }
+        }
+        // Typed returns: only validate expressions whose type can be proven.
+        const returned = /^\s*return(?:\s+(.+))?$/.exec(row);
+        if (returned && /^\s*return\b/.test(code)) {
+          let functionFrame = null;
+          for (let k = scopes.length - 1; k >= 0; k--) {
+            if (scopes[k].kind === "function") {functionFrame = scopes[k]; break;}
+          }
+          if (functionFrame?.result) {
+            const result = returned[1]?.trim() || "nil", actual = valueType(result);
+            if (!compatible(functionFrame.result, actual)) {
+              report(start, row, "return", `Strict return mismatch in '${functionFrame.name}': expected '${functionFrame.result}', got '${showType(actual)}'.`, "StrictReturn");
+            }
+          }
+        }
+        // Validate simple positional calls to typed user-defined functions.
+        // Skip complex/nested calls rather than reporting guessed argument types.
+        if (!functionHeader && !constructorHeader) {
+          const callPattern = /\b([A-Za-z_]\w*)\s*\(([^()\n]*)\)/g;
+          let call;
+          while ((call = callPattern.exec(code)) !== null) {
+            const fn = signatures.get(call[1]);
+            if (!fn || (getVar(call[1]) && getVar(call[1]).type !== "function") || /[.:]\s*$/.test(code.slice(0,call.index))) continue;
+            const rawCall = row.slice(call.index, call.index + call[0].length);
+            const rawArgs = rawCall.slice(rawCall.indexOf('(') + 1, -1);
+            const args = rawArgs.trim() ? splitTypes(rawArgs, ',') : [];
+            const required = fn.params.filter(p=>!p.defaulted && !(p.type?.endsWith('?'))).length;
+            if (args.length < required || (!fn.variadic && args.length > fn.params.length)) {
+              report(start,row,call[1],`Strict call arity: '${call[1]}' expects ${required === fn.params.length ? required : `${required}-${fn.variadic ? "∞" : fn.params.length}`} argument(s), got ${args.length}.`,"StrictArity");
+              continue;
+            }
+            for (let k = 0; k < Math.min(args.length,fn.params.length); k++) {
+              const actual = valueType(args[k]); const expected = fn.params[k].type;
+              if (expected && !compatible(expected,actual)) {
+                const basicType = /^(?:number|string|boolean)\??$/.test(expected);
+                const basicLiteral = args[k] && /^(?:['"`]|-?(?:\d|\.\d)|true$|false$|nil$)/.test(args[k].trim());
+                // The existing annotated-call checker already reports these.
+                if (!(basicType && basicLiteral)) report(start,row,call[1],`Strict argument ${k+1} of '${call[1]}' expects '${expected}', got '${showType(actual)}'.`,"StrictArgument");
+              }
+            }
+          }
+        }
+        // Detect arithmetic that uses definitely incompatible primitive operands.
+        // Never reject unknown types, Roblox vectors, or overloaded operators.
+        const numeric = /\b([A-Za-z_]\w*)\s*([+*\/-])\s*([A-Za-z_]\w*|\d+(?:\.\d+)?|"[^"]*"|'[^']*')/g;
+        let operation;
+        while ((operation = numeric.exec(row)) !== null) {
+          if (!/\b(?:local|return|if|while|then|=)\b|=/.test(row.slice(0,operation.index))) continue;
+          if (code.slice(operation.index,operation.index + operation[0].length).trim().length < operation[0].length - 3) continue;
+          const left = valueType(operation[1]), right = valueType(operation[3]);
+          if (!left || !right) continue;
+          if ([left,right].some(t => t === "string" || t === "boolean" || t === "nil" || /^"/.test(t))) {
+            report(start, row, operation[1], `Strict arithmetic mismatch: '${operation[2]}' cannot use operands '${showType(left)}' and '${showType(right)}'.`, "StrictArithmetic");
+          }
+        }
+      }
+    }
+
     // The @deprecated scanner supports named local functions, methods,
     // namespace functions and Laua class methods in the same source file.
     function indexPlaygroundDeprecatedFunctions(source, masked) {
@@ -7588,6 +7824,7 @@ end`;
       lintRobloxApiMembers(source, masked, symbols, pushMarker);
       lintDeprecatedRobloxUsage(masked, symbols, pushMarker);
       lintPlaygroundTypes(source, masked, directives, pushMarker);
+      lintPlaygroundStrictTypes(source, masked, directives, pushMarker);
       lintPlaygroundDeprecations(source, masked, pushMarker);
 
       const visibleMarkers = suppressPlaygroundLints(markers, directives, source);
