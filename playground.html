@@ -362,6 +362,14 @@
       "collectgarbage", "getfenv", "setfenv", "DebuggerManager", "PluginManager",
       "delay", "elapsedTime", "printidentity", "spawn", "version", "wait", "ypcall"
     ]);
+    // Default/common direct DataModel children, not an arbitrary list of
+    // all API classes with the Service tag.
+    const ROBLOX_GAME_CHILDREN = [
+      "Workspace", "Players", "Lighting", "ReplicatedStorage", "ReplicatedFirst",
+      "ServerScriptService", "ServerStorage", "StarterGui", "StarterPack",
+      "StarterPlayer", "SoundService", "Teams", "Chat", "TextChatService",
+      "MaterialService", "Terrain", "TestService"
+    ];
     const ROBLOX_SERVICES = [
       "Players", "RunService", "UserInputService", "ContextActionService",
       "ReplicatedStorage", "ServerStorage", "ServerScriptService",
@@ -4183,6 +4191,24 @@ end`;
         StudioModeChanged: {kind: "event", detail: "UserGameSettings event"},
         Changed: {kind: "event", detail: "Instance event"}
       },
+      LuaSourceContainer: {
+        // Base class for Script, LocalScript, and ModuleScript.
+        // The live Roblox API dump supplies their complete inherited members.
+        Name: {kind: "field", detail: "Inherited Instance property"},
+        Parent: {kind: "field", returnClass: "Instance", detail: "Inherited Instance property"}
+      },
+      Script: {
+        Source: {kind: "field", detail: "Script.Source · Studio/editor access; not readable from running Script or LocalScript", documentation: "Script source code. Roblox restricts access in running scripts; use ScriptEditorService in permitted Studio plugin contexts."},
+        Enabled: {kind: "field", detail: "Script property"},
+        RunContext: {kind: "field", detail: "Script property"}
+      },
+      LocalScript: {
+        Source: {kind: "field", detail: "LocalScript.Source · Studio/editor access only", documentation: "Not accessible from running scripts."},
+        Enabled: {kind: "field", detail: "LocalScript property"}
+      },
+      ModuleScript: {
+        Source: {kind: "field", detail: "ModuleScript.Source · Studio/editor access only", documentation: "Not accessible from running scripts."}
+      },
       Instance: {
         Destroy: {kind: "function", detail: "Instance method"},
         FindFirstChild: {kind: "function", params: "name: string, recursive: boolean?", returnClass: "Instance"},
@@ -4341,7 +4367,8 @@ end`;
 
     const ROBLOX_API_FALLBACK_URLS = [
       "https://cdn.jsdelivr.net/gh/MaximumADHD/Roblox-Client-Tracker@roblox/API-Dump.json",
-      "https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/roblox/API-Dump.json"
+      "https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/roblox/API-Dump.json",
+      "https://cdn.jsdelivr.net/gh/jpeckenpaugh/roblox-api-database@main/current/roblox_api_dump.json"
     ];
 
     const ROBLOX_API = {
@@ -4418,14 +4445,26 @@ end`;
       return hasRobloxTag(descriptor, "NotScriptable");
     }
 
+    // Roblox's dump includes API members visible in different execution
+    // environments. Suggest public, Studio-plugin, and local-command members
+    // while labeling their access level; never pretend internal engine APIs
+    // are callable from normal scripts.
     function isNormalScriptSecurity(value) {
-      if (value == null) return true;
+      return value == null || value === "None" || value === "PluginSecurity" ||
+        value === "LocalUserSecurity";
+    }
 
-      if (typeof value === "string") {
-        return value === "None";
+    function robloxMemberAccessNote(member) {
+      const security = member?.Security;
+      const levels = typeof security === "object" && security !== null
+        ? [security.Read, security.Write]
+        : [security];
+      if (levels.includes("PluginSecurity")) return "Studio plugin/editor access";
+      if (levels.includes("LocalUserSecurity")) return "Studio command-bar access";
+      if (member?.Name === "Source" && member?.MemberType === "Property") {
+        return "Script source (not accessible from running game scripts)";
       }
-
-      return false;
+      return "";
     }
 
     function isRobloxMemberAccessible(member) {
@@ -4457,11 +4496,8 @@ end`;
     function shouldExposeRobloxMember(member) {
       if (!member?.Name || /^__/.test(member.Name)) return false;
 
-      if (isRobloxDeprecated(member)) {
-        ROBLOX_API.stats.deprecatedFiltered += 1;
-        return false;
-      }
-
+      // Keep deprecated callable APIs discoverable, clearly labeled. The
+      // completion list still excludes non-scriptable/internal methods.
       if (isRobloxNotScriptable(member)) {
         ROBLOX_API.stats.notScriptableFiltered += 1;
         return false;
@@ -4503,9 +4539,12 @@ end`;
         robloxTypeName(member.ValueType) ||
         robloxTypeName(member.ReturnType);
 
-      return valueType
+      const note = robloxMemberAccessNote(member);
+      const deprecated = isRobloxDeprecated(member) ? " · deprecated" : "";
+      const base = valueType
         ? `${className} ${type.toLowerCase()} · ${valueType}`
         : `${className} ${type.toLowerCase()}`;
+      return `${base}${note ? ` · ${note}` : ""}${deprecated}`;
     }
 
     function robloxFunctionParams(member) {
@@ -4569,6 +4608,7 @@ end`;
           params: robloxFunctionParams(member),
           detail: robloxMemberDetail(className, member),
           returnClass: robloxMemberReturnClass(member),
+          documentation: robloxMemberAccessNote(member) || undefined,
           apiMember: member,
           ownerClass: className
         };
@@ -4628,13 +4668,16 @@ end`;
         ...getRobloxApiMembers("DataModel")
       };
 
-      // Services are children of DataModel and are commonly addressed as
-      // game.Players, game.Workspace, game.Lighting, etc. Add every service
-      // from the current API dump rather than maintaining a small manual list.
-      for (const serviceName of ROBLOX_API.services) {
+      // The API contains hundreds of Service-tagged types, many of which
+      // are not children of the DataModel. Never spill all class names into
+      // game. completion: use the common DataModel children only. Every
+      // available service remains discoverable via game:GetService("...").
+      for (const serviceName of ROBLOX_GAME_CHILDREN) {
+        if (!ROBLOX_API.services.has(serviceName)) continue;
+        if (members[serviceName]) continue;
         members[serviceName] = {
           kind: "field",
-          detail: `Roblox service · ${serviceName}`,
+          detail: `DataModel child service · ${serviceName}`,
           returnClass: serviceName
         };
       }
@@ -4694,14 +4737,7 @@ end`;
         }
 
         for (const member of classInfo.Members || []) {
-          // Count only members that would actually be exposed.
-          if (
-            !isRobloxDeprecated(member) &&
-            !isRobloxNotScriptable(member) &&
-            isRobloxMemberAccessible(member)
-          ) {
-            ROBLOX_API.stats.members += 1;
-          }
+          if (shouldExposeRobloxMember(member)) ROBLOX_API.stats.members += 1;
         }
       }
 
@@ -4736,9 +4772,11 @@ end`;
       return ROBLOX_API.ready;
     }
 
-    async function fetchJson(url) {
+    async function fetchJson(url, forceRefresh = false) {
       const response = await fetch(url, {
-        cache: "no-store",
+        // Roblox's versioned Studio dump is several MB. Cache it rather than
+        // downloading the entire class catalog again on every page load.
+        cache: forceRefresh ? "reload" : "default",
         mode: "cors"
       });
 
@@ -4757,12 +4795,12 @@ end`;
       // First use Roblox's current Studio version and official API dump.
       try {
         const versionData = await fetchJson(
-          "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64"
+          "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64", force
         );
 
         if (versionData?.clientVersionUpload) {
           const dump = await fetchJson(
-            `https://setup.rbxcdn.com/${versionData.clientVersionUpload}-API-Dump.json`
+            `https://setup.rbxcdn.com/${versionData.clientVersionUpload}-API-Dump.json`, force
           );
 
           if (installRobloxApiDump(dump, {
@@ -4777,7 +4815,7 @@ end`;
       // Then try mirrors.
       for (const url of ROBLOX_API_FALLBACK_URLS) {
         try {
-          const dump = await fetchJson(url);
+          const dump = await fetchJson(url, force);
 
           if (installRobloxApiDump(dump, {
             version: null,
@@ -4815,10 +4853,10 @@ end`;
       }
       // These representative inherited call chains must resolve like Studio.
       for (const [className, methods] of [
-        ["UserSettings", ["IsUserFeatureEnabled", "Reset", "GetService", "FindService"]],
-        ["UserGameSettings", ["InFullScreen", "InStudioMode", "GetOnboardingCompleted"]],
-        ["Players", ["GetPlayers", "GetPlayerByUserId"]],
-        ["DataModel", ["GetService", "FindService"]]
+        ["UserSettings", ["GetService"]],
+        ["Players", ["GetPlayers"]],
+        ["DataModel", ["GetService"]],
+        ["Script", ["Destroy"]]
       ]) {
         if (!ROBLOX_API.classes.has(className)) {
           problems.push(`${className} class is missing.`);
@@ -4848,6 +4886,8 @@ end`;
       if (!gameMembers.Workspace) {
         problems.push("game.Workspace is missing.");
       }
+      const scriptMembers = getRobloxApiMembers("Script");
+      if (!scriptMembers.Source) problems.push("Script.Source is missing from loaded API.");
 
       for (const [className, classInfo] of ROBLOX_API.classes) {
         if (isRobloxDeprecated(classInfo)) {
@@ -4859,7 +4899,7 @@ end`;
 
         for (const member of classInfo.Members || []) {
           if (
-            (isRobloxDeprecated(member) || isRobloxNotScriptable(member)) &&
+            (isRobloxNotScriptable(member) || !isRobloxMemberAccessible(member)) &&
             exposed[member.Name]?.apiMember === member
           ) {
             problems.push(`Filtered member leaked into autocomplete: ${className}.${member.Name}`);
@@ -4942,7 +4982,10 @@ end`;
       if (!typeName) return null;
       if (ROBLOX_API.ready && ROBLOX_API.classes.has(typeName)) return getRobloxApiMembers(typeName);
       if (ROBLOX_CORE_FALLBACK[typeName]) return {
-        ...ROBLOX_CORE_FALLBACK.Instance, ...ROBLOX_CORE_FALLBACK[typeName]
+        ...ROBLOX_CORE_FALLBACK.Instance,
+        ...(["Script", "LocalScript", "ModuleScript"].includes(typeName)
+          ? ROBLOX_CORE_FALLBACK.LuaSourceContainer : {}),
+        ...ROBLOX_CORE_FALLBACK[typeName]
       };
       if (ROBLOX_CORE_INSTANCE_PARENTS[typeName]) {
         const parentType = ROBLOX_CORE_INSTANCE_PARENTS[typeName];
@@ -5083,7 +5126,10 @@ end`;
       // Luau standard libraries.
       if (LIBRARY_MEMBERS[owner]) return makeLibraryMembers(owner);
       if (owner === "plugin") return getRobloxResolvedMembers("Plugin");
-      if (owner === "script") return getRobloxResolvedMembers("Instance");
+      // `script` is a LuaSourceContainer, not an arbitrary Instance.
+      // Use Script as the default editor context; Source is declared on the
+      // concrete Script/LocalScript/ModuleScript API classes.
+      if (owner === "script") return getRobloxResolvedMembers("Script");
 
       // Roblox enums from the current API dump.
       if (owner === "Enum" && ROBLOX_API.ready) {
@@ -5110,7 +5156,10 @@ end`;
           BindToClose: { kind: "function", detail: "DataModel method" },
           IsLoaded: { kind: "function", detail: "DataModel method" },
           Loaded: { kind: "event", detail: "DataModel event" },
-          Workspace: { kind: "field", detail: "Workspace", returnClass: "Workspace" }
+          Workspace: { kind: "field", detail: "Workspace", returnClass: "Workspace" },
+          Players: { kind: "field", detail: "Players service", returnClass: "Players" },
+          Lighting: { kind: "field", detail: "Lighting service", returnClass: "Lighting" },
+          ReplicatedStorage: { kind: "field", detail: "ReplicatedStorage service", returnClass: "ReplicatedStorage" }
         };
       }
 
