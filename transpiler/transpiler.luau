@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.47"}
+local Transpiler = {Version = "3.48"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -3699,6 +3699,17 @@ local function validateReservedBindings(source: string)
     end
 end
 
+-- Export syntax is lowered after semantic validation. Mask only the export
+-- prefix of class headers, keeping offsets identical to the original source.
+local function maskExportedClassDeclarations(source: string): string
+    return (source:gsub("[^\n]+", function(row: string): string
+        local indentation, spacing, header = row:match("^([ \t]*)export([ \t]+)(.*)$")
+        if not header then return row end
+        if not (header:match("^class%s+") or header:match("^final%s+class%s+") or header:match("^abstract%s+class%s+")) then return row end
+        return indentation .. string.rep(" ", #"export" + #spacing) .. header
+    end))
+end
+
 function Transpiler.Transpile(source: string, options: any?): string
     assert(type(source) == "string", "Expected Laua source string")
     local mode = type(options) == "table" and options.Mode or "Development"
@@ -3709,6 +3720,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     validateExpressionSyntax(source)
     local checkSource = (source:find('schema', 1, true)) and nativeMaskContractBodies(source) or source
+    checkSource = maskExportedClassDeclarations(checkSource)
     local getterRewrites = {}
     if type(options) ~= "table" or options.SemanticCheck ~= false then
         validateReservedBindings(source)
