@@ -4,6 +4,66 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Laua Playground</title>
+  <link id="lauaFavicon" rel="icon" type="image/png" href="https://raw.githubusercontent.com/Thegreatestprogrammerthatseverlived/laua/main/logo.png?v=laua-20261013-icon3" />
+  <link rel="apple-touch-icon" href="https://raw.githubusercontent.com/Thegreatestprogrammerthatseverlived/laua/main/logo.png?v=laua-20261013-icon3" />
+  <meta name="theme-color" content="#151922" />
+  <script>
+    // Make the tab icon fill the available space by trimming transparent padding.
+    // The original GitHub image remains the fallback if canvas or CORS is blocked.
+    (() => {
+      const source = new Image();
+      source.crossOrigin = 'anonymous';
+      source.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          const width = source.naturalWidth;
+          const height = source.naturalHeight;
+          if (!width || !height || width * height > 16000000) return;
+          canvas.width = width;
+          canvas.height = height;
+          const context = canvas.getContext('2d', { willReadFrequently: true });
+          if (!context) return;
+          context.drawImage(source, 0, 0);
+          const data = context.getImageData(0, 0, width, height).data;
+          let minX = width;
+          let minY = height;
+          let maxX = -1;
+          let maxY = -1;
+          for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+              if (data[(y * width + x) * 4 + 3] < 24) continue;
+              if (x < minX) minX = x;
+              if (y < minY) minY = y;
+              if (x > maxX) maxX = x;
+              if (y > maxY) maxY = y;
+            }
+          }
+          if (maxX < minX || maxY < minY) return;
+          const boundedWidth = maxX - minX + 1;
+          const boundedHeight = maxY - minY + 1;
+          const size = 128;
+          const padding = 2;
+          const scale = (size - padding * 2) / Math.max(boundedWidth, boundedHeight);
+          const target = document.createElement('canvas');
+          target.width = size;
+          target.height = size;
+          const targetContext = target.getContext('2d');
+          if (!targetContext) return;
+          targetContext.imageSmoothingEnabled = true;
+          targetContext.imageSmoothingQuality = 'high';
+          targetContext.drawImage(source, minX, minY, boundedWidth, boundedHeight,
+            (size - boundedWidth * scale) / 2,
+            (size - boundedHeight * scale) / 2,
+            boundedWidth * scale, boundedHeight * scale);
+          const favicon = document.getElementById('lauaFavicon');
+          if (favicon) favicon.href = target.toDataURL('image/png');
+        } catch (_) {
+          // If the image cannot be read, keep the normal favicon.
+        }
+      };
+      source.src = document.getElementById('lauaFavicon').href;
+    })();
+  </script>
   <style>
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; font-family: Inter, system-ui, Arial, sans-serif; background: #0f1115; color: #f4f4f5; }
@@ -21,6 +81,14 @@
       padding: 8px 13px; cursor: pointer; font-weight: 600;
     }
     button:hover { background: #2b3342; }
+    .github-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid #343b49; border-radius: 8px; background: #232936;
+      color: #f4f4f5; padding: 8px 13px; font-size: 13px; font-weight: 600;
+      text-decoration: none; cursor: pointer; white-space: nowrap; flex-shrink: 0;
+    }
+    .github-btn:hover { background: #2b3342; }
+    .github-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
     .mode-label { display:flex; align-items:center; gap:6px; font-size:12px; color:#cbd5e1; }
     select { background:#232936; border:1px solid #343b49; border-radius:7px; color:#f4f4f5; padding:7px; }
     button:disabled { opacity: .55; cursor: not-allowed; }
@@ -52,6 +120,7 @@
     .actions { flex: 1 1 auto; min-width: 0; flex-wrap: nowrap; justify-content: flex-end; align-items: center; gap: 7px; }
     .actions > button, .actions > label { flex-shrink: 0; white-space: nowrap; }
     .actions > button { padding: 7px 10px; }
+    .actions > .github-btn { padding: 7px 10px; }
     .header-more { position: relative; flex-shrink: 0; }
     .header-more > summary { user-select: none; display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; cursor: pointer; border: 1px solid #343b49; border-radius: 8px; background: #232936; font-size: 13px; font-weight: 600; list-style: none; }
     .header-more > summary::-webkit-details-marker { display: none; }
@@ -61,7 +130,7 @@
     .more-panel button { width: 100%; text-align: left; white-space: normal; font-size: 12px; padding: 10px 11px; }
     .more-section { color: #94a3b8; font-size: 10px; text-transform: uppercase; font-weight: 700; letter-spacing: .1em; padding: 7px 7px 3px; }
     @media (max-width: 1050px) { .brand span { display: none; } .brand { flex-basis: 170px; } }
-    @media (max-width: 760px) { header { height: auto; min-height: 58px; flex-wrap: wrap; padding: 10px 12px; gap: 8px; } .brand { flex-basis: 100%; } .actions { justify-content: flex-start; width: 100%; flex-wrap: wrap; gap: 6px; } .actions > button { padding: 7px 9px; } }
+    @media (max-width: 760px) { header { height: auto; min-height: 58px; flex-wrap: wrap; padding: 10px 12px; gap: 8px; } .brand { flex-basis: 100%; } .actions { justify-content: flex-start; width: 100%; flex-wrap: wrap; gap: 6px; } .actions > button, .actions > .github-btn { padding: 7px 9px; } }
 
     .file-tabs { display:flex; align-items:center; gap:3px; flex:1; min-width:0; overflow-x:auto; scrollbar-width:thin; }
     .file-tab { white-space:nowrap; display:inline-flex; align-items:center; gap:7px; background:transparent; color:#a6b3c6; border:1px solid transparent; border-bottom:2px solid transparent; border-radius:7px 7px 0 0; padding:7px 9px; font-size:12px; font-weight:500; }
@@ -112,6 +181,7 @@
       </label>
       <button id="transpileBtn">Transpile</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
+      <a id="githubBtn" class="github-btn" href="https://github.com/Thegreatestprogrammerthatseverlived/laua" target="_blank" rel="noopener noreferrer" title="Open Laua on GitHub">Github</a>
       <details class="header-more" id="headerMore">
         <summary aria-label="More Laua actions">More ▾</summary>
         <div class="more-panel">
