@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.42"}
+local Transpiler = {Version = "3.44"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and never require LauaAsync/LauaCore/LauaSignal.
 
@@ -842,7 +842,7 @@ local function transpileClasses(source: string): string
                 continue
             end
             local modifiers, remainder = parseModifiers(headerText)
-            local kind, memberName, params = nil, nil, nil
+            local kind, memberName, params, returnType = nil, nil, nil, nil
             if not kind then
                 for _, possible in LAUA_METHOD_KINDS do
                     memberName, params = remainder:match("^" .. possible .. "%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*$")
@@ -851,7 +851,7 @@ local function transpileClasses(source: string): string
             end
             if not kind then
                 for _, possible in LAUA_METHOD_KINDS do
-                    memberName, params = remainder:match("^" .. possible .. "%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*.+$")
+                    memberName, params, returnType = remainder:match("^" .. possible .. "%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*(.+)$")
                     if memberName then kind = possible; break end
                 end
             end
@@ -928,7 +928,7 @@ local function transpileClasses(source: string): string
                 local nextLine = body:find("\n", kindStart, true)
                 local memberBody = nextLine and body:sub(nextLine + 1, ending.Start - 1) or ""
                 local member = {Name = memberName, Kind = kind or "constructor", Params = params or ctorParams,
-                    Body = memberBody, Static = modifiers.static == true, Abstract = modifiers.abstract == true,
+                    Body = memberBody, ReturnType = returnType and trim(returnType) or "", Static = modifiers.static == true, Abstract = modifiers.abstract == true,
                     Final = modifiers.final == true, Override = modifiers.override == true, Attributes = table.concat(attributes, "\n")}
                 attributes = {}
                 if member.Kind == "constructor" then
@@ -1058,7 +1058,7 @@ local function transpileClasses(source: string): string
             end
             for _, method in methods do
                 local code = normalized(transpileSource(method.Body), "    ")
-                table.insert(simple, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")})`)
+                table.insert(simple, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")}){method.ReturnType ~= "" and ": " .. method.ReturnType or ""}`)
                 if code ~= "" then table.insert(simple, code) end
                 table.insert(simple, "end")
             end
@@ -1110,7 +1110,7 @@ local function transpileClasses(source: string): string
                 local methodBody = base and replaceSuper(method.Body, base, not method.Static) or method.Body
                 if maskNonCode(methodBody):find("super%s*%(") then error("super(...) can only be called in constructors") end
                 methodBody = normalized(transpileSource(methodBody), "    ")
-                table.insert(simple, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")})`)
+                table.insert(simple, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")}){method.ReturnType ~= "" and ": " .. method.ReturnType or ""}`)
                 if method.Abstract then
                     table.insert(simple, `    error("Abstract method '{name}.{method.Name}' must be overridden")`)
                 elseif methodBody ~= "" then
@@ -1236,14 +1236,14 @@ local function transpileClasses(source: string): string
         table.insert(generated, "end")
         for _, member in getters do
             local nested = base and replaceSuper(member.Body, base) or member.Body
-            table.insert(generated, `{name}.__getters.{member.Name} = function(self: any)`)
+            table.insert(generated, `{name}.__getters.{member.Name} = function(self: any){member.ReturnType ~= "" and ": " .. member.ReturnType or ""}`)
             local code = normalized(transpileSource(nested), "    ")
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
         end
         for _, member in setters do
             local nested = base and replaceSuper(member.Body, base) or member.Body
-            table.insert(generated, `{name}.__setters.{member.Name} = function(self: any, {member.Params})`)
+            table.insert(generated, `{name}.__setters.{member.Name} = function(self: any, {member.Params}){member.ReturnType ~= "" and ": " .. member.ReturnType or ""}`)
             local code = normalized(transpileSource(nested), "    ")
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
@@ -1259,7 +1259,7 @@ local function transpileClasses(source: string): string
             if base then table.insert(generated, `if {base}.__finalMethods and {base}.__finalMethods["{method.Name}"] then error("Cannot override final method '{method.Name}'") end`) end
             if base and method.Override then table.insert(generated, `if not {base}.{method.Name} then error("No inherited method '{method.Name}' to override") end`) end
             local nested = base and replaceSuper(method.Body, base, not method.Static) or method.Body
-            table.insert(generated, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")})`)
+            table.insert(generated, `{method.Attributes ~= "" and method.Attributes .. "\n" or ""}{method.Kind == "async function" and "async " or ""}function {name}.{method.Name}({method.Static and method.Params or "self: any" .. (trim(method.Params) ~= "" and ", " .. method.Params or "")}){method.ReturnType ~= "" and ": " .. method.ReturnType or ""}`)
             local code = normalized(transpileSource(nested), "    ")
             if method.Abstract then
                 table.insert(generated, `    error("Abstract method '{method.Name}' must be overridden")`)
@@ -2052,20 +2052,20 @@ local function preprocessMode(source: string, mode: string): string
             if flag ~= 'DEBUG' and flag ~= 'RELEASE' and flag ~= 'DEVELOPMENT' then error('Unknown --#if mode ' .. flag) end
             table.insert(stack, {Parent=active, Matched=mode:upper()==flag, Else=false})
             active = active and mode:upper()==flag
-            table.insert(out,'')
+            table.insert(out, string.rep(' ', #line))
         elseif line:match('^%s*%-%-#else%s*$') then
             local top = stack[#stack]
             if not top or top.Else then error('Unexpected --#else') end
             top.Else = true
             active = top.Parent and not top.Matched
-            table.insert(out,'')
+            table.insert(out, string.rep(' ', #line))
         elseif line:match('^%s*%-%-#end%s*$') then
             local top = table.remove(stack)
             if not top then error('Unexpected --#end') end
             active = top.Parent
-            table.insert(out,'')
+            table.insert(out, string.rep(' ', #line))
         else
-            table.insert(out,active and line or '')
+            table.insert(out,active and line or string.rep(' ', #line))
         end
     end
     if #stack > 0 then error('Missing --#end for compile-time branch') end
@@ -3755,6 +3755,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     local style = type(options) == "table" and options.OutputStyle or "Readable"
     if style ~= "Readable" and style ~= "Compact" then error("Invalid Laua output style") end
 
+    if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     validateExpressionSyntax(source)
     local checkSource = (source:find('schema', 1, true) or source:find('network', 1, true)) and nativeMaskContractBodies(source) or source
     if type(options) ~= "table" or options.SemanticCheck ~= false then
@@ -3763,7 +3764,6 @@ function Transpiler.Transpile(source: string, options: any?): string
         validateTypedSemantics(checkSource)
     end
     -- Earlier passes may introduce syntax for later passes. Inspect current text.
-    if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     if source:find("match exhaustive", 1, true) then source = nativeExhaustiveMatches(source) end
     if source:find("schema", 1, true) or source:find("network", 1, true) then source = nativeTranspileContracts(source) end
     if source:find("cancelScope", 1, true) then source = nativeCancelScopes(source) end
