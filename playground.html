@@ -1127,7 +1127,7 @@ local part = message[1:7]`;
           }
           const { modifiers, text } = parseLauaModifiers(original);
           const isStatic = modifiers.has("static");
-          const methodMatch = text.match(/^(async function|function|get|set)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*[^=]+)?$/);
+          const methodMatch = text.match(/^(async function|function|get|set)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([^=]+))?$/);
           const operatorMatch = text.match(/^operator\s+([^\s(]+)\s*\(([^)]*)\)\s*$/);
           if (operatorMatch) {
             const opMap = {"+":"__add", "-":"__sub", "*":"__mul", "/":"__div", "//":"__idiv", "%":"__mod", "^":"__pow", "..":"__concat", "==":"__eq", "<":"__lt", "<=":"__le", "#":"__len"};
@@ -1201,7 +1201,7 @@ local part = message[1:7]`;
             const lineEnd = body.indexOf("\n", memberStart);
             const memberBody = body.slice(lineEnd + 1, memberEnd.start);
             const params = constructorMatch ? constructorMatch[1] : methodMatch[3];
-            const member = { name: methodMatch?.[2], kind, params, body: memberBody, static: isStatic,
+            const member = { name: methodMatch?.[2], kind, params, returnType: methodMatch?.[4]?.trim() || '', body: memberBody, static: isStatic,
               final: modifiers.has("final"), override: modifiers.has("override"), abstract: modifiers.has("abstract"),
               attributes: attrs.join("\n"), start:headerEnd + 1 + memberStart, bodyStart:headerEnd + 2 + lineEnd };
             attrs = [];
@@ -1319,7 +1319,7 @@ local part = message[1:7]`;
           for (const member of methods) {
             const memberBody = normalizeBlockIndent(transpileCore(member.body), "    ");
             if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
-            output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n${memberBody ? memberBody + "\n" : ""}end\n`;
+            output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
           generatedOffsetShift += output.trimEnd().length - (endPos.end - declStart);
           source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
@@ -1354,7 +1354,7 @@ local part = message[1:7]`;
             let body = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
             if (/\bsuper\s*\(/.test(maskNonCode(body))) throw classLocation(new Error('super(...) can only be called in constructors'), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
             body = normalizeBlockIndent(transpileCore(body));
-            output += `${member.attributes ? member.attributes + '\n' : ''}${member.kind === 'async function' ? 'async ' : ''}function ${name}.${member.name}(${member.static ? member.params : 'self: any' + (member.params.trim() ? ', ' + member.params : '')})\n`;
+            output += `${member.attributes ? member.attributes + '\n' : ''}${member.kind === 'async function' ? 'async ' : ''}function ${name}.${member.name}(${member.static ? member.params : 'self: any' + (member.params.trim() ? ', ' + member.params : '')})${member.returnType ? ': ' + member.returnType : ''}\n`;
             if (member.abstract) output += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
             else if (body) output += body + '\n';
             output += 'end\n';
@@ -1458,7 +1458,7 @@ local part = message[1:7]`;
           let memberBody = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
           if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
-          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self: any${member.params.trim() ? ", " + member.params : ""})\n`;
+          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self: any${member.params.trim() ? ", " + member.params : ""})${member.returnType ? ": " + member.returnType : ""}\n`;
           if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
         }
@@ -1471,7 +1471,7 @@ local part = message[1:7]`;
           let memberBody = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
           if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
-          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})\n`;
+          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n`;
           if (member.abstract) generated += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
           else if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
@@ -2210,7 +2210,7 @@ local part = message[1:7]`;
       .map(name => name.slice("table.".length))
       .filter(name => /^[A-Za-z_]\w*$/.test(name));
     for (const name of LAUA_TABLE_EXTENSION_NAMES) {
-      if (!LIBRARY_MEMBERS.table.includes(name)) LIBRARY_MEMBERS.table.push(name);
+      if (typeof LIBRARY_MEMBERS !== 'undefined' && !LIBRARY_MEMBERS.table.includes(name)) LIBRARY_MEMBERS.table.push(name);
     }
 
     function compactLauaCoreRuntime(source) {
@@ -2473,17 +2473,17 @@ local part = message[1:7]`;
           const wanted=flag[1];
           if(!['DEBUG','RELEASE','DEVELOPMENT'].includes(wanted))throw new Error('Unknown --#if mode '+wanted);
           stack.push({parent:active,matched:wanted===mode.toUpperCase(),hasElse:false});
-          active=active&&wanted===mode.toUpperCase();result.push('');continue;
+          active=active&&wanted===mode.toUpperCase();result.push(' '.repeat(line.length));continue;
         }
         if(/^\s*--#else\s*$/.test(line)){
           const top=stack.at(-1);if(!top||top.hasElse)throw new Error('Unexpected --#else');
-          top.hasElse=true;active=top.parent&&!top.matched;result.push('');continue;
+          top.hasElse=true;active=top.parent&&!top.matched;result.push(' '.repeat(line.length));continue;
         }
         if(/^\s*--#end\s*$/.test(line)){
           const top=stack.pop();if(!top)throw new Error('Unexpected --#end');
-          active=top.parent;result.push('');continue;
+          active=top.parent;result.push(' '.repeat(line.length));continue;
         }
-        result.push(active?line:'');
+        result.push(active ? line : ' '.repeat(line.length));
       }
       if(stack.length)throw new Error('Missing --#end for compile-time branch');
       return result.join('\n');
@@ -3535,6 +3535,7 @@ end`;
       const originalLauaSource = source;
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
+      if (source.includes('--#')) source = preprocessMode(source, mode);
       validateExpressionSyntax(source);
       if (source.includes('enum')) validateEnumLocations(source);
       if (source.includes('namespace')) validateNamespacePlacement(source);
@@ -3554,7 +3555,6 @@ end`;
 
       // Skip whole-file transforms when their syntax cannot occur. Check the
       // current text at each stage because an earlier pass can introduce syntax.
-      if (source.includes('--#')) source = preprocessMode(source,mode);
       if (/\bmatch\s+exhaustive\b/.test(source)) source = validateExhaustiveMatches(source);
       if (/\bschema\s+[A-Za-z_]/.test(source)) source = transpileSchemas(source);
       if (/\bnetwork\s+[A-Za-z_]/.test(source)) source = transpileNetworks(source);
