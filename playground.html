@@ -4607,7 +4607,7 @@ end`;
           kind: robloxMemberKind(member),
           params: robloxFunctionParams(member),
           detail: robloxMemberDetail(className, member),
-          returnClass: robloxMemberReturnClass(member),
+          returnClass: member.MemberType === "Event" ? "RBXScriptSignal" : robloxMemberReturnClass(member),
           documentation: robloxMemberAccessNote(member) || undefined,
           apiMember: member,
           ownerClass: className
@@ -5326,7 +5326,7 @@ end`;
         symbols.locals[match[1]].type ||= typeByProperty[match[3]];
       }
 
-      const workspaceAliasPattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*workspace\b/g;
+      const workspaceAliasPattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*workspace\b(?!\s*[.:])/g;
 
       while ((match = workspaceAliasPattern.exec(source)) !== null) {
         if (!symbols.locals[match[1]]) {
@@ -5343,7 +5343,7 @@ end`;
         symbols.locals[match[1]].robloxClass = "UserGameSettings";
       }
 
-      const gameServicePropertyPattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*game\.([A-Za-z_][A-Za-z0-9_]*)/g;
+      const gameServicePropertyPattern = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*game\.([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*[.:])/g;
 
       while ((match = gameServicePropertyPattern.exec(source)) !== null) {
         const possibleClass = match[2];
@@ -5358,6 +5358,65 @@ end`;
 
           symbols.locals[match[1]].robloxClass = possibleClass;
           symbols.locals[match[1]].detail = `Roblox object: ${possibleClass}`;
+        }
+      }
+
+      // Infer the types of local aliases to Roblox property/method chains
+      // using the same API metadata as autocomplete and member diagnostics.
+      // This covers arbitrary classes, rather than special-casing LocalPlayer,
+      // CurrentCamera, Position, etc. Only concrete API return types qualify.
+      const localValuePattern = /\blocal\s+([A-Za-z_]\w*)\s*=\s*([^\n;]+)/g;
+      const localValues = [...source.matchAll(localValuePattern)];
+      const resolveValueType = raw => {
+        const value = raw.trim();
+        const start = /^([A-Za-z_]\w*)(\s*\(\s*\))?/.exec(value);
+        if (!start) return null;
+        const root = start[1];
+        let type = start[2] ? (root === "UserSettings" ? "UserSettings" : root === "settings" ? "GlobalSettings" : null)
+          : root === "game" ? "DataModel" : root === "workspace" ? "Workspace"
+          : root === "script" ? "Script" : root === "plugin" ? "Plugin"
+          : symbols.locals[root]?.robloxClass || symbols.locals[root]?.service ||
+            symbols.locals[root]?.type?.replace(/\?$/, "").trim() ||
+            symbols.parameters[root]?.type?.replace(/\?$/, "").trim() || null;
+        if (!type) return null;
+        let offset = start[0].length;
+        let segments = 0;
+        while (segments++ < 16) {
+          const remainder = value.slice(offset);
+          const memberMatch = /^\s*([.:])\s*([A-Za-z_]\w*)/.exec(remainder);
+          if (!memberMatch) break;
+          const members = type === "DataModel" ? getGameApiMembers() : getRobloxResolvedMembers(type);
+          const member = members?.[memberMatch[2]];
+          if (!member) return null;
+          if (memberMatch[1] === ":" && member.kind !== "function") return null;
+          offset += memberMatch[0].length;
+          let args = "";
+          const rest = value.slice(offset);
+          const simpleCall = /^\s*\((?:[^()"']|"[^"\n]*"|'[^'\n]*')*\)/.exec(rest);
+          if (simpleCall) { args = simpleCall[0]; offset += args.length; }
+          if (args && member.kind !== "function") return null;
+          let nextType = member.returnClass;
+          if (args && (memberMatch[2] === "GetService" || memberMatch[2] === "FindService")) {
+            const name = /^\s*\(\s*["']([A-Za-z_]\w*)["']\s*\)$/.exec(args)?.[1];
+            if (type === "UserSettings") nextType = name === "UserGameSettings" ? name : null;
+            else nextType = name && (ROBLOX_API.ready ? ROBLOX_API.services.has(name) : ROBLOX_SERVICES.includes(name)) ? name : null;
+          }
+          if (!nextType) return null;
+          type = nextType;
+        }
+        return value.slice(offset).trim() ? null : type;
+      };
+      // Multiple passes allow `local a = players.LocalPlayer; local b = a.Character`
+      // without making declaration order or one level of aliasing special.
+      for (let round = 0; round < 3; round++) {
+        for (const found of localValues) {
+          const name = found[1];
+          const localInfo = symbols.locals[name];
+          if (!localInfo || localInfo.robloxClass || localInfo.type) continue;
+          const type = resolveValueType(found[2]);
+          if (!type || !getRobloxResolvedMembers(type)) continue;
+          localInfo.robloxClass = type;
+          localInfo.detail = `Roblox value: ${type}`;
         }
       }
 
@@ -6460,6 +6519,164 @@ end`;
       }
     }
 
+    // Roblox API member diagnostics share the same metadata as autocomplete.
+    // Unknown/dynamic values are deliberately not type-checked: a Luau table
+    // or Instance child may have members absent from Roblox's class API dump.
+    function lintRobloxApiMembers(source, masked, symbols, pushMarker) {
+      const getKnownClass = name => {
+        if (name === "game") return "DataModel";
+        if (name === "workspace") return "Workspace";
+        if (name === "script") return "Script";
+        if (name === "plugin") return "Plugin";
+        const info = symbols.locals[name];
+        return info?.robloxClass || info?.service ||
+          info?.type?.replace(/\?$/, "").trim() ||
+          symbols.parameters[name]?.type?.replace(/\?$/, "").trim() || null;
+      };
+      const isEngineClass = name => Boolean(name && (
+        ROBLOX_API.classes.has(name) || ROBLOX_CORE_FALLBACK[name] ||
+        SERVICE_MEMBER_SETS[name] || ROBLOX_CORE_INSTANCE_PARENTS[name] ||
+        BUILTIN_MEMBER_SETS[name]
+      ));
+      const isInstanceClass = name => {
+        if (!name) return false;
+        if (ROBLOX_API.ready && ROBLOX_API.classes.has(name)) {
+          const visited = new Set();
+          for (let current = name; current && !visited.has(current);) {
+            if (current === "Instance") return true;
+            visited.add(current);
+            current = ROBLOX_API.classes.get(current)?.Superclass;
+          }
+          return false;
+        }
+        return Boolean(ROBLOX_CORE_FALLBACK[name] || SERVICE_MEMBER_SETS[name] ||
+          ROBLOX_CORE_INSTANCE_PARENTS[name] ||
+          ["Instance", "BasePart", "Player", "Model", "Humanoid", "RemoteEvent", "RemoteFunction"].includes(name));
+      };
+      const bestMember = (members, word) => {
+        const needle = word.toLowerCase();
+        let best = null, distance = Infinity;
+        for (const candidate of Object.keys(members)) {
+          if (/^__/.test(candidate)) continue;
+          const edit = lintEditDistance(needle, candidate.toLowerCase());
+          if (edit < distance) { distance = edit; best = candidate; }
+        }
+        return best && distance <= (word.length >= 9 ? 3 : 2) ? best : null;
+      };
+      // Parenthesized calls may contain strings (GetService("Players")), nested
+      // parentheses and commas; masked text preserves the exact source offsets.
+      const callEnd = start => {
+        if (masked[start] !== "(") return -1;
+        let depth = 0;
+        for (let i = start; i < masked.length; i++) {
+          if (masked[i] === "(") depth++;
+          else if (masked[i] === ")" && --depth === 0) return i + 1;
+        }
+        return -1;
+      };
+      const roots = /\b[A-Za-z_]\w*/g;
+      const memberToken = /[A-Za-z_]\w*/y;
+      let found;
+      while ((found = roots.exec(masked)) !== null) {
+        const root = found[0], start = found.index;
+        // An identifier after '.' or ':' is part of an enclosing chain.
+        const before = masked.slice(Math.max(0, start - 3), start).trimEnd();
+        if (before.endsWith(".") || before.endsWith(":")) continue;
+        let pos = roots.lastIndex;
+        let callRoot = false;
+        let gap = pos;
+        while (/[ \t]/.test(masked[gap] || "")) gap++;
+        if ((root === "UserSettings" || root === "settings") && masked[gap] === "(") {
+          const end = callEnd(gap);
+          if (end > 0 && !source.slice(gap + 1, end - 1).trim()) {
+            callRoot = true;
+            pos = end;
+          }
+        }
+        const rootType = callRoot ? (root === "UserSettings" ? "UserSettings" : "GlobalSettings") : getKnownClass(root);
+        const namedEnum = root === "Enum" || ROBLOX_API.enums.has(root);
+        const library = Boolean(LIBRARY_MEMBERS[root]);
+        const datatype = Boolean(ROBLOX_DATATYPE_STATIC[root]);
+        // Don't analyze arbitrary tables or unknown local variables as Roblox.
+        if (!callRoot && !namedEnum && !library && !datatype && !isEngineClass(rootType)) continue;
+        let expression = source.slice(start, pos);
+        let currentType = rootType;
+        let knownMembers = callRoot ? getRobloxResolvedMembers(currentType)
+          : getSymbolMembers(symbols, root, ".", start);
+        if (!knownMembers) continue;
+        let remainingSteps = 0;
+        while (remainingSteps++ < 32) {
+          const operatorStart = pos;
+          while (/[ \t]/.test(masked[pos] || "")) pos++;
+          const operator = masked[pos];
+          if (operator !== "." && operator !== ":") break;
+          pos++;
+          while (/[ \t]/.test(masked[pos] || "")) pos++;
+          const memberStart = pos;
+          memberToken.lastIndex = pos;
+          const token = memberToken.exec(masked);
+          if (!token) break;
+          const memberName = token[0];
+          pos += memberName.length;
+          let callStart = pos;
+          while (/[ \t]/.test(masked[callStart] || "")) callStart++;
+          const invoked = masked[callStart] === "(";
+          // Colons in annotations, fields and table types aren't calls.
+          if (operator === ":" && !invoked) break;
+          const member = knownMembers[memberName];
+          if (!member) {
+            const isRobloxValue = isEngineClass(currentType);
+            const isClosedSet = library || datatype || namedEnum ||
+              (ROBLOX_API.ready && isRobloxValue && !isInstanceClass(currentType));
+            const suggestion = bestMember(knownMembers, memberName);
+            // Instance children are dynamic. Only report a probable misspelling
+            // of a known member, or an invalid method call (children are not
+            // automatically callable methods). Avoid broad false positives.
+            if (suggestion || (ROBLOX_API.ready && operator === ":" && isRobloxValue) || isClosedSet) {
+              const context = currentType || root;
+              const authoritative = !isRobloxValue || ROBLOX_API.ready;
+              const suffix = suggestion ? ` Did you mean '${suggestion}'?` : "";
+              pushMarker(memberStart, pos,
+                authoritative ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+                `Unknown ${operator === ":" ? "method" : "member"} '${memberName}' on '${context}'.${suffix}`,
+                "lint", "RobloxUnknownMember");
+            }
+            break;
+          }
+          if (operator === ":" && member.kind !== "function" && member.kind !== "method") {
+            pushMarker(memberStart, pos, monaco.MarkerSeverity.Error,
+              `'${memberName}' is a ${member.kind || "property"}, not a callable method. Use '.' instead of ':'.`,
+              "lint", "RobloxMemberCall");
+            break;
+          }
+          if (invoked && operator === "." && member.kind !== "function" && member.kind !== "method" && member.kind !== "enum") {
+            pushMarker(memberStart, pos, monaco.MarkerSeverity.Error,
+              `'${memberName}' is not a function.`, "lint", "RobloxMemberCall");
+            break;
+          }
+          let end = pos;
+          if (invoked) {
+            end = callEnd(callStart);
+            if (end < 0) break;  // Incomplete code; don't invent a diagnostic.
+          }
+          const nextExpression = source.slice(start, end);
+          const nextType = member.kind === "event" ? "RBXScriptSignal" : member.returnClass || null;
+          // Reuse the existing receiver resolution (including literal
+          // GetService and enum paths), keeping type flow consistent with UI.
+          const chained = getChainedMembers(symbols, nextExpression, start);
+          if (!chained && nextType) {
+            knownMembers = getRobloxResolvedMembers(nextType);
+          } else {
+            knownMembers = chained;
+          }
+          currentType = nextType;
+          pos = end;
+          expression = nextExpression;
+          if (!knownMembers) break;
+        }
+      }
+    }
+
     function lintDeprecatedRobloxUsage(maskedSource, symbols, pushMarker) {
       if (!ROBLOX_API.ready) return;
 
@@ -7368,6 +7585,7 @@ end`;
       lintClassMembers(source, symbols, pushMarker);
       lintOverrides(source, masked, symbols, pushMarker);
       lintKnownClassAccess(source, masked, symbols, pushMarker);
+      lintRobloxApiMembers(source, masked, symbols, pushMarker);
       lintDeprecatedRobloxUsage(masked, symbols, pushMarker);
       lintPlaygroundTypes(source, masked, directives, pushMarker);
       lintPlaygroundDeprecations(source, masked, pushMarker);
@@ -7617,6 +7835,8 @@ end`;
 
           if (attributeMatch) {
             const partial = attributeMatch[1].toLowerCase();
+            // Once an attribute is fully written, stop suggesting it again.
+            if (LUAU_ATTRIBUTES.some(attribute => attribute.slice(1) === attributeMatch[1])) return { suggestions: [] };
 
             return {
               suggestions: LUAU_ATTRIBUTES
@@ -7637,6 +7857,7 @@ end`;
 
           if (directiveMatch) {
             const partial = directiveMatch[1].toLowerCase();
+            if (LUAU_DIRECTIVES.some(directive => directive.slice(3) === directiveMatch[1])) return { suggestions: [] };
 
             return {
               suggestions: LUAU_DIRECTIVES
@@ -7836,11 +8057,14 @@ end`;
 
           const quotedCall = completeRobloxStringArgument(model, position, lineBefore);
           if (quotedCall) {
-            if (!ROBLOX_API.ready) {
-              await ensureRobloxApiLoaded();
-              return completeRobloxStringArgument(model, position, lineBefore) || quotedCall;
-            }
-            return quotedCall;
+            if (!ROBLOX_API.ready) await ensureRobloxApiLoaded();
+            const result = ROBLOX_API.ready
+              ? completeRobloxStringArgument(model, position, lineBefore) || quotedCall
+              : quotedCall;
+            // A complete service, class or enum string is not a new completion.
+            const quotedPartial = lineBefore.match(/["']([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
+            if (quotedPartial && result.suggestions.some(item => item.label === quotedPartial)) return { suggestions: [] };
+            return result;
           }
 
           const memberMatch = getCompletionMemberContext(lineBefore);
@@ -7917,6 +8141,12 @@ end`;
               }
             }
 
+            // A correctly finished member (InputBegan, GetService, Source,
+            // etc.) must not keep offering longer or duplicate names.
+            if (memberMatch.partial && memberSuggestions.some(item => item.label === memberMatch.partial)) {
+              return { suggestions: [] };
+            }
+
             // An unresolved `object:` must NOT fall through to global names,
             // which previously made game:print / game:__index appear.
             // Only an actual type annotation may use the type-name catalog.
@@ -7927,6 +8157,12 @@ end`;
 
           // Preserve genuine Studio/Laua symbols only. Deduplicate and filter
           // by prefix so typing never floods the list with irrelevant items.
+          // This applies equally to keywords, globals, locals, class names,
+          // types and libraries. `class` must NOT suggest `class` or
+          // `classSomething` once the complete keyword was typed.
+          if (word.word && suggestions.some(item => item.label === word.word)) {
+            return { suggestions: [] };
+          }
           const seenLabels = new Set();
           const completions = [];
           for (const item of suggestions) {
@@ -8014,6 +8250,9 @@ end`;
             range: new monaco.Range(position.lineNumber, position.column - partial.length, position.lineNumber, position.column)
           });
           const choose = (names, important = []) => {
+            // Suppress ghost text too when the full word is already valid.
+            // In particular, `print` must not ghost-complete to `printidentity`.
+            if (names.some(name => name === partial)) return { items: [] };
             const all = [...new Set(names)].filter(name =>
               typeof name === "string" && name.toLowerCase().startsWith(lower) && name.toLowerCase() !== lower);
             if (!all.length) return { items: [] };
