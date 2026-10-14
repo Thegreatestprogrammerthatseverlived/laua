@@ -156,13 +156,25 @@
       main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
       .pane:first-child { border-right: 0; border-bottom: 1px solid #2a2f3a; }
     }
+  
+    .laua-callback-hint {
+      display: flex; gap: 0.55rem; align-items: baseline;
+      padding: 5px 9px; border: 1px solid #4a5174;
+      border-radius: 6px; background: #181c2b; color: #e0e6ff;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+      box-shadow: 0 3px 12px #0007; max-width: min(560px, 80vw);
+      pointer-events: none; white-space: nowrap; z-index: 20;
+    }
+    .laua-callback-hint strong { color: #bbadeb; font-weight: 600; }
+    .laua-callback-hint .hint-params { overflow: hidden; text-overflow: ellipsis; }
+
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “Lawah” · v3.43 · multi-file · validated export · live preflight</span>
+      <span>pronounced “lau-wuh” · v3.43 · multi-file · validated export · live preflight</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -197,7 +209,7 @@
           <button id="refreshApiBtn" title="Fetch the latest Roblox Studio API dump again">Refresh Roblox API</button>
           <button id="testsBtn" title="Run compiler regression tests">Tests</button>
           <button id="diffBtn" title="Compare the last two successful manual transpiles">Output Diff</button>
-          <button id="docsBtn" title="Generate reference documentation from Laua declarations">Docs</button>
+          <a id="docsBtn" class="github-btn" href="https://github.com/Thegreatestprogrammerthatseverlived/laua/blob/main/docs/Documentation.md" target="_blank" rel="noopener noreferrer" title="Read the official Laua documentation on GitHub">Docs</a>
           <button id="nextErrorBtn" title="Jump to the next error or warning (F8)">Next Problem</button>
         </div>
       </details>
@@ -272,14 +284,56 @@
   </script>
   <script>
     function initializeLauaPlayground() {
-    const LAUA_KEYWORDS = [
-      "class", "extends", "constructor", "private", "public", "protected",
-      "static", "new", "namespace", "super", "self", "abstract", "override", "enum",
-      "final", "get", "set", "defer", "using", "async", "await",
-      "match", "case", "default", "exhaustive", "import", "from", "operator", "signal",
-      "lazy", "watch", "export", "as", "memo", "is", "inline", "const",
-      "schema", "network", "client_to_server", "server_to_client"
+    // Laua language registry: a new contextual keyword is registered once here.
+    // Highlighting, keyword suggestions, inline completion, hover text and lint
+    // keyword recognition derive from this list. Runtime methods are discovered
+    // from LAUA_CORE_RUNTIME_SOURCE instead of maintained as duplicate lists.
+    // Grammar-changing features still require actual transpiler implementation.
+    const LAUA_LANGUAGE_FEATURES = [
+      ["class", "Declare a Laua class."],
+      ["extends", "Inherit from another Laua class."],
+      ["constructor", "Initialize a Laua instance."],
+      ["private", "Class-only member visibility."],
+      ["public", "Public class member visibility."],
+      ["protected", "Inherited class member visibility."],
+      ["static", "Declare a class-level member."],
+      ["new", "Create a Laua class instance."],
+      ["namespace", "Declare a Laua namespace."],
+      ["super", "Access the parent class."],
+      ["self", "Current instance within a Laua constructor or method."],
+      ["abstract", "Declare an abstract class or member."],
+      ["override", "Override an inherited method."],
+      ["enum", "Declare a Laua enum."],
+      ["final", "Prevent overriding a member."],
+      ["get", "Declare a computed getter."],
+      ["set", "Declare a computed setter."],
+      ["defer", "Run cleanup when leaving the scope."],
+      ["using", "Dispose a resource at scope exit."],
+      ["async", "Declare an asynchronous function."],
+      ["await", "Wait for an asynchronous result."],
+      ["match", "Match against cases."],
+      ["case", "Declare a match case."],
+      ["default", "Declare a fallback match branch."],
+      ["exhaustive", "Require every enum or boolean case to be handled."],
+      ["import", "Load exports from another module."],
+      ["from", "Identify an import module."],
+      ["operator", "Declare an overloaded operator."],
+      ["signal", "Declare a Laua signal."],
+      ["lazy", "Initialize a field on first access."],
+      ["watch", "Respond when a watched field changes."],
+      ["export", "Expose named declarations from a module."],
+      ["as", "Rename a named import."],
+      ["memo", "Memoize a function's results."],
+      ["is", "Check Laua class ancestry."],
+      ["inline", "Request inline transpilation where supported."],
+      ["const", "Declare an immutable binding."],
+      ["schema", "Declare a runtime validation schema."],
+      ["network", "Declare a typed networking contract."],
+      ["client_to_server", "Define a client-to-server networking member."],
+      ["server_to_client", "Define a server-to-client networking member."]
     ];
+    const LAUA_KEYWORDS = [...new Set(LAUA_LANGUAGE_FEATURES.map(([name]) => name))];
+    const LAUA_KEYWORD_DOCS = Object.fromEntries(LAUA_LANGUAGE_FEATURES);
 
     const LUAU_ATTRIBUTES = [
       "@native",
@@ -8365,34 +8419,7 @@ end`;
             };
           }
 
-          const keywordDocs = {
-            lazy: "Initialize a class field when first accessed (cached per instance).",
-            watch: "React when a watched field is assigned a different value.",
-            export: "Expose named declarations through the module return table.",
-            as: "Rename a member in a named module import.",
-            using: "Acquire a resource that is cleaned up at function exit.",
-            async: "Create an asynchronous function that returns a promise-like result.",
-            await: "Wait for a promise result inside an async function.",
-            class: "Declare a Laua class.",
-            extends: "Inherit from another Laua class.",
-            constructor: "Declare the constructor for a Laua class.",
-            private: "Mark a class member as private.",
-            public: "Mark a class member as public.",
-            protected: "Mark a class member as protected.",
-            static: "Make a class member belong to the class itself.",
-            new: "Create a new instance of a Laua class.",
-            namespace: "Create a Laua namespace.",
-            super: "Access the parent class or call its constructor.",
-            self: "Reference the current instance in a Laua class constructor, method or accessor.",
-            abstract: "Declare an abstract class or method.",
-            override: "Declare that a method overrides a parent method.",
-            enum: "Declare a Laua enum.",
-            schema: "Define a runtime data validation contract.",
-            network: "Define a typed client/server RemoteEvent contract.",
-            client_to_server: "Specify an event received by the server.",
-            server_to_client: "Specify an event received by clients.",
-            exhaustive: "Require all enum or boolean match cases to be handled."
-          };
+          const keywordDocs = LAUA_KEYWORD_DOCS;
 
           const makeKeyword = (label, detail = "Luau keyword") => ({
             label,
@@ -8957,10 +8984,112 @@ end`;
         }
       });
 
+      // API-driven event signature help and small, non-invasive inline tip.
+      // Roblox event arguments are read from the live API dump whenever
+      // available; only a small core set is used if offline.
+      const LAUA_EVENT_SIGNATURE_FALLBACK = Object.freeze({
+        UserInputService: {
+          InputBegan: "input: InputObject, gameProcessed: boolean",
+          InputEnded: "input: InputObject, gameProcessed: boolean",
+          InputChanged: "input: InputObject, gameProcessed: boolean",
+          TouchStarted: "touch: InputObject, gameProcessed: boolean",
+          TouchEnded: "touch: InputObject, gameProcessed: boolean",
+          JumpRequest: ""
+        },
+        RunService: {
+          Heartbeat: "deltaTime: number",
+          RenderStepped: "deltaTime: number",
+          Stepped: "time: number, deltaTime: number",
+          PreSimulation: "deltaTimeSim: number",
+          PostSimulation: "deltaTimeSim: number"
+        },
+        Player: { CharacterAdded: "character: Model", CharacterRemoving: "character: Model", Chatted: "message: string, recipient: Player?" },
+        Players: { PlayerAdded: "player: Player", PlayerRemoving: "player: Player" },
+        BasePart: { Touched: "otherPart: BasePart", TouchEnded: "otherPart: BasePart" },
+        Humanoid: { Died: "", HealthChanged: "health: number", Running: "speed: number" },
+        RemoteEvent: { OnServerEvent: "player: Player, ...: any", OnClientEvent: "...: any" },
+        BindableEvent: { Event: "...: any" }
+      });
+      const LAUA_FUNCTION_CALLBACK_SIGNATURES = Object.freeze({
+        "table.map": "value: any, index: number",
+        "table.filter": "value: any, index: number",
+        "table.findWhere": "value: any, index: number",
+        "table.reduce": "accumulator: any, value: any, index: number",
+        "table.sort": "a: any, b: any"
+      });
+      function displayRobloxCallbackType(type) {
+        if (!type) return "any";
+        const raw = typeof type === "string" ? type : robloxTypeName(type);
+        const name = String(raw || "any");
+        if (/^(?:bool|boolean)$/i.test(name)) return "boolean";
+        if (/^(?:int|int64|float|double|long|number)$/i.test(name)) return "number";
+        if (/^(?:Variant|Tuple)$/i.test(name)) return "any";
+        if (typeof type === "object" && type?.Category === "Enum") return `Enum.${name}`;
+        return name;
+      }
+      function findLauaCallbackHint(model, position) {
+        const line = model.getLineContent(position.lineNumber);
+        const before = line.slice(0, position.column - 1);
+        const maskedBefore = maskNonCode(before, true);
+        // The opening parenthesis of an anonymous function is the only
+        // trigger; avoid misidentifying nested calls or ordinary functions.
+        const anonymous = /\bfunction\s*\(([^()\n]*)$/.exec(maskedBefore);
+        if (!anonymous) return null;
+        const prior = before.slice(0, anonymous.index);
+        const connectMatch = /:\s*(Connect|Once|ConnectParallel)\s*\(\s*$/.exec(maskNonCode(prior, true));
+        const symbols = getLauaSymbols(model.getValue());
+        let params = null;
+        let label = "Callback";
+        if (connectMatch) {
+          const eventText = prior.slice(0, connectMatch.index);
+          const eventMatch = /\.\s*([A-Za-z_]\w*)\s*$/.exec(eventText);
+          if (eventMatch) {
+            const eventName = eventMatch[1];
+            const receiver = eventText.slice(0, eventMatch.index).trim().match(/(?:[A-Za-z_]\w*(?:\s*:\s*\w+\s*\([^\n)]*\)|\s*\.\s*\w+)*)$/)?.[0]?.trim();
+            if (receiver) {
+              const members = /[.:(]/.test(receiver) ? getChainedMembers(symbols, receiver, model.getOffsetAt(position)) : getSymbolMembers(symbols, receiver, ".", model.getOffsetAt(position));
+              const eventInfo = members?.[eventName];
+              if (eventInfo?.kind === "event" && Array.isArray(eventInfo.apiMember?.Parameters)) {
+                params = eventInfo.apiMember.Parameters.map(item => `${item.Name || "value"}: ${displayRobloxCallbackType(item.Type)}`).join(", ");
+              }
+              if (params === null) {
+                const root = receiver.match(/^([A-Za-z_]\w*)/)?.[1];
+                const service = symbols.locals[root]?.service || symbols.locals[root]?.robloxClass || symbols.parameters[root]?.type ||
+                  receiver.match(/GetService\s*\(\s*["']([A-Za-z_]\w*)["']\s*\)/)?.[1] ||
+                  (root === "game" ? "DataModel" : root === "workspace" ? "Workspace" : null);
+                params = LAUA_EVENT_SIGNATURE_FALLBACK[service]?.[eventName] ?? null;
+              }
+              if (params !== null) label = `${eventName} callback`;
+            }
+          }
+        } else {
+          const callMatch = /\b(table\s*\.\s*(?:map|filter|reduce|findWhere|sort))\s*\([^\n]*,\s*$/.exec(maskNonCode(prior, true));
+          if (callMatch) {
+            const method = callMatch[1].replace(/\s+/g, "");
+            params = LAUA_FUNCTION_CALLBACK_SIGNATURES[method] ?? null;
+            label = `${method} callback`;
+          }
+        }
+        if (params === null) return null;
+        return {label, params, activeParameter: (anonymous[1].match(/,/g) || []).length};
+      }
+
       monaco.languages.registerSignatureHelpProvider("laua", {
         signatureHelpTriggerCharacters: ["(", ","],
 
         provideSignatureHelp(model, position) {
+          const callback = findLauaCallbackHint(model, position);
+          if (callback) {
+            const parameters = callback.params ? callback.params.split(/,\s*/).filter(Boolean) : [];
+            return {
+              value: {
+                signatures: [{label: `${callback.label}(${callback.params})`, documentation: "Expected callback parameters (you can rename the variables)", parameters: parameters.map(label => ({label}))}],
+                activeSignature: 0,
+                activeParameter: Math.min(callback.activeParameter, Math.max(0, parameters.length - 1))
+              },
+              dispose() {}
+            };
+          }
           const line = model.getLineContent(position.lineNumber).slice(0, position.column - 1);
           const match = line.match(/([A-Za-z_][A-Za-z0-9_]*)(?:([.:])([A-Za-z_][A-Za-z0-9_]*))?\s*\(([^()]*)$/);
           if (!match) return null;
@@ -9710,6 +9839,102 @@ end`;
         padding: { top: 10, bottom: 10 }
       });
 
+      // Small overlay anchored immediately above an anonymous callback.
+      const callbackHintNode = document.createElement("div");
+      callbackHintNode.className = "laua-callback-hint";
+      callbackHintNode.style.display = "none";
+      const callbackHintWidget = {
+        getId: () => "laua.callbackParameterHint",
+        getDomNode: () => callbackHintNode,
+        getPosition: () => callbackHintNode.style.display === "none" ? null : {
+          position: lauaEditor.getPosition(),
+          preference: [monaco.editor.ContentWidgetPositionPreference.ABOVE,
+            monaco.editor.ContentWidgetPositionPreference.BELOW]
+        }
+      };
+      lauaEditor.addContentWidget(callbackHintWidget);
+      function refreshCallbackHint() {
+        const model = lauaEditor.getModel();
+        const position = lauaEditor.getPosition();
+        const result = model && position && model.getLanguageId() === "laua"
+          ? findLauaCallbackHint(model, position) : null;
+        callbackHintNode.replaceChildren();
+        if (result) {
+          const heading = document.createElement("strong");
+          heading.textContent = result.label;
+          const values = document.createElement("span");
+          values.className = "hint-params";
+          values.textContent = result.params || "(no arguments)";
+          callbackHintNode.append(heading, values);
+          callbackHintNode.style.display = "flex";
+        } else callbackHintNode.style.display = "none";
+        lauaEditor.layoutContentWidget(callbackHintWidget);
+      }
+      lauaEditor.onDidChangeCursorPosition(refreshCallbackHint);
+      lauaEditor.onDidChangeModelContent(refreshCallbackHint);
+      lauaEditor.onDidChangeModel(refreshCallbackHint);
+
+      // Insert the matching block ending when Enter is pressed on a header.
+      // Unlike a plain snippet, this respects the existing auto-closed `)`
+      // after e.g. Connect(function()) and avoids adding an extra `)`.
+      function lauaBlockClosingPlan(before, after, following) {
+        if (!before.trim() || after.trim() && !/^\)+\s*$/.test(after)) return null;
+        if (/^(?:end\b|until\b)/.test(following.trim())) return null;
+        const header = before.trim();
+        let closing = null;
+        if (/\b(?:async\s+)?function\s*(?:[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)?\s*)?\([^()]*\)\s*(?::\s*[A-Za-z_][\w?.{}<>| ]*)?$/.test(header) ||
+            /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*constructor\s*\([^()]*\)\s*(?::\s*[^\n]+)?$/.test(header) ||
+            /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*(?:get|set|watch)\s+[A-Za-z_]\w*\s*\([^()]*\)\s*(?::\s*[^\n]+)?$/.test(header)) closing = "end";
+        else if (/^(?:export\s+)?(?:(?:abstract|final)\s+)?(?:class|namespace|enum|schema|network)\b\s+[A-Za-z_]\w*(?:\s+extends\s+[A-Za-z_]\w*)?\s*$/.test(header)) closing = "end";
+        else if (/^match\b.+$/.test(header) || /^if\b.+\bthen\s*$/.test(header) ||
+                 /^for\b.+\bdo\s*$/.test(header) || /^while\b.+\bdo\s*$/.test(header) ||
+                 /^do\s*$/.test(header)) closing = "end";
+        if (!closing) return null;
+        if (closing === "end" && /\bfunction\s*\([^()]*\)\s*$/.test(header) &&
+            /\b(?:Connect|Once|ConnectParallel|spawn|defer|delay|wrap|pcall|xpcall)\s*\(\s*function\s*\(/.test(header)) {
+          if (!after.trim().startsWith(")")) closing = "end)";
+        } else if (closing === "end" && /\bfunction\s*\([^()]*\)\s*$/.test(header) &&
+                   /\b(?:[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)?)\s*\(\s*function\s*\(/.test(header)) {
+          if (!after.trim().startsWith(")")) closing = "end)";
+        }
+        return closing;
+      }
+      function tryAutoCloseLauaBlock() {
+        const selection = lauaEditor.getSelection();
+        const model = lauaEditor.getModel();
+        if (!model || model.getLanguageId() !== "laua" || !selection?.isEmpty()) return false;
+        const position = lauaEditor.getPosition();
+        const line = model.getLineContent(position.lineNumber);
+        const before = line.slice(0, position.column - 1);
+        const after = line.slice(position.column - 1);
+        const following = position.lineNumber < model.getLineCount() ? model.getLineContent(position.lineNumber + 1) : "";
+        const closing = lauaBlockClosingPlan(before, after, following);
+        if (!closing) return false;
+        // An existing matching block close may be several lines later.
+        // Don't inject a second end when editing an established function.
+        if (!/\bend\)/.test(closing)) {
+          try {
+            const headerOffset = model.getOffsetAt({lineNumber: position.lineNumber, column: 1});
+            const existing = findMatchingEndByLines(model.getValue(), headerOffset);
+            if (existing.start > headerOffset) return false;
+          } catch { /* Incomplete blocks have no matching end yet. */ }
+        }
+        const lineIndent = /^\s*/.exec(line)?.[0] || "";
+        const options = model.getOptions();
+        const tab = options.insertSpaces ? " ".repeat(options.tabSize || 4) : "\t";
+        const eol = model.getEOL();
+        lauaEditor.pushUndoStop();
+        lauaEditor.executeEdits("laua-auto-block", [{range: selection,
+          text: `${eol}${lineIndent}${tab}${eol}${lineIndent}${closing}`, forceMoveMarkers: true}]);
+        lauaEditor.setPosition({lineNumber: position.lineNumber + 1, column: lineIndent.length + tab.length + 1});
+        lauaEditor.pushUndoStop();
+        return true;
+      }
+      lauaEditor.onKeyDown(event => {
+        if (event.keyCode !== monaco.KeyCode.Enter || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+        if (tryAutoCloseLauaBlock()) { event.preventDefault(); event.stopPropagation(); }
+      });
+
       const luauEditor = monaco.editor.create(document.getElementById("luauEditor"), {
         value: "",
         language: "lua",
@@ -10136,11 +10361,7 @@ end`;
         status.textContent=`Output Diff: ${label}`;
         status.className="ok";
       });
-      document.getElementById("docsBtn").addEventListener("click", () => {
-        downloadPlaygroundText("Laua_DEFINITIONS.md",generateLauaDocs(lauaEditor.getValue()));
-        status.textContent="Exported Laua_DEFINITIONS.md";
-        status.className="ok";
-      });
+
       document.getElementById("testsBtn").addEventListener("click", () => {
         try {
           runTranspilerSelfTests();
