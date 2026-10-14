@@ -273,7 +273,7 @@
     function initializeLauaPlayground() {
     const LAUA_KEYWORDS = [
       "class", "extends", "constructor", "private", "public", "protected",
-      "static", "new", "namespace", "super", "abstract", "override", "enum",
+      "static", "new", "namespace", "super", "self", "abstract", "override", "enum",
       "final", "get", "set", "defer", "using", "async", "await",
       "match", "case", "default", "exhaustive", "import", "from", "operator", "signal",
       "lazy", "watch", "export", "as", "memo", "is", "inline", "const",
@@ -3973,6 +3973,29 @@ end`;
     }
 
 
+    // The editor's autocomplete must not offer the implicit instance receiver
+    // inside static methods or at class top-level. Use source block ranges,
+    // not a guess based solely on whether the cursor is inside a class.
+    function hasImplicitSelfAtOffset(source, symbols, offset) {
+      const info = findClassAtOffset(symbols, offset);
+      if (!info) return false;
+      const bodyStart = source.indexOf("\n", info.start);
+      if (bodyStart < 0 || offset <= bodyStart) return false;
+      const prior = maskNonCode(source).slice(bodyStart + 1, offset);
+      const method = /^\s*((?:(?:public|private|protected|static|override|abstract|final)\s+)*)(constructor|(?:async\s+)?function|get|set|watch|operator)\b[^\n]*\(/gm;
+      let candidate;
+      for (const match of prior.matchAll(method)) candidate = match;
+      if (!candidate || /\bstatic\b/.test(candidate[1])) return false;
+      const methodAt = bodyStart + 1 + candidate.index + candidate[0].indexOf(candidate[2]);
+      try {
+        const closing = findMatchingEndByLines(source, methodAt);
+        return offset <= closing.end;
+      } catch {
+        // While typing an unfinished method, no closing `end` may exist.
+        return true;
+      }
+    }
+
     const LAUA_DOCS = {
       final: "Prevent inheritance from a final class, or overriding a final class method.",
       get: "Define a computed class property. Usage: get Name() ... end.",
@@ -3991,6 +4014,7 @@ end`;
       new: "Creates an instance of a Laua class. Parentheses are optional when there are no arguments.",
       namespace: "Creates a scoped table-like namespace. Normal functions are exported; local functions remain private.",
       super: "Accesses the parent class. super(...) calls the parent constructor and super:Method(...) calls a parent method.",
+      self: "Contextual Laua keyword for the current instance inside constructors, instance methods, and accessors. Emits the normal Luau self parameter.",
       abstract: "Declares a class or method that cannot be used directly until required methods are implemented.",
       override: "Marks a method as replacing a method inherited from the parent class.",
       enum: "Declares a frozen set of named values.",
@@ -6798,7 +6822,7 @@ end`;
       for (const name of Object.keys(symbols.classes)) globals.add(name);
       for (const name of Object.keys(symbols.enums)) globals.add(name);
       for (const name of Object.keys(symbols.namespaces)) globals.add(name);
-      const root = {parent: null, names: new Map()};
+      const root = {parent: null, names: new Map(), kind: "root"};
       let scope = root;
       const at = i => tokens[i]?.text;
       const mark = i => { if (i >= 0 && i < tokens.length) skipped.add(i); };
@@ -6807,7 +6831,7 @@ end`;
         target.names.set(tokens[i].text, tokens[i].start);
         mark(i);
       };
-      const enter = () => { scope = {parent: scope, names: new Map()}; };
+      const enter = (kind = "block") => { scope = {parent: scope, names: new Map(), kind}; };
       const leave = () => { if (scope.parent) scope = scope.parent; };
       const visible = (name, offset) => {
         if (globals.has(name)) return true;
@@ -6953,11 +6977,11 @@ end`;
           // `from` is syntax, not a variable reference.
           continue;
         }
-        if ((w === 'get' || w === 'set' || w === 'watch' || w === 'operator') && findClassAtOffset(symbols, t.start) && isAtStart(i)) {
+        if ((w === 'get' || w === 'set' || w === 'watch' || w === 'operator') && (scope.kind === "class" || findClassAtOffset(symbols, t.start)) && isAtStart(i)) {
           let k = i + 1;
           if (w === 'operator') { mark(k++); }
           else { mark(k++); }
-          enter();
+          enter("method");
           scope.names.set('self', 0);
           markParameters(k);
           continue;
@@ -6978,9 +7002,13 @@ end`;
               mark(k++); mark(k++);
             }
           }
-          enter();
-          const isStaticMember = /\bstatic\s+$/.test(maskedSource.slice(lineStart(t.start), t.start));
-          if (hasReceiver || (findClassAtOffset(symbols, t.start) && !isStaticMember)) scope.names.set('self', 0);
+          // Method scope is known even while a class is still being typed (and
+          // before its closing `end` exists in the symbol index). Static
+          // modifiers can precede async, visibility and other modifiers.
+          const directClassMember = scope.kind === "class";
+          const isStaticMember = /\bstatic\b/.test(maskedSource.slice(lineStart(t.start), t.start));
+          enter("function");
+          if (hasReceiver || (directClassMember && !isStaticMember)) scope.names.set("self", 0);
           if (at(k) === '<') { // Function generic parameters.
             let d = 0;
             while (k < tokens.length) {
@@ -6996,7 +7024,7 @@ end`;
         if (w === 'class' || w === 'namespace' || w === 'enum') {
           if (tokens[i + 1]?.word) mark(i + 1);
           if (next && at(i + 2) === 'extends') { mark(i + 2); mark(i + 3); }
-          enter();
+          enter(w === "class" ? "class" : "block");
           // The receiver is introduced by instance methods, not by the class itself.
           continue;
         }
@@ -7031,6 +7059,18 @@ end`;
         if ((w === 'if' || w === 'while' || w === 'repeat' || w === 'match') && isAtStart(i)) { enter(); continue; }
         if (w === 'do') { if (pendingLoop) pendingLoop = false; else enter(); continue; }
         if (w === 'then') continue;
+        // `self` is a contextual Laua keyword, but in the emitted Luau it is
+        // still an ordinary bound parameter. Do not silently accept a stray
+        // `self` outside an instance method or a function declaring it.
+        if (w === "self") {
+          if (prev === "." || prev === ":" || prev === "?." || skipped.has(i) || visible("self", t.start)) continue;
+          // A table key named `self` is not an implicit receiver reference.
+          if (tableDepth > 0 && (next === "=" || next === ":") && (prev === "{" || prev === "," || prev === ";")) continue;
+          pushMarker(t.start, t.end, monaco.MarkerSeverity.Warning,
+            "'self' is only available inside an instance method, constructor, accessor, or function that declares it.",
+            "lint", "UnknownVariable");
+          continue;
+        }
         if (!t.word || keywords.has(w) || skipped.has(i)) continue;
         if (prev === '.' || prev === ':' || prev === '?.' || prev === '::' || next === '::') continue;
         // Table keys are identifiers even if they do not bind a variable.
@@ -7580,6 +7620,7 @@ end`;
             new: "Create a new instance of a Laua class.",
             namespace: "Create a Laua namespace.",
             super: "Access the parent class or call its constructor.",
+            self: "Reference the current instance in a Laua class constructor, method or accessor.",
             abstract: "Declare an abstract class or method.",
             override: "Declare that a method overrides a parent method.",
             enum: "Declare a Laua enum.",
@@ -7619,7 +7660,7 @@ end`;
           }
           const suggestions = [
             ...LUAU_KEYWORDS.map(name => makeKeyword(name)),
-            ...(isLaua ? LAUA_KEYWORDS.map(name => makeKeyword(name, "Laua keyword")) : []),
+            ...(isLaua ? LAUA_KEYWORDS.filter(name => name !== "self").map(name => makeKeyword(name, "Laua keyword")) : []),
             ...LUAU_TYPE_WORDS.map(name => makeName(name, monaco.languages.CompletionItemKind.TypeParameter, "Luau type", "0200")),
             ...LUAU_GLOBAL_FUNCTIONS.map(name => makeName(
               name,
@@ -7648,16 +7689,15 @@ end`;
           // generalized-iteration snippets, or speculative multi-line code.
 
           const sourceSymbols = getProjectSymbols(model);
-          // Laua instance methods use standard Luau `self`, not a separate
-          // `this` keyword. The member completion path already resolves
-          // `self.` / `self:` through the class and its inherited members.
-          if (model.getLanguageId() === "laua" && findClassAtOffset(sourceSymbols, model.getOffsetAt(position))) {
+          // `self` is a contextual Laua keyword, not a global Luau value.
+          // Only suggest it where an instance receiver is supplied implicitly.
+          if (isLaua && hasImplicitSelfAtOffset(model.getValue(), sourceSymbols, model.getOffsetAt(position))) {
             suggestions.unshift({
               label: "self",
-              kind: monaco.languages.CompletionItemKind.Variable,
+              kind: monaco.languages.CompletionItemKind.Keyword,
               insertText: "self",
-              detail: "Current Laua class instance",
-              documentation: "Access this instance's fields and methods with self.Field or self:Method(...).",
+              detail: "Laua instance receiver",
+              documentation: keywordDocs.self,
               sortText: "0000_self",
               range
             });
@@ -7980,7 +8020,7 @@ end`;
             ], ["number", "string", "boolean", "Secret"]);
           }
 
-          const keywords = isLaua ? [...LUAU_KEYWORDS, ...LAUA_KEYWORDS] : LUAU_KEYWORDS;
+          const keywords = isLaua ? [...LUAU_KEYWORDS, ...LAUA_KEYWORDS.filter(name => name !== "self")] : LUAU_KEYWORDS;
           const builtinNames = [
             ...keywords, ...LUAU_GLOBAL_FUNCTIONS, ...LUAU_GLOBAL_OBJECTS,
             ...LUAU_LIBRARIES, ...LUAU_RUNTIME_CONSTRUCTORS, ...LUAU_GLOBAL_CONSTANTS,
@@ -7989,7 +8029,7 @@ end`;
             ...Object.keys(symbols.parameters), ...Object.keys(symbols.namespaces),
             ...Object.keys(symbols.classes), ...Object.keys(symbols.enums)
           ];
-          if (isLaua && findClassAtOffset(symbols, cursorOffset)) builtinNames.push("self");
+          if (isLaua && hasImplicitSelfAtOffset(source, symbols, cursorOffset)) builtinNames.push("self");
           return choose(builtinNames, ["print", "warn", "local", "function", "return", "require", "game", "workspace", "task"]);
         },
         freeInlineCompletions() {}
