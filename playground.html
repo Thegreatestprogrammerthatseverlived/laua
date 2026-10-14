@@ -3705,11 +3705,11 @@ end`;
             const target = isStatic ? staticMembers : instanceMembers;
 
             target[fn[2]] = {
-              kind: fn[1] === "function" ? "function" : "field",
+              kind: fn[1] === "function" || fn[1] === "async function" ? "function" : "field",
               params: fn[3],
               visibility,
               final: isFinal,
-              detail: fn[1] === "function" ? (isStatic ? "Laua static method" : `Laua ${visibility} method`) : `Laua computed property (${fn[1]})`,
+              detail: fn[1] === "function" || fn[1] === "async function" ? (isStatic ? "Laua static method" : `Laua ${visibility} method`) : `Laua computed property (${fn[1]})`,
               declarationOffset: lines[li].start + raw.indexOf(fn[1])
             };
 
@@ -3727,14 +3727,18 @@ end`;
             }
           }
 
-          const field = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=]+)?\s*=\s*(.+)$/);
-          if (field) {
+          // A declared field does not need a default value. Both
+          // `public Health: number` and `Health: number = 100` must be indexed
+          // for self, instance, inherited-field completion and visibility.
+          const field = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*([^=\n]+?))?(?:\s*=\s*(.+))?$/);
+          if (field && (field[2] || field[3] !== undefined)) {
             const target = isStatic ? staticMembers : instanceMembers;
-
+            const declaredType = field[2]?.trim() || null;
             target[field[1]] = {
               kind: "field",
+              type: declaredType,
               visibility,
-              detail: isStatic ? "Laua static field" : `Laua ${visibility} field`
+              detail: `${isStatic ? "Laua static" : `Laua ${visibility}`} field${declaredType ? `: ${declaredType}` : ""}`
             };
           }
 
@@ -3982,6 +3986,40 @@ end`;
         ...inherited,
         ...(staticOnly ? classInfo.staticMembers : classInfo.instanceMembers)
       };
+    }
+
+    // Autocomplete must honor the same visibility rules as Laua source:
+    // own private members are available inside their declaring class;
+    // protected members are also available to subclasses; external code
+    // only sees public members. Never remove members from the semantic index.
+    function collectVisibleClassMembers(symbols, className, cursorOffset, staticOnly = false) {
+      const requester = findClassAtOffset(symbols, cursorOffset)?.name || null;
+      const result = {};
+      const visited = new Set();
+      const ancestors = [];
+      for (let owner = className; owner && !visited.has(owner); owner = symbols.classes[owner]?.base) {
+        visited.add(owner);
+        const cls = symbols.classes[owner];
+        if (!cls) break;
+        ancestors.unshift({owner, members:staticOnly ? cls.staticMembers : cls.instanceMembers});
+      }
+      const derivesFrom = (child, ancestor) => {
+        const seen = new Set();
+        while (child && !seen.has(child)) {
+          if (child === ancestor) return true;
+          seen.add(child);
+          child = symbols.classes[child]?.base;
+        }
+        return false;
+      };
+      for (const {owner, members} of ancestors) {
+        for (const [name, info] of Object.entries(members)) {
+          if (info.visibility === "private" && requester !== owner) continue;
+          if (info.visibility === "protected" && !derivesFrom(requester, owner)) continue;
+          result[name] = info;
+        }
+      }
+      return result;
     }
 
     function findClassAtOffset(symbols, offset) {
@@ -5131,8 +5169,8 @@ end`;
       // User-defined Laua symbols always win.
       if (symbols.namespaces[owner]) return symbols.namespaces[owner].members;
       if (symbols.enums[owner]) return symbols.enums[owner].members;
-      if (symbols.classes[owner]) return collectClassMembers(symbols, owner, true);
-      if (symbols.variables[owner]) return collectClassMembers(symbols, symbols.variables[owner].className, false);
+      if (symbols.classes[owner]) return collectVisibleClassMembers(symbols, owner, cursorOffset, true);
+      if (symbols.variables[owner]) return collectVisibleClassMembers(symbols, symbols.variables[owner].className, cursorOffset, false);
 
       // The engine's Instance class has instance methods, but the global
       // Instance table exposes constructors. Do not confuse the two.
@@ -5191,7 +5229,7 @@ end`;
         const typeName = localInfo.type?.replace(/\?$/, "").trim();
 
         if (typeName && symbols.classes[typeName]) {
-          return collectClassMembers(symbols, typeName, false);
+          return collectVisibleClassMembers(symbols, typeName, cursorOffset, false);
         }
 
         if (ROBLOX_API.ready && typeName && ROBLOX_API.classes.has(typeName)) {
@@ -5225,7 +5263,7 @@ end`;
         if (localInfo.alias) {
           if (symbols.namespaces[localInfo.alias]) return symbols.namespaces[localInfo.alias].members;
           if (symbols.enums[localInfo.alias]) return symbols.enums[localInfo.alias].members;
-          if (symbols.classes[localInfo.alias]) return collectClassMembers(symbols, localInfo.alias, true);
+          if (symbols.classes[localInfo.alias]) return collectVisibleClassMembers(symbols, localInfo.alias, cursorOffset, true);
 
           if (operator === ".") {
             const staticMembers = getRobloxDatatypeStaticMembers(localInfo.alias);
@@ -5245,7 +5283,7 @@ end`;
         const typeName = parameterInfo.type.replace(/\?$/, "").trim();
 
         if (symbols.classes[typeName]) {
-          return collectClassMembers(symbols, typeName, false);
+          return collectVisibleClassMembers(symbols, typeName, cursorOffset, false);
         }
 
         if (ROBLOX_API.ready && ROBLOX_API.classes.has(typeName)) {
@@ -5261,11 +5299,11 @@ end`;
       const enclosingClass = findClassAtOffset(symbols, cursorOffset);
 
       if (owner === "self" && enclosingClass) {
-        return collectClassMembers(symbols, enclosingClass.name, false);
+        return collectVisibleClassMembers(symbols, enclosingClass.name, cursorOffset, false);
       }
 
       if (owner === "super" && enclosingClass?.base) {
-        return collectClassMembers(symbols, enclosingClass.base, operator === ".");
+        return collectVisibleClassMembers(symbols, enclosingClass.base, cursorOffset, operator === ".");
       }
 
       return null;
@@ -6451,8 +6489,8 @@ end`;
           }
 
           const functionMatch = remaining.match(/^(?:function|get|set)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
-          const fieldMatch = remaining.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=]+)?\s*=/);
-          const name = functionMatch?.[1] || fieldMatch?.[1];
+          const fieldMatch = remaining.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*[^=\n]+)?\s*=|^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^=\n]+$/);
+          const name = functionMatch?.[1] || fieldMatch?.[1] || fieldMatch?.[2];
 
           if (name) {
             if (seenMembers.has(name) && !/^(get|set)\b/.test(remaining)) {
