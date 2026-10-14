@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.48"}
+local Transpiler = {Version = "3.49"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -1184,10 +1184,11 @@ local function replaceRange(source: string, first: number, last: number, replace
     return source:sub(1, first - 1) .. replacement .. source:sub(last + 1)
 end
 
-local function transpileExports(source: string): (string, {string})
+local function transpileExports(source: string): (string, {string}, string?)
     local names = {}
     local seen = {}
     local rows = {}
+    local className: string? = nil
     for _, row in splitLines(source) do
         local raw = row.Text
         if not raw:find("export", 1, true) then
@@ -1207,12 +1208,15 @@ local function transpileExports(source: string): (string, {string})
             or rest:match("^function%s+([%a_][%w_]*)") or rest:match("^local%s+function%s+([%a_][%w_]*)")
             or rest:match("^local%s+async%s+function%s+([%a_][%w_]*)") or rest:match("^local%s+([%a_][%w_]*)%s*=") or rest:match("^local%s+([%a_][%w_]*)%s*:%s*.-%s*=")
         if not name then error(`Unsupported export declaration: {rest}`) end
+        local isClass = rest:match("^class%s+") ~= nil or rest:match("^final%s+class%s+") ~= nil or rest:match("^abstract%s+class%s+") ~= nil
+        if isClass and className then error(`Only one export class is allowed per module (already exported '{className}', found '{name}')`) end
         if seen[name] then error(`Duplicate export '{name}'`) end
+        if isClass then className = name end
         seen[name] = true
         table.insert(names, name)
         table.insert(rows, indent .. rest)
     end
-    return table.concat(rows, "\n"), names
+    return table.concat(rows, "\n"), names, className
 end
 
 local function transpileImports(source: string): string
@@ -2857,6 +2861,8 @@ local function validateLauaSemantics(source: string): {any}
     for _, importLine in splitLines(masked) do
         local text = trim(importLine.Text)
         local named = text:match('^import%s+%{(.-)%}%s+from%s+')
+        local importedDefault = text:match('^import%s+([%a_][%w_]*)%s+from%s+')
+        if importedDefault then importedSymbols[importedDefault] = true end
         if named then
             for piece in named:gmatch('[^,]+') do
                 local original, replacement = trim(piece):match('^([%a_][%w_]*)%s+as%s+([%a_][%w_]*)$')
@@ -3747,7 +3753,8 @@ function Transpiler.Transpile(source: string, options: any?): string
         source = transpileAdditionalSyntax(source)
     end
     local exportedNames = {}
-    if source:find("export", 1, true) then source, exportedNames = transpileExports(source) end
+    local exportedClassName: string? = nil
+    if source:find("export", 1, true) then source, exportedNames, exportedClassName = transpileExports(source) end
     if source:find("??=", 1, true) then source = transpileCoalescingAssign(source) end
     if source:find("using", 1, true) then source = transpileUsing(source) end
     source = transpileSource(source)
@@ -3765,7 +3772,9 @@ function Transpiler.Transpile(source: string, options: any?): string
     if awaitCount > 0 and asyncCount == 0 then error("await requires an async function") end
     if source:find("function", 1, true) and source:find("=", 1, true) then source = transpileParameterDefaults(source) end
     if source:find("__laua", 1, true) then source = insertEmbeddedRuntimes(source) end
-    if #exportedNames > 0 then
+    if exportedClassName and #exportedNames == 1 then
+        source ..= "\nreturn " .. exportedClassName
+    elseif #exportedNames > 0 then
         local values = {}
         for _, name in exportedNames do table.insert(values, `{name} = {name}`) end
         source ..= "\nreturn {" .. table.concat(values, ", ") .. "}"
@@ -3778,7 +3787,10 @@ function Transpiler.Transpile(source: string, options: any?): string
             error("Generated Luau contains an expression immediately followed by a number without a separator")
         end
     end
-    return style == "Compact" and compactGeneratedOutput(source) or source
+    local generated = style == "Compact" and compactGeneratedOutput(source) or source
+    local header = "-- Transpiled with laua v" .. Transpiler.Version
+    if generated:sub(1, #header + 1) == header .. "\n" or generated == header then return generated end
+    return header .. "\n" .. generated
 end
 
 return Transpiler
