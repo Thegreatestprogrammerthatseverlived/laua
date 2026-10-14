@@ -114,9 +114,9 @@
     /* v3.13 multi-file project workspace */
     /* Studio-friendly command bar: primary commands never wrap unexpectedly. */
     header { gap: 16px; position: relative; z-index: 30; flex-shrink: 0; }
-    .brand { flex: 0 1 285px; min-width: 140px; align-items: center; }
-    .brand h1 { font-size: 18px; white-space: nowrap; }
-    .brand span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .brand { flex: 0 0 auto; min-width: 0; align-items: center; }
+    .brand h1 { font-size: 18px; white-space: nowrap; flex-shrink: 0; }
+    .brand span { white-space: nowrap; flex-shrink: 0; }
     .actions { flex: 1 1 auto; min-width: 0; flex-wrap: nowrap; justify-content: flex-end; align-items: center; gap: 7px; }
     .actions > button, .actions > label { flex-shrink: 0; white-space: nowrap; }
     .actions > button { padding: 7px 10px; }
@@ -129,8 +129,9 @@
     .more-panel { position: absolute; right: 0; top: calc(100% + 9px); z-index: 100; width: min(315px, calc(100vw - 24px)); max-height: min(68vh, 560px); overflow-y: auto; border: 1px solid #3d4960; border-radius: 11px; padding: 9px; background: #191f2b; box-shadow: 0 18px 50px rgba(0,0,0,.55); display: grid; grid-template-columns: 1fr; gap: 5px; }
     .more-panel button { width: 100%; text-align: left; white-space: normal; font-size: 12px; padding: 10px 11px; }
     .more-section { color: #94a3b8; font-size: 10px; text-transform: uppercase; font-weight: 700; letter-spacing: .1em; padding: 7px 7px 3px; }
-    @media (max-width: 1050px) { .brand span { display: none; } .brand { flex-basis: 170px; } }
-    @media (max-width: 760px) { header { height: auto; min-height: 58px; flex-wrap: wrap; padding: 10px 12px; gap: 8px; } .brand { flex-basis: 100%; } .actions { justify-content: flex-start; width: 100%; flex-wrap: wrap; gap: 6px; } .actions > button, .actions > .github-btn { padding: 7px 9px; } }
+    @media (max-width: 1250px) { header { height: auto; min-height: 58px; flex-wrap: wrap; padding: 10px 12px; gap: 8px; } .brand { flex-basis: 100%; } .actions { justify-content: flex-start; width: 100%; flex-wrap: wrap; gap: 6px; } }
+    @media (max-width: 760px) { .actions > button, .actions > .github-btn { padding: 7px 9px; } }
+    @media (max-width: 440px) { .brand { flex-wrap: wrap; } }
 
     .file-tabs { display:flex; align-items:center; gap:3px; flex:1; min-width:0; overflow-x:auto; scrollbar-width:thin; }
     .file-tab { white-space:nowrap; display:inline-flex; align-items:center; gap:7px; background:transparent; color:#a6b3c6; border:1px solid transparent; border-bottom:2px solid transparent; border-radius:7px 7px 0 0; padding:7px 9px; font-size:12px; font-weight:500; }
@@ -174,7 +175,7 @@
   <header>
     <div class="brand">
       <h1>Laua Playground</h1>
-      <span>pronounced “lau-wuh” · v3.43 · multi-file · validated export · live preflight</span>
+      <span>pronounced “lau-wuh”</span>
     </div>
     <div class="actions" role="toolbar" aria-label="Laua editor commands">
       <button id="lintBtn">Lint</button>
@@ -604,7 +605,7 @@ local allNumbers = {...numbers, ...mapped}
 local message = "Welcome to Laua"
 local part = message[1:7]`;
 
-    const PREVIOUS_MAIN_STARTER = "import {Zombie} from \"./Zombie\"\nimport {Player} from \"./Player\"\n\nlocal zombie = new Zombie\nlocal player = new Player\nprint(zombie.Health, player.Name)";
+    const PREVIOUS_MAIN_STARTER = "import Zombie from \"./Zombie\"\nimport Player from \"./Player\"\n\nlocal zombie = new Zombie\nlocal player = new Player\nprint(zombie.Health, player.Name)";
 
     function replaceRange(source, start, end, replacement) {
       return source.slice(0, start) + replacement + source.slice(end);
@@ -1631,23 +1632,27 @@ local part = message[1:7]`;
     function transpileExports(source) {
       const names = [];
       const found = new Set();
+      let className = null;
       const lines = source.split('\n').map(line => {
         if (!line.includes('export')) return line;
         const code = maskNonCode(line).trim();
         if (!/^export\s+/.test(code) || /^export\s+type\s+/.test(code)) return line;
         // Copied source may use Unicode indentation (for example NBSP).
         // Convert only the indentation, never the declaration or its string values.
-        const match = line.match(/^(\s*)export\s+(.+)$/);
+        const match = line.match(/^(\s*)export[ \t]+([^\r\n]+)(\r?)$/);
         if (!match) throw new Error('Invalid export statement');
         const rest = match[2];
         const declaration = rest.match(/^(?:(?:final|abstract)\s+)?class\s+([A-Za-z_]\w*)|^enum\s+([A-Za-z_]\w*)|^namespace\s+([A-Za-z_]\w*)|^(?:local\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)|^local\s+([A-Za-z_]\w*)\s*(?::\s*[^=]+)?\s*=/);
         const name = declaration && declaration.slice(1).find(Boolean);
         if (!name) throw new Error(`Unsupported export declaration: ${rest}`);
+        const classDeclaration = /^(?:(?:final|abstract)\s+)?class\s+/.test(rest);
+        if (classDeclaration && className) throw new Error(`Only one export class is allowed per module (already exported '${className}', found '${name}')`);
         if (found.has(name)) throw new Error(`Duplicate export '${name}'`);
+        if (classDeclaration) className = name;
         found.add(name); names.push(name);
-        return match[1].replace(/[^ \t]/g, ' ') + rest;
+        return match[1].replace(/[^ \t]/g, ' ') + rest + (match[3] || '');
       });
-      return {source: lines.join('\n'), names};
+      return {source: lines.join('\n'), names, className};
     }
 
     function transpileImports(source) {
@@ -3153,6 +3158,7 @@ local part = message[1:7]`;
       const classes = new Map(), enums = new Map(), namespaces = new Map();
       const knownVariables = new Map(), functions = new Map();
       const importedSymbols = new Set();
+      for(const imp of source.matchAll(/^\s*import\s+([A-Za-z_]\w*)\s+from\s+["'][^"'\n]+["']/gm)) importedSymbols.add(imp[1]);
       for(const imp of source.matchAll(/^\s*import\s+\{([^{}]+)\}\s+from\s+["'][^"'\n]+["']/gm)) {
         for(const part of imp[1].split(',')) {
           const match=/^\s*([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*$/.exec(part);
@@ -3220,7 +3226,10 @@ local part = message[1:7]`;
             const staticMember=/\bstatic\b/.test(prefix.split(/\b(?:function|lazy|get|set)\b/)[0]);
             if(m[4]){info.ctor=signature(m[4]);continue;}
             const name=m[2]||m[5]||m[7]||m[8];if(!name)continue;
-            (staticMember?info.statics:info.instance).set(name,{kind:m[2]?'method':'field',params:m[2]?signature(m[3]):null});
+            const accessorKind=m[5] ? /\b(get|set)\s+[A-Za-z_]\w*\s*\(/.exec(prefix)?.[1] : null;
+            const target=staticMember?info.statics:info.instance;
+            if(accessorKind==='set'&&target.get(name)?.kind==='getter')continue;
+            target.set(name,{kind:m[2]?'method':accessorKind==='get'?'getter':accessorKind==='set'?'setter':'field',params:m[2]?signature(m[3]):null});
           }
         }
         const en=/^enum\s+(\w+)\s*$/.exec(clean);
@@ -3310,8 +3319,12 @@ local part = message[1:7]`;
           if(owner==='self' && tail)return;
           fail(`${isStatic?'Class':'Instance'} '${cls}' has no ${delimiter===':'?'method':'member'} '${member}'.`,offset);
         }
-        if(delimiter===':'&&found.kind!=='method')fail(`'${cls}.${member}' is a property, not a method.`,offset);
+        if(delimiter===':'&&found.kind!=='method'&&found.kind!=='getter')fail(`'${cls}.${member}' is a property, not a method.`,offset);
         if(args!==undefined){
+          if(delimiter===':'&&found.kind==='getter'){
+            if(args.trim())fail(`Getter '${cls}.${member}' takes no arguments.`,offset);
+            return 'getter';
+          }
           if(found.kind!=='method')fail(`'${cls}.${member}' is not callable.`,offset);
           if(delimiter==='.' && !isStatic && found.kind==='method' || delimiter==='.' && isStatic && !findMember(cls,member,true)) {
             // Dot syntax does not inject self; the first argument must supply it.
@@ -3329,7 +3342,9 @@ local part = message[1:7]`;
             checkCall(`${cls}.${member}`,found.params,comma<0?'':args.slice(comma+1),offset);
           } else checkCall(`${cls}.${member}`,found.params,args,offset);
         }
+        return found.kind;
       };
+      const getterRewrites=[];
       const memberCalls=/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\s*\(/g;
       const safeMasked=masked;
       for(const m of safeMasked.matchAll(memberCalls)) {
@@ -3337,7 +3352,8 @@ local part = message[1:7]`;
         if(/\bfunction\s*$/.test(prefix)) continue;
         const openAt=m.index+m[0].lastIndexOf('(');
         const closeAt=findMatchingParen(source,openAt,masked);
-        checkMember(m[1],m[2],m[3],source.slice(openAt+1,closeAt),m.index+m[0].lastIndexOf(m[3]));
+        const kind=checkMember(m[1],m[2],m[3],source.slice(openAt+1,closeAt),m.index+m[0].lastIndexOf(m[3]));
+        if(kind==='getter'&&m[2]===':')getterRewrites.push({start:m.index,end:closeAt+1,replacement:`${m[1]}.${m[3]}`});
       }
       for(const m of safeMasked.matchAll(/\b([A-Za-z_]\w*)\s*([.:])\s*([A-Za-z_]\w*)\b/g)){
         const prefix=masked.slice(masked.lastIndexOf('\n',m.index-1)+1,m.index);
@@ -3408,6 +3424,7 @@ local part = message[1:7]`;
       for(const m of masked.matchAll(/\b(?:local|const)\s+([A-Za-z_]\w*)(?:\s*:\s*[A-Za-z_]\w*\??)?\s*=\s*([A-Za-z_]\w*)\s*(?=\n|;|$)/g)){
         const ref=m[2];if(!declarations.has(ref)&&!builtins.has(ref)&&!['nil','true','false'].includes(ref)&&!new RegExp(`\\b(?:local|const|for|function|using)\\s+${ref}\\b`).test(masked.slice(0,m.index)))fail(`Unknown variable '${ref}'.`,m.index+m[0].lastIndexOf(ref));
       }
+      return getterRewrites;
     }
 
     // Runtime schemas and cancellation primitives.
@@ -3567,6 +3584,15 @@ end`;
       return letters.join('');
     }
 
+    // Preserve original source offsets while revealing exported classes to the
+    // semantic, contract, and type-checking passes. Export lowering runs later.
+    function maskExportedClassDeclarations(source) {
+      return source.replace(/^([^\S\r\n]*)export([ \t]+)((?:(?:final|abstract)[ \t]+)?class[ \t]+[^\r\n]*)/gm,
+        (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
+    }
+
+    const LAUA_VERSION = "3.49";
+
     function transpile(source, options = {}) {
       const originalLauaSource = source;
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
@@ -3580,8 +3606,10 @@ end`;
         // Validate the new syntax before older semantic checks inspect its body.
         if(/\bschema\s+[A-Za-z_]/.test(source))transpileSchemas(source);
       }
-      const semanticSource=contractPresent?maskLauaContractBlocks(source):source;
-      if (options?.SemanticCheck !== false) {validateLauaReservedBindings(source);validateClassContracts(semanticSource);validateScopedReferences(semanticSource);validateLauaSemantics(semanticSource);validateTypedSemantics(semanticSource);}
+      const semanticSource=maskExportedClassDeclarations(contractPresent?maskLauaContractBlocks(source):source);
+      let getterRewrites=[];
+      if (options?.SemanticCheck !== false) {validateLauaReservedBindings(source);validateClassContracts(semanticSource);validateScopedReferences(semanticSource);getterRewrites=validateLauaSemantics(semanticSource)||[];validateTypedSemantics(semanticSource);}
+      for(const edit of getterRewrites.reverse())source=replaceRange(source,edit.start,edit.end,edit.replacement);
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact'].includes(style))throw new Error('Invalid Laua output style');
       // Visibility diagnostics must use original positions before opt-in
@@ -3600,7 +3628,7 @@ end`;
       if (source.includes('memo')) source = transpileMemoClear(source);
       if (/\bis\b/.test(source)) source = transpileIsOperator(source);
       if (source.includes('=>') || source.includes('...') || source.includes('[') || source.includes('table.') || source.includes('import') || source.includes('@nolint')) source = transpileAdditionalSyntax(source);
-      const exported = source.includes('export') ? transpileExports(source) : {source, names:[]};
+      const exported = source.includes('export') ? transpileExports(source) : {source, names:[], className:null};
       source = exported.source;
       if (source.includes('??=')) source = transpileCoalescingAssign(source);
       if (source.includes('using')) source = transpileUsing(source);
@@ -3631,14 +3659,17 @@ end`;
       let output = awaited.source;
       if (/\bfunction[^\n]*\([^\n)]*=/.test(output)) output = transpileParameterDefaults(output);
       if (output.includes('__laua')) output = insertLauaEmbeddedRuntimes(output);
-      if (exported.names.length) output += `\nreturn {${exported.names.map(name => `${name} = ${name}`).join(', ')}}`;
+      if (exported.className && exported.names.length === 1) output += `\nreturn ${exported.className}`;
+      else if (exported.names.length) output += `\nreturn {${exported.names.map(name => `${name} = ${name}`).join(', ')}}`;
       output = output.replace(/[\t ]+(?=\n|$)/g, '');
       // Detect malformed adjacent expression tokens before reporting successful compilation.
       // This is not a full Luau grammar/type checker.
       if(!/\[(?:=*)\[/.test(output) && /[})]\d/.test(maskNonCode(output))){
         throw new Error('Generated Luau contains an expression immediately followed by a number without a separator.');
       }
-      return style==='Compact' ? compactGeneratedOutput(output) : output;
+      const generated = style==='Compact' ? compactGeneratedOutput(output) : output;
+      const header = `-- Transpiled with laua v${LAUA_VERSION}`;
+      return generated.startsWith(header + '\n') || generated === header ? generated : `${header}\n${generated}`;
     }
     function buildLauaSymbolIndex(source) {
       const symbols = {
