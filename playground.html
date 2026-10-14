@@ -1589,7 +1589,9 @@ local part = message[1:7]`;
         if (!line.includes('export')) return line;
         const code = maskNonCode(line).trim();
         if (!/^export\s+/.test(code) || /^export\s+type\s+/.test(code)) return line;
-        const match = line.match(/^([ \t]*)export\s+(.+)$/);
+        // Copied source may use Unicode indentation (for example NBSP).
+        // Convert only the indentation, never the declaration or its string values.
+        const match = line.match(/^(\s*)export\s+(.+)$/);
         if (!match) throw new Error('Invalid export statement');
         const rest = match[2];
         const declaration = rest.match(/^(?:(?:final|abstract)\s+)?class\s+([A-Za-z_]\w*)|^enum\s+([A-Za-z_]\w*)|^namespace\s+([A-Za-z_]\w*)|^(?:local\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)|^local\s+([A-Za-z_]\w*)\s*(?::\s*[^=]+)?\s*=/);
@@ -1597,7 +1599,7 @@ local part = message[1:7]`;
         if (!name) throw new Error(`Unsupported export declaration: ${rest}`);
         if (found.has(name)) throw new Error(`Duplicate export '${name}'`);
         found.add(name); names.push(name);
-        return match[1] + rest;
+        return match[1].replace(/[^ \t]/g, ' ') + rest;
       });
       return {source: lines.join('\n'), names};
     }
