@@ -180,6 +180,7 @@
         </select>
       </label>
       <button id="transpileBtn">Transpile</button>
+      <button id="forceTranspileBtn" title="Bypass lint and preflight errors; syntax/transpilation errors still stop output">Force Transpile</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
       <a id="githubBtn" class="github-btn" href="https://github.com/Thegreatestprogrammerthatseverlived/laua" target="_blank" rel="noopener noreferrer" title="Open Laua on GitHub">Github</a>
       <details class="header-more" id="headerMore">
@@ -525,12 +526,12 @@ class Character
     end
 end
 
-local async function LauaAsyncOperation()
+local async function LauaAsyncOperation(): boolean
     return true
 end
 
-local async function CheckCharacter()
-    using connection = game:GetService("RunService").Heartbeat:Connect(function(_dt)
+local async function CheckCharacter(): boolean
+    using connection = game:GetService("RunService").Heartbeat:Connect(function(_dt: number)
         -- Active until this async operation finishes
     end)
 
@@ -541,7 +542,7 @@ local async function CheckCharacter()
 end
 
 local operation = CheckCharacter()
-operation:andThen(function(result)
+operation:andThen(function(result: boolean)
     print(result)
 end)
 
@@ -6673,6 +6674,28 @@ end`;
           if (invoked) {
             end = callEnd(callStart);
             if (end < 0) break;  // Incomplete code; don't invent a diagnostic.
+            // The Roblox API dump provides actual method parameter metadata.
+            // Use it for arity only when it is available and the receiver is
+            // resolved. Unconfirmed / dynamic members are never guessed.
+            const apiParams = member.apiMember?.Parameters;
+            if (Array.isArray(apiParams) && member.kind === "function") {
+              const parsed = playgroundCallArgs(source, masked, callStart);
+              if (parsed) {
+                const variadic = apiParams.some(parameter =>
+                  parameter.Name === "..." || parameter.Type?.Name === "Tuple");
+                const required = apiParams.filter(parameter =>
+                  parameter.Name !== "..." && parameter.Type?.Name !== "Tuple" &&
+                  !Object.prototype.hasOwnProperty.call(parameter, "Default")).length;
+                const max = variadic ? Infinity : apiParams.length;
+                if (parsed.args.length < required || parsed.args.length > max) {
+                  const expected = required === max ? String(required) :
+                    `${required}-${Number.isFinite(max) ? max : "∞"}`;
+                  pushMarker(memberStart, pos, monaco.MarkerSeverity.Error,
+                    `Call to '${memberName}' expected ${expected} parameter(s) but got ${parsed.args.length} instead.`,
+                    "type", "RobloxCallArity");
+                }
+              }
+            }
           }
           const nextExpression = source.slice(start, end);
           const nextType = member.kind === "event" ? "RBXScriptSignal" : member.returnClass || null;
@@ -6908,6 +6931,102 @@ end`;
       }
     }
 
+    // Declared callable arities. Laua extensions use the same names derived
+    // from the embedded runtime; do not remove them when importing Luau APIs.
+    // A missing signature deliberately means "unknown", not "zero parameters".
+    const PLAYGROUND_LIBRARY_ARITIES = {
+      table: {
+        find:[2,3], filter:[2,2], map:[2,2], reduce:[3,3], findWhere:[2,2],
+        clear:[1,1], clone:[1,1], concat:[1,3], create:[1,2], freeze:[1,1],
+        insert:[2,3], isfrozen:[1,1], maxn:[1,1], move:[4,5], pack:[0,Infinity],
+        remove:[1,2], sort:[1,2], unpack:[1,3]
+      },
+      string: {
+        byte:[1,3], char:[0,Infinity], find:[2,4], format:[1,Infinity],
+        gmatch:[2,2], gsub:[3,4], len:[1,1], lower:[1,1], match:[2,3],
+        pack:[1,Infinity], packsize:[1,1], rep:[2,3], reverse:[1,1],
+        split:[2,2], sub:[2,3], unpack:[1,2], upper:[1,1]
+      },
+      math: {
+        abs:[1,1], acos:[1,1], asin:[1,1], atan:[1,2], atan2:[2,2],
+        ceil:[1,1], clamp:[3,3], cos:[1,1], deg:[1,1], exp:[1,1],
+        floor:[1,1], fmod:[2,2], log:[1,2], max:[1,Infinity], min:[1,Infinity],
+        modf:[1,1], noise:[1,3], pow:[2,2], rad:[1,1], random:[0,2],
+        randomseed:[1,2], round:[1,1], sign:[1,1], sin:[1,1], sqrt:[1,1],
+        tan:[1,1]
+      },
+      task: {cancel:[1,1], defer:[1,Infinity], delay:[2,Infinity],
+        desynchronize:[0,0], spawn:[1,Infinity], synchronize:[0,0], wait:[0,1]},
+      coroutine: {close:[1,1], create:[1,1], isyieldable:[0,0],
+        resume:[1,Infinity], running:[0,0], status:[1,1], wrap:[1,1], yield:[0,Infinity]},
+      utf8: {char:[0,Infinity], codes:[1,1], codepoint:[1,3],
+        graphemes:[1,1], len:[1,3], nfcnormalize:[1,1], nfdnormalize:[1,1], offset:[2,3]},
+      os: {clock:[0,0], date:[0,2], difftime:[2,2], time:[0,1]},
+      bit32: {arshift:[2,2], band:[0,Infinity], bnot:[1,1], bor:[0,Infinity],
+        btest:[0,Infinity], bxor:[0,Infinity], extract:[2,3],
+        lrotate:[2,2], lshift:[2,2], replace:[3,4], rrotate:[2,2], rshift:[2,2]},
+      buffer: {create:[1,1], fromstring:[1,1], tostring:[1,1], len:[1,1],
+        copy:[3,5], fill:[3,4], readstring:[3,3], writestring:[4,4],
+        readbits:[3,3], writebits:[4,4]}
+    };
+    for (const method of LAUA_TABLE_EXTENSION_NAMES) {
+      if (!PLAYGROUND_LIBRARY_ARITIES.table[method]) {
+        // The runtime has more helpers than the declared signatures above.
+        // Unknown arity is safer than inventing one.
+        PLAYGROUND_LIBRARY_ARITIES.table[method] = null;
+      }
+    }
+    for (const format of ["i8", "u8", "i16", "u16", "i32", "u32", "f32", "f64"]) {
+      PLAYGROUND_LIBRARY_ARITIES.buffer[`read${format}`] = [2,2];
+      PLAYGROUND_LIBRARY_ARITIES.buffer[`write${format}`] = [3,3];
+    }
+
+    function playgroundCallArgs(source, masked, openParen) {
+      let nested = 0, start = openParen + 1;
+      const args = [];
+      for (let i = openParen + 1; i < masked.length; i++) {
+        const ch = masked[i];
+        if (ch === "(" || ch === "[" || ch === "{") nested++;
+        else if (ch === ")" || ch === "]" || ch === "}") {
+          if (ch === ")" && nested === 0) {
+            const last = source.slice(start, i).trim();
+            if (last || args.length) args.push(last);
+            return {args, end:i};
+          }
+          nested = Math.max(0,nested - 1);
+        } else if (ch === "," && nested === 0) {
+          args.push(source.slice(start, i).trim());
+          start = i + 1;
+        }
+      }
+      return null;
+    }
+
+    function lintPlaygroundLibraryArity(source, masked, directives, pushMarker) {
+      if (directives.mode === "nocheck") return;
+      // Only real global library receivers are checked. Shadowing is treated
+      // conservatively rather than claiming arbitrary user tables are Luau APIs.
+      const shadowed = new Set();
+      for (const match of masked.matchAll(/\b(?:local|const)\s+(table|string|math|task|coroutine|utf8|os|bit32|buffer)\b/g)) shadowed.add(match[1]);
+      const calls = /\b(table|string|math|task|coroutine|utf8|os|bit32|buffer)\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
+      let match;
+      while ((match = calls.exec(masked)) !== null) {
+        const [whole, library, member] = match;
+        if (shadowed.has(library)) continue;
+        const spec = PLAYGROUND_LIBRARY_ARITIES[library]?.[member];
+        if (!spec) continue;
+        const opening = match.index + whole.lastIndexOf("(");
+        const parsed = playgroundCallArgs(source, masked, opening);
+        if (!parsed) continue; // Incomplete code while typing.
+        const n = parsed.args.length;
+        if (n >= spec[0] && n <= spec[1]) continue;
+        const expected = spec[0] === spec[1] ? String(spec[0]) : `${spec[0]}-${Number.isFinite(spec[1]) ? spec[1] : "∞"}`;
+        const position = match.index + whole.indexOf(member);
+        pushMarker(position, position + member.length, monaco.MarkerSeverity.Error,
+          `Call to '${library}.${member}' expected ${expected} parameter(s) but got ${n} instead.`, "type", "LibraryArity");
+      }
+    }
+
     // Conservative, scope-aware strict type pass. This is intentionally separate
     // from the transpiler: unknown/dynamic Roblox types are never guessed.
     // It supplements the lightweight nonstrict checks and honors --!nocheck.
@@ -6998,6 +7117,60 @@ end`;
         const defaultAt = match[2] ? splitTypes(match[2], '=') : [];
         return {name: match[1], type: defaultAt.length ? trimType(defaultAt[0]) : null, defaulted: defaultAt.length > 1};
       }).filter(Boolean);
+      // Check anonymous callback parameter annotations as well as declarations.
+      // An anonymous callback has no named declaration to visit in the scope pass.
+      for (const match of masked.matchAll(/\bfunction\s*\(([^()]*)\)/g)) {
+        const parameters = source.slice(match.index + match[0].indexOf("(") + 1, match.index + match[0].length - 1);
+        const paramsAt = match.index + match[0].indexOf("(") + 1;
+        let consumed = 0;
+        for (const part of splitTypes(parameters, ",")) {
+          const text = part.trim();
+          if (!text) { consumed += part.length + 1; continue; }
+          const name = /^(?:[A-Za-z_]\w*|\.\.\.)/.exec(text)?.[0];
+          if (name && !/^(?:[A-Za-z_]\w*|\.\.\.)\s*:/.test(text)) {
+            const position = source.indexOf(name, paramsAt + consumed);
+            if (position >= 0) pushMarker(position, position + name.length, monaco.MarkerSeverity.Error,
+              `Strict callback parameter '${name}' requires an explicit type annotation.`, "type", "StrictParameterAnnotation");
+          }
+          consumed += part.length + 1;
+        }
+      }
+      // A complete function may be written on one line; the line-scoped
+      // checker below only visits headers that end at a newline.
+      for (const match of masked.matchAll(/\bfunction\s+([A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)?)\s*\(([^()]*)\)([^\n]*)/g)) {
+        // A named one-line function bypasses the line-scoped header parser.
+        if (match[3].trim() && !/^\s*:\s*[^\n]+\s*$/.test(match[3])) {
+          const paramsAt = match.index + match[0].indexOf("(") + 1;
+          let searchFrom = paramsAt;
+          for (const part of splitTypes(source.slice(paramsAt, match.index + match[0].indexOf(")")), ",")) {
+            const parameter = part.trim();
+            const name = /^(?:[A-Za-z_]\w*|\.\.\.)/.exec(parameter)?.[0];
+            if (!name) continue;
+            const position = source.indexOf(name, searchFrom);
+            if (position >= 0) searchFrom = position + name.length;
+            if (!/^(?:[A-Za-z_]\w*|\.\.\.)\s*:/.test(parameter) && position >= 0) {
+              pushMarker(position, position + name.length, monaco.MarkerSeverity.Error,
+                `Strict parameter '${name}' requires an explicit type annotation.`, "type", "StrictParameterAnnotation");
+            }
+          }
+        }
+        const bodyBeforeEnd = match[3].split(/\bend\b/)[0];
+        if (!/\breturn\s+/.test(bodyBeforeEnd)) continue;
+        if (/^\s*:\s*[^\n]+?\s+return\b/.test(source.slice(match.index + match[0].indexOf(")") + 1, match.index + match[0].length))) continue;
+        const at = match.index + match[0].indexOf(match[1]);
+        pushMarker(at, at + match[1].length, monaco.MarkerSeverity.Error,
+          `Strict function '${match[1]}' returns a value but has no explicit return type. Add ': type' to its declaration.`,
+          "type", "StrictReturnAnnotation");
+      }
+      for (const match of masked.matchAll(/\bfunction\s*\(([^()]*)\)([^\n]*)/g)) {
+        const bodyBeforeEnd = match[2].split(/\bend\b/)[0];
+        if (!/\breturn\s+/.test(bodyBeforeEnd)) continue;
+        const originalTail = source.slice(match.index + match[0].indexOf(")") + 1, match.index + match[0].length);
+        if (/^\s*:\s*[^\n]+?\s+return\b/.test(originalTail)) continue;
+        pushMarker(match.index, match.index + "function".length, monaco.MarkerSeverity.Error,
+          `Strict anonymous function returns a value but has no explicit return type. Add ': type' after its parameter list.`,
+          "type", "StrictReturnAnnotation");
+      }
       // Pre-index signatures and simple type aliases. Do not analyze dynamic
       // generic/structural aliases as though they were primitive types.
       for (let i = 0; i < rows.length; i++) {
@@ -7033,6 +7206,23 @@ end`;
           const name = functionHeader?.[1] || "constructor";
           const params = parseArgs(functionHeader ? functionHeader[2] : constructorHeader[1]);
           const result = functionHeader ? trimType(functionHeader[3] || "") || null : null;
+          const rawParams = functionHeader ? functionHeader[2] : constructorHeader[1];
+          const paramStart = row.indexOf("(", functionHeader ? functionHeader.index : constructorHeader.index) + 1;
+          let searchFrom = paramStart;
+          for (const rawParam of splitTypes(rawParams, ",")) {
+            const param = rawParam.trim();
+            if (!param) continue;
+            const declaration = /^(?:([A-Za-z_]\w*)|\.\.\.)(?:\s*:\s*.+)?$/.exec(param);
+            if (!declaration) continue;
+            const paramName = declaration[1] || "...";
+            const loc = row.indexOf(paramName, searchFrom);
+            if (loc >= 0) searchFrom = loc + paramName.length;
+            if (!/^(?:[A-Za-z_]\w*|\.\.\.)\s*:/.test(param)) {
+              const markAt = start + (loc >= 0 ? loc : paramStart);
+              pushMarker(markAt, markAt + paramName.length, monaco.MarkerSeverity.Error,
+                `Strict parameter '${paramName}' requires an explicit type annotation (for example, ${paramName}: any).`, "type", "StrictParameterAnnotation");
+            }
+          }
           pushScope("function", result, name);
           for (const param of params) scopes[scopes.length - 1].variables.set(param.name, {type: param.type});
           if (name === "constructor" || name.includes(":")) scopes[scopes.length - 1].variables.set("self", {type:null});
@@ -7079,10 +7269,35 @@ end`;
           for (let k = scopes.length - 1; k >= 0; k--) {
             if (scopes[k].kind === "function") {functionFrame = scopes[k]; break;}
           }
+          if (functionFrame && !functionFrame.result && returned[1]?.trim() && functionFrame.name !== "constructor") {
+            report(start, row, "return", `Strict function '${functionFrame.name}' returns a value but has no explicit return type. Add ': type' to its declaration.`, "StrictReturnAnnotation");
+          }
           if (functionFrame?.result) {
             const result = returned[1]?.trim() || "nil", actual = valueType(result);
             if (!compatible(functionFrame.result, actual)) {
               report(start, row, "return", `Strict return mismatch in '${functionFrame.name}': expected '${functionFrame.result}', got '${showType(actual)}'.`, "StrictReturn");
+            }
+          }
+        }
+        // Inline early returns are common in Luau (`if bad then return x end`).
+        // The ordinary return check above only handles standalone return lines.
+        if (!returned && /^\s*if\b/.test(code) && /\bthen\s+return\b/.test(code)) {
+          const inline = /\bthen\s+return\s+(.+?)(?:\s+end\s*)?$/.exec(row);
+          if (inline) {
+            let functionFrame = null;
+            for (let k = scopes.length - 1; k >= 0; k--) {
+              if (scopes[k].kind === "function") {functionFrame = scopes[k];break;}
+            }
+            const at = row.indexOf("return", row.indexOf("then"));
+            if (at >= 0 && functionFrame && functionFrame.name !== "constructor") {
+              const actual = valueType(inline[1]);
+              if (!functionFrame.result) {
+                pushMarker(start + at, start + at + 6, monaco.MarkerSeverity.Error,
+                  `Strict function '${functionFrame.name}' returns a value but has no explicit return type. Add ': type' to its declaration.`, "type", "StrictReturnAnnotation");
+              } else if (!compatible(functionFrame.result, actual)) {
+                pushMarker(start + at, start + at + 6, monaco.MarkerSeverity.Error,
+                  `Strict return mismatch in '${functionFrame.name}': expected '${functionFrame.result}', got '${showType(actual)}'.`, "type", "StrictReturn");
+              }
             }
           }
         }
@@ -7824,6 +8039,7 @@ end`;
       lintRobloxApiMembers(source, masked, symbols, pushMarker);
       lintDeprecatedRobloxUsage(masked, symbols, pushMarker);
       lintPlaygroundTypes(source, masked, directives, pushMarker);
+      lintPlaygroundLibraryArity(source, masked, directives, pushMarker);
       lintPlaygroundStrictTypes(source, masked, directives, pushMarker);
       lintPlaygroundDeprecations(source, masked, pushMarker);
 
@@ -9056,6 +9272,7 @@ end`;
         const file={name:normalized,model,output,sourceView:null,outputView:null,errors:0,warnings:0,generated:null};
         file.disposeChange=model.onDidChangeContent(()=>{
           file.generated=null;
+          file.generatedForce=false;
           file.output.setValue("");
           rememberProject();
           refreshEditorIntelligence();
@@ -9657,13 +9874,13 @@ end`;
       // must never replace comparison snapshots.
       const diffSnapshots = [];
 
-      function runTranspile(recordForDiff = false) {
+      function runTranspile(recordForDiff = false, force = false) {
         try {
           const file = projectFiles.get(activeFile);
           const preflight=refreshFileMarkers(file);
-          if(preflight.errors>0)throw new Error(`Laua preflight detected ${preflight.errors} error(s). Fix marked source before transpiling.`);
+          if(!force && preflight.errors>0)throw new Error(`Laua preflight detected ${preflight.errors} error(s). Fix marked source before transpiling.`);
           const importErrors = isCompiledLuauFile(file) ? [] : projectImportMarkers(file);
-          if (importErrors.length) throw new Error(importErrors.map(item=>item.message).join("; "));
+          if (!force && importErrors.length) throw new Error(importErrors.map(item=>item.message).join("; "));
           const output = isCompiledLuauFile(file) ? lauaEditor.getValue() : transpile(lauaEditor.getValue(), {Mode: document.getElementById("modeSelect").value,OutputStyle:document.getElementById("outputStyleSelect").value});
           if (recordForDiff) {
             diffSnapshots.push({
@@ -9680,23 +9897,26 @@ end`;
             const range=makeRangeFromOffsets(luauEditor.getModel(),diagnostic.start,diagnostic.end);
             return {...range,severity:monaco.MarkerSeverity.Error,message:'Generated Luau preflight: '+diagnostic.message};
           }));
-          if(generatedErrors.length)throw new Error(`Generated Luau preflight detected ${generatedErrors.length} syntax issue(s).`);
+          if(!force && generatedErrors.length)throw new Error(`Generated Luau preflight detected ${generatedErrors.length} syntax issue(s).`);
           file.generated=output;
+          file.generatedForce=force;
           const directives = readPlaygroundDirectives(lauaEditor.getValue());
           const inputBytes = new TextEncoder().encode(lauaEditor.getValue()).length;
           const outputBytes = new TextEncoder().encode(output).length;
           const savedBytes = Math.max(0, inputBytes-outputBytes);
-          status.textContent = isCompiledLuauFile(file)
+          status.textContent = force
+            ? `Force transpiled · ${preflight.errors} source error(s), ${importErrors.length} import error(s), ${generatedErrors.length} generated warning(s) bypassed · Generated output may not run in Roblox Studio`
+            : isCompiledLuauFile(file)
             ? `Compiled Luau passthrough (no Laua transformations; Studio analysis not verified) · ${outputBytes.toLocaleString()} bytes${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`
             : `Transpiled (preflight only; Studio not verified) · ${document.getElementById("modeSelect").value} · ${inputBytes.toLocaleString()} → ${outputBytes.toLocaleString()} bytes${savedBytes ? ` · ${savedBytes.toLocaleString()} fewer bytes` : ""} · Roblox optimize ${directives.optimize ?? "default"}${recordForDiff ? (diffSnapshots.length === 2 ? " · Output Diff ready" : " · Output Diff 1/2") : ""}`;
-          status.className = "ok";
+          status.className = force && (preflight.errors || importErrors.length || generatedErrors.length) ? "error" : "ok";
           return output;
         } catch (err) {
           // Never let Copy use stale code from an earlier successful transpilation.
           const failureMessage = err?.message || String(err);
           monaco.editor.setModelMarkers(luauEditor.getModel(),'laua-generated',[]);
           luauEditor.setValue("-- Transpilation failed. Fix the error in the Laua editor.\n-- " + String(failureMessage).replaceAll("\n", "\n-- "));
-          if (activeFile) projectFiles.get(activeFile).generated=null;
+          if (activeFile) { projectFiles.get(activeFile).generated=null; projectFiles.get(activeFile).generatedForce=false; }
           status.textContent = "Transpile error: " + failureMessage;
           status.className = "error";
           return null;
@@ -9776,7 +9996,8 @@ end`;
           return;
         }
 
-        const output = runTranspile();
+        const file = projectFiles.get(activeFile);
+        const output = file?.generatedForce && file.generated !== null ? file.generated : runTranspile();
         if (output === null) return;
         if (!output.trim()) {
           status.textContent = "Nothing to copy. The transpiled output is empty.";
@@ -9858,6 +10079,7 @@ end`;
       lauaEditor.addCommand(monaco.KeyCode.F8,jumpToNextProblem);
       document.getElementById("lintBtn").addEventListener("click", () => runLint(true));
       document.getElementById("transpileBtn").addEventListener("click", () => runTranspile(true));
+      document.getElementById("forceTranspileBtn").addEventListener("click", () => runTranspile(true, true));
       copyButton.addEventListener("click", copyTranspiledCode);
       document.getElementById("modeSelect").addEventListener("change", () => runTranspile(true));
       document.getElementById("outputStyleSelect").addEventListener("change", () => runTranspile(true));
@@ -9894,7 +10116,8 @@ end`;
         }
       });
       document.getElementById("exportBtn").addEventListener("click", () => {
-        const output = runTranspile();
+        const file = projectFiles.get(activeFile);
+        const output = file?.generatedForce && file.generated !== null ? file.generated : runTranspile();
         if (output === null) return;
         const url = URL.createObjectURL(new Blob([output], {type:"text/plain;charset=utf-8"}));
         const a = document.createElement("a");
