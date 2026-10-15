@@ -5296,8 +5296,20 @@ end`;
       if (symbols.namespaces[owner]) return symbols.namespaces[owner].members;
       if (symbols.enums[owner]) return symbols.enums[owner].members;
       if (symbols.classes[owner]) {
-        const declared = collectVisibleClassMembers(symbols, owner, cursorOffset, true);
-        return operator === "." ? {new:{kind:"function",detail:"Laua class constructor"},...declared} : declared;
+        // Show the user-declared class API when exploring a Laua class name or
+        // imported alias. The generated `.new` constructor is an implementation
+        // detail: source code instantiates classes with `new ClassName(...)`.
+        // Keep visibility filtering and distinguish instance from static members.
+        const instanceMembers = collectVisibleClassMembers(symbols, owner, cursorOffset, false);
+        const staticMembers = collectVisibleClassMembers(symbols, owner, cursorOffset, true);
+        const declared = {};
+        for (const [name, info] of Object.entries(instanceMembers)) {
+          declared[name] = {...info, detail: `${info.detail || "Laua class member"} (instance)`};
+        }
+        for (const [name, info] of Object.entries(staticMembers)) {
+          declared[name] = {...info, detail: `${info.detail || "Laua class member"} (static)`};
+        }
+        return operator === "." ? declared : {};
       }
       if (symbols.variables[owner]) return collectVisibleClassMembers(symbols, symbols.variables[owner].className, cursorOffset, false);
 
