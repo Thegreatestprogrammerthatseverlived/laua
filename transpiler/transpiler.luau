@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.49"}
+local Transpiler = {Version = "3.52"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -262,8 +262,12 @@ LauaCore.table = {}
 
 function LauaCore.table.filter<T>(items: {T}, predicate: (T, number) -> boolean): {T}
     local out: {T} = {}
+    local length = 0
     for index, item in items do
-        if predicate(item, index) then table.insert(out, item) end
+        if predicate(item, index) then
+            length += 1
+            out[length] = item
+        end
     end
     return out
 end
@@ -821,7 +825,7 @@ local function transpileClasses(source: string): string
         end
 
         local ctorBody = ctor and ctor.Body or ""
-        local parentInit = base and `{base}.__init(self{ctor and trim(ctor.Params) ~= "" and ", " .. getParams(ctor.Params) or ""})` or nil
+        local parentInit = base and `{base}.__init(self{not ctor and ", ..." or trim(ctor.Params) ~= "" and ", " .. getParams(ctor.Params) or ""})` or nil
         if base and ctor then
             local ctorLines = splitLines(ctorBody)
             for _, row in ctorLines do
@@ -940,7 +944,7 @@ local function transpileClasses(source: string): string
                 table.insert(simple, `{name}.__finalMethods = {base and "setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})" or finalTable}`)
             end
             for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
-            table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
+            table.insert(simple, `function {name}.__init(self: any{not ctor and base and ", ...: any" or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             if parentInit then table.insert(simple, "    " .. parentInit) end
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
             local init = normalized(transpileSource(ctorBody), "    ")
@@ -990,18 +994,22 @@ local function transpileClasses(source: string): string
                 if method.Final then table.insert(finalEntries, `["{method.Name}"] = true`) end
             end
             local finalTable = "{" .. table.concat(finalEntries, ", ") .. "}"
-            local finalMethods = base and ("setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})") or finalTable
+            local hasOwnFinalMethods = false
+            for _, method in methods do if method.Final then hasOwnFinalMethods = true; break end end
+            local finalMethods = base and (hasOwnFinalMethods and ("setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})") or ("(" .. base .. ".__finalMethods or {})")) or finalTable
             table.insert(generated, `{name}.__finalMethods = {finalMethods}`)
         end
-        local function inherited(tableName: string): string
-            return base and ("setmetatable({}, {__index = " .. base .. "." .. tableName .. " or {}})") or "{}"
+        local function inherited(tableName: string, hasLocalEntries: boolean): string
+            if not base then return "{}" end
+            if hasLocalEntries then return "setmetatable({}, {__index = " .. base .. "." .. tableName .. " or {}})" end
+            return "(" .. base .. "." .. tableName .. " or {})"
         end
-        if usesGetters then table.insert(generated, `{name}.__getters = {inherited("__getters")}`) end
-        if usesSetters then table.insert(generated, `{name}.__setters = {inherited("__setters")}`) end
-        if usesLazy then table.insert(generated, `{name}.__lazy = {inherited("__lazy")}`) end
+        if usesGetters then table.insert(generated, `{name}.__getters = {inherited("__getters", #getters > 0)}`) end
+        if usesSetters then table.insert(generated, `{name}.__setters = {inherited("__setters", #setters > 0)}`) end
+        if usesLazy then table.insert(generated, `{name}.__lazy = {inherited("__lazy", next(lazies) ~= nil)}`) end
         if usesWatchers then
-            table.insert(generated, `{name}.__watchers = {inherited("__watchers")}`)
-            table.insert(generated, `{name}.__watchedFields = {inherited("__watchedFields")}`)
+            table.insert(generated, `{name}.__watchers = {inherited("__watchers", next(watchers) ~= nil)}`)
+            table.insert(generated, `{name}.__watchedFields = {inherited("__watchedFields", next(watchers) ~= nil)}`)
             for watchName in watchers do table.insert(generated, `{name}.__watchedFields["{watchName}"] = true`) end
         end
         if not usesGetters and not usesLazy and not usesWatchers then
@@ -1062,7 +1070,7 @@ local function transpileClasses(source: string): string
             table.insert(generated, "end")
         end
         for _, field in statics do if field.Value ~= nil then table.insert(generated, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
-        table.insert(generated, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
+        table.insert(generated, `function {name}.__init(self: any{not ctor and base and ", ...: any" or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
         if parentInit then table.insert(generated, "    " .. parentInit) end
         for _, field in fields do
             if field.Value == nil then continue end
@@ -1211,6 +1219,7 @@ local function transpileExports(source: string): (string, {string}, string?)
         local isClass = rest:match("^class%s+") ~= nil or rest:match("^final%s+class%s+") ~= nil or rest:match("^abstract%s+class%s+") ~= nil
         if isClass and className then error(`Only one export class is allowed per module (already exported '{className}', found '{name}')`) end
         if seen[name] then error(`Duplicate export '{name}'`) end
+        if (isClass and #names > 0) or (not isClass and className ~= nil) then error("An exported class must be the only export in its module") end
         if isClass then className = name end
         seen[name] = true
         table.insert(names, name)
@@ -1228,11 +1237,13 @@ local function transpileImports(source: string): string
             table.insert(result, raw)
             continue
         end
-        local name, path = line:match('^import%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
+        local name, alias, path = line:match('^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
+        if not name then name, alias, path = line:match("^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
+        if not name then name, path = line:match('^import%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$') end
         if not name then name, path = line:match("^import%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
         local named, namedPath = line:match('^import%s+[{](.-)[}]%s+from%s+"([^"\n]+)"%s*$')
         if not named then named, namedPath = line:match("^import%s+[{](.-)[}]%s+from%s+'([^'\n]+)'%s*$") end
-        if not name and not named then error("Expected import Name or import {Name} from \"./Module\"") end
+        if not name and not named then error("Expected import Name [as Alias] or import {Name} from \"./Module\"") end
         path = path or namedPath
         if path:sub(1, 2) ~= "./" and path:sub(1, 3) ~= "../" then error("Import path must be relative to script: ./ or ../") end
         local current = "script.Parent"
@@ -1263,7 +1274,7 @@ local function transpileImports(source: string): string
             table.insert(result, indent .. `local {temporary} = require({current})`)
             for _, entry in locals do table.insert(result, indent .. `local {entry.Local} = {temporary}.{entry.External}`) end
         else
-            table.insert(result, indent .. `local {name} = require({current})`)
+            table.insert(result, indent .. `local {alias or name} = require({current})`)
         end
     end
     return table.concat(result, "\n")
@@ -1718,7 +1729,7 @@ local function transpileCoalescing(source: string): (string, boolean)
         local replacement: string
         if b == "nil" and a:match("^[%a_][%w_]*$") then
             replacement = a
-        elseif a:match("^[%a_][%w_]*$") and (b:match("^[%a_][%w_]*$") or (b:match("^%d[%d_]*$") or b:match("^%d[%d_]*%.%d[%d_]*$")) or b:match("^0[xX][%da-fA-F_]+$") or b:match("^0[bB][01_]+$")) and a ~= "true" and a ~= "false" and a ~= "nil" then
+        elseif a:match("^[%a_][%w_]*$") and (b:match("^[%a_][%w_]*$") or (b:match("^%d[%d_]*$") or b:match("^%d[%d_]*%.%d[%d_]*$")) or b:match("^0[xX][%da-fA-F_]+$") or b:match("^0[bB][01_]+$") or b:match('^"[^"\\]*"$') or b:match("^'[^'\\]*'$") ) and a ~= "true" and a ~= "false" and a ~= "nil" then
             replacement = `(if {a} ~= nil then {a} else {b})`
         else
             replacement = `__lauaCore.coalesce({a}, function() return {b} end)`
@@ -2861,8 +2872,9 @@ local function validateLauaSemantics(source: string): {any}
     for _, importLine in splitLines(masked) do
         local text = trim(importLine.Text)
         local named = text:match('^import%s+%{(.-)%}%s+from%s+')
-        local importedDefault = text:match('^import%s+([%a_][%w_]*)%s+from%s+')
-        if importedDefault then importedSymbols[importedDefault] = true end
+        local importedDefault, importedAlias = text:match('^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+')
+        if not importedDefault then importedDefault = text:match('^import%s+([%a_][%w_]*)%s+from%s+') end
+        if importedDefault then importedSymbols[importedAlias or importedDefault] = true end
         if named then
             for piece in named:gmatch('[^,]+') do
                 local original, replacement = trim(piece):match('^([%a_][%w_]*)%s+as%s+([%a_][%w_]*)$')
@@ -3012,6 +3024,18 @@ local function validateLauaSemantics(source: string): {any}
         end
         return nil
     end
+    local function inheritedConstructor(className: string): string?
+        local seen = {}
+        local current: string? = className
+        while current and not seen[current] do
+            seen[current] = true
+            local info = classes[current]
+            if not info then return nil end
+            if info.Constructor ~= nil then return info.Constructor end
+            current = info.Base
+        end
+        return ""
+    end
     for _, line in lines do
         local code = line.Text
         local name, className, arguments = code:match("local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)%s*%(([^)]*)%)")
@@ -3029,7 +3053,7 @@ local function validateLauaSemantics(source: string): {any}
                 local closeAt = code:find("%)", startAt or open)
                 if startAt and closeAt then rawArguments = raw:sub(startAt + 1, closeAt - 1) end
             end
-            if classes[className] then checkCall(className .. " constructor", classes[className].Constructor or "", rawArguments, line.Start) end
+            if classes[className] then checkCall(className .. " constructor", inheritedConstructor(className), rawArguments, line.Start) end
         end
         local typedName, typedClass = code:match("local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)")
         if typedName and classes[typedClass] then knownVariables[typedName] = typedClass end
@@ -3107,6 +3131,8 @@ local function validateLauaSemantics(source: string): {any}
         for name in line.Text:gmatch("%f[%w_]for%s+([%a_][%w_]*)") do knownCalls[name] = true end
         for name in line.Text:gmatch("%f[%w_]function%s+([%a_][%w_]*)") do knownCalls[name] = true end
         for name in line.Text:gmatch("%f[%w_]import%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        local _, importedAlias = line.Text:match("^%s*import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+")
+        if importedAlias then knownCalls[importedAlias] = true end
         for _, pattern in {"function%s+[%a_][%w_]*%s*%(([^)]*)%)", "function%s+[%a_][%w_]*%s*%b<>%s*%(([^)]*)%)"} do
             for params in line.Text:gmatch(pattern) do
                 for _, part in paramParts(params) do
@@ -3772,7 +3798,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     if awaitCount > 0 and asyncCount == 0 then error("await requires an async function") end
     if source:find("function", 1, true) and source:find("=", 1, true) then source = transpileParameterDefaults(source) end
     if source:find("__laua", 1, true) then source = insertEmbeddedRuntimes(source) end
-    if exportedClassName and #exportedNames == 1 then
+    if exportedClassName then
         source ..= "\nreturn " .. exportedClassName
     elseif #exportedNames > 0 then
         local values = {}
