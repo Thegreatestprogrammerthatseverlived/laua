@@ -5283,7 +5283,10 @@ end`;
       // User-defined Laua symbols always win.
       if (symbols.namespaces[owner]) return symbols.namespaces[owner].members;
       if (symbols.enums[owner]) return symbols.enums[owner].members;
-      if (symbols.classes[owner]) return collectVisibleClassMembers(symbols, owner, cursorOffset, true);
+      if (symbols.classes[owner]) {
+        const declared = collectVisibleClassMembers(symbols, owner, cursorOffset, true);
+        return operator === "." ? {new:{kind:"function",detail:"Laua class constructor"},...declared} : declared;
+      }
       if (symbols.variables[owner]) return collectVisibleClassMembers(symbols, symbols.variables[owner].className, cursorOffset, false);
 
       // The engine's Instance class has instance methods, but the global
@@ -5749,10 +5752,7 @@ end`;
       "class", "extends", "constructor", "private", "public", "protected",
       "static", "new", "namespace", "super", "abstract", "override", "enum",
       "final", "get", "set", "defer", "using", "async", "await",
-      "match", "case", "default", "import", "from", "operator", "lazy", "watch", "export", "as",
-      "lazy", "watch", "as", "export", "lazy", "watch", "export", "as",
-      "lazy", "watch", "as", "export", "lazy", "watch", "export", "as",
-      "lazy", "watch", "as", "export"
+      "match", "case", "default", "import", "from", "operator", "lazy", "watch", "export", "as"
     ];
 
     function lintEditDistance(a, b) {
@@ -7839,7 +7839,11 @@ end`;
               }
               k++;
             }
-          } else if (tokens[k]?.word) declare(k);
+          } else if (tokens[k]?.word) {
+            if (at(k + 1) === 'as' && tokens[k + 2]?.word) {
+              mark(k); mark(k + 1); declare(k + 2);
+            } else declare(k);
+          }
           // `from` is syntax, not a variable reference.
           continue;
         }
@@ -7985,7 +7989,7 @@ end`;
       return result;
     }
 
-    function updateLauaDiagnostics(model) {
+    function updateLauaDiagnostics(model, projectSymbols = null) {
       if (model.getLanguageId() !== "laua") return;
 
       const source = model.getValue();
@@ -7994,7 +7998,7 @@ end`;
       // The actual transpiler still validates the full unmodified source.
       const lintSource = editorLintContractSource(source);
       const masked = maskNonCode(lintSource);
-      const symbols = getLauaSymbols(lintSource);
+      const symbols = projectSymbols || getLauaSymbols(lintSource);
       const markers = [];
       const directives = readPlaygroundDirectives(source);
 
@@ -8538,6 +8542,20 @@ end`;
           // generalized-iteration snippets, or speculative multi-line code.
 
           const sourceSymbols = getProjectSymbols(model);
+          const directImportPosition = /^\s*import\s+([A-Za-z_]\w*)?$/.exec(lineBefore);
+          if (isLaua && directImportPosition && findFileByModel(model)) {
+            const exportedClasses = new Set();
+            for (const file of projectFiles.values()) {
+              if (file.model === model || isCompiledLuauFile(file)) continue;
+              for (const info of Object.values(scanProjectExports(file.model.getValue()))) {
+                if (info.kind === "class") exportedClasses.add(info.name);
+              }
+            }
+            return {suggestions:[...exportedClasses].filter(name => !typedPrefix || name.toLowerCase().startsWith(typedPrefix.toLowerCase())).filter(name => name !== directImportPosition[1]).map(name => ({
+              label:name, insertText:name, kind:monaco.languages.CompletionItemKind.Class,
+              detail:"Exported Laua class", sortText:"0000_"+name, range
+            }))};
+          }
           // `self` is a contextual Laua keyword, not a global Luau value.
           // Only suggest it where an instance receiver is supplied implicitly.
           if (isLaua && hasImplicitSelfAtOffset(model.getValue(), sourceSymbols, model.getOffsetAt(position))) {
@@ -9227,6 +9245,7 @@ end`;
                   if(m && (m[2]||m[1])===word && exported[m[1]])remoteName=m[1];
                 }
               }
+              if(imp.name===word && exported[imp.importedName])remoteName=imp.importedName;
               if(imp.name===owner && exported[word])remoteName=word;
               if(remoteName){
                 const offset=findDeclaredSymbolOffset(remote.model.getValue(),remoteName);
@@ -9234,7 +9253,7 @@ end`;
               }
             }
           }
-          const symbols=getLauaSymbols(source);
+          const symbols=getProjectSymbols(model);
           const info=symbols.classes[word]||symbols.namespaces[word]||symbols.enums[word];
           const offset=info?.start ?? findDeclaredSymbolOffset(source,word);
           if(offset<0 || !Number.isInteger(offset))return null;
@@ -9304,9 +9323,9 @@ end`;
           const code = sourceLines[row];
           const trimmed = maskNonCode(code).trim();
           if (!/^import\b/.test(trimmed)) continue;
-          const match = code.match(/^\s*import\s+(?:([A-Za-z_]\w*)|\{([^{}]+)\})\s+from\s+["']([^"'\n]+)["']\s*$/);
+          const match = code.match(/^\s*import\s+(?:([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?|\{([^{}]+)\})\s+from\s+(["'])([^"'\n]+)\4\s*$/);
           if (!match) continue; // ordinary parser/linter handles malformed imports
-          imports.push({name:match[1],named:match[2],path:match[3],target:resolveProjectImport(fileName,match[3]),line:row + 1});
+          imports.push({name:match[2] || match[1],importedName:match[1] || null,named:match[3] || null,path:match[5],target:resolveProjectImport(fileName,match[5]),line:row + 1});
         }
         return cacheProjectScan(scanCacheImports,key,imports);
       }
@@ -9339,10 +9358,21 @@ end`;
             remoteSymbols = getLauaSymbols(indexedSource);
           } catch { continue; }
           if (imp.name) {
-            localSymbols.namespaces[imp.name] = {
-              name:imp.name, start:0, end:0,
-              members:Object.fromEntries(Object.entries(exports).map(([key,value]) => [key, {kind:value.kind === "function" ? "function" : "field", detail:`Export from ${imp.target}`}]))
-            };
+            const directExport = exports[imp.importedName];
+            if (directExport?.kind === "class" && remoteSymbols.classes[imp.importedName]) {
+              localSymbols.classes[imp.name] = {
+                ...remoteSymbols.classes[imp.importedName],
+                name: imp.name, start: -1, end: -1,
+                importedFrom: imp.target, originalName: imp.importedName
+              };
+              delete localSymbols.namespaces[imp.name];
+            } else {
+              // Non-class direct imports are still ordinary namespace/table values.
+              localSymbols.namespaces[imp.name] = {
+                name:imp.name, start:-1, end:-1,
+                members:Object.fromEntries(Object.entries(exports).map(([key,value]) => [key, {kind:value.kind === "function" ? "function" : "field", detail:`Export from ${imp.target}`}]))
+              };
+            }
           }
           if (imp.named) {
             for (const clause of imp.named.split(",")) {
@@ -9364,6 +9394,12 @@ end`;
             }
           }
         }
+        for (const [name, info] of Object.entries(localSymbols.locals)) {
+          const typeName = info.type?.replace(/\?$/, "").trim();
+          if (typeName && localSymbols.classes[typeName]) {
+            localSymbols.variables[name] ||= {kind:"instance",className:typeName};
+          }
+        }
         return localSymbols;
       }
 
@@ -9380,14 +9416,23 @@ end`;
           let message = null;
           if (!imp.target) message = `Invalid project import '${imp.path}'.`;
           else if (!targetFile) message = `Missing project file '${imp.target}' (imported as ${imp.path}).`;
-          else if (imp.named) {
+          else {
             const exports = scanProjectExports(targetFile.model.getValue());
-            for (const part of imp.named.split(",")) {
-              const name = part.trim().match(/^([A-Za-z_]\w*)/);
-              if (name && !exports[name[1]]) {
-                message = `'${name[1]}' is not exported from ${imp.target}.`;
-                break;
+            const directClass = Object.values(exports).find(info => info.kind === "class");
+            if (imp.named) {
+              for (const part of imp.named.split(",")) {
+                const name = part.trim().match(/^([A-Za-z_]\w*)/);
+                if (name && !exports[name[1]]) {
+                  message = `'${name[1]}' is not exported from ${imp.target}.`;
+                  break;
+                }
+                if (name && directClass && name[1] === directClass.name) {
+                  message = `Class '${name[1]}' is returned directly by ${imp.target}. Use import ${name[1]} from "${imp.path}" instead.`;
+                  break;
+                }
               }
+            } else if (directClass && imp.importedName !== directClass.name) {
+              message = `Module '${imp.target}' exports class '${directClass.name}', not '${imp.importedName}'. Use import ${directClass.name}${imp.name !== imp.importedName ? ` as ${imp.name}` : ""} from "${imp.path}".`;
             }
           }
           if (message) markers.push({severity:monaco.MarkerSeverity.Error, startLineNumber:imp.line, endLineNumber:imp.line, startColumn:1, endColumn:Math.max(2,file.model.getLineMaxColumn(imp.line)), message, source:"Laua project"});
@@ -9402,7 +9447,7 @@ end`;
           file.errors=0;file.warnings=0;
           return {errors:0,warnings:0,hints:0,directives:readPlaygroundDirectives(file.model.getValue())};
         }
-        const result = updateLauaDiagnostics(file.model);
+        const result = updateLauaDiagnostics(file.model, getProjectSymbols(file.model));
         const base = monaco.editor.getModelMarkers({owner:"laua",resource:file.model.uri}) || [];
         const projectErrors = projectImportMarkers(file);
         const source=file.model.getValue(),masked=maskNonCode(source);
