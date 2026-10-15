@@ -3256,9 +3256,21 @@ local part = message[1:7]`;
           const found=(isStatic?info.statics:info.instance).get(member);if(found)return found;current=info.base;}
         return null;
       };
-      for(const m of masked.matchAll(/\b(?:local\s+|const\s+)?([A-Za-z_]\w*)\s*(?::\s*([A-Za-z_]\w*))?\s*=\s*new\s+([A-Za-z_]\w*)\s*(?:\(([^\n)]*)\))?/g)){
-        if(!classes.has(m[3])){if(!importedSymbols.has(m[3])&&!m[3].includes('.'))fail(`Unknown class '${m[3]}'.`,m.index);continue;}
-        knownVariables.set(m[1],m[3]);checkCall(`${m[3]} constructor`,classes.get(m[3]).ctor||[],m[4]===undefined?'':source.slice(m.index+m[0].lastIndexOf('(')+1,m.index+m[0].length-1),m.index+m[0].indexOf('new'));
+      // Match the declaration through the class name only. A regular expression
+      // that stops at the first ')' truncates nested calls such as
+      // new PlayerTracker(CFrame.new(0, 10, 0)) and invents extra arguments.
+      for(const m of masked.matchAll(/\b(?:local\s+|const\s+)?([A-Za-z_]\w*)\s*(?::\s*([A-Za-z_]\w*))?\s*=\s*new\s+([A-Za-z_]\w*)\b/g)){
+        if(!classes.has(m[3])){if(!importedSymbols.has(m[3]))fail(`Unknown class '${m[3]}'.`,m.index);continue;}
+        knownVariables.set(m[1],m[3]);
+        const callStart = m.index + m[0].length;
+        const opening = /^[ \t]*\(/.exec(masked.slice(callStart));
+        let argumentsText = '';
+        if(opening){
+          const openAt = callStart + opening[0].length - 1;
+          const closeAt = findMatchingParen(source, openAt, masked);
+          argumentsText = source.slice(openAt + 1, closeAt);
+        }
+        checkCall(`${m[3]} constructor`, classes.get(m[3]).ctor || [], argumentsText, m.index + m[0].lastIndexOf('new'));
       }
       for(const m of masked.matchAll(/\blocal\s+(\w+)\s*:\s*(\w+)\b/g)){if(classes.has(m[2])&&!knownVariables.has(m[1])) knownVariables.set(m[1],m[2]);}
       // Lexically scoped class inference: a nested `local p = new Child()` must
