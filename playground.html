@@ -1253,7 +1253,7 @@ local part = message[1:7]`;
         }
 
         let constructorBody = ctor?.body || "";
-        let parentInit = base ? `${base}.__init(self${ctor?.params?.trim() ? ", " + ctor.params.split(",").map(param => param.trim().split(":")[0].trim()).join(", ") : ""})` : "";
+        let parentInit = base ? `${base}.__init(self${!ctor ? ", ..." : ctor.params.trim() ? ", " + ctor.params.split(",").map(param => param.trim().split(":")[0].trim()).join(", ") : ""})` : "";
         if (base && ctor) {
           const rows = constructorBody.split("\n");
           let firstExec = rows.findIndex(row => row.trim() && !row.trim().startsWith("--"));
@@ -1338,7 +1338,7 @@ local part = message[1:7]`;
             output += `${name}.__finalMethods = ${base ? `setmetatable({${ownFinals}}, {__index = ${base}.__finalMethods or {}})` : `{${ownFinals}}`}\n`;
           }
           for (const field of statics) if (field.value !== null) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
-          const arglist = ctor?.params?.trim() ? ', ' + ctor.params : '';
+          const arglist = ctor?.params?.trim() ? ', ' + ctor.params : base && !ctor ? ', ...: any' : '';
           output += `function ${name}.__init(self: any${arglist})\n`;
           if (parentInit) output += `    ${parentInit}\n`;
           for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
@@ -3225,7 +3225,7 @@ local part = message[1:7]`;
             const lineEnd=bodyMasked.indexOf('\n',m.index), prefix=bodyMasked.slice(m.index,lineEnd===-1?bodyMasked.length:lineEnd);
             if(/^\s*(?:local|return|self\.|if\b|for\b)/.test(prefix))continue;
             const staticMember=/\bstatic\b/.test(prefix.split(/\b(?:function|lazy|get|set)\b/)[0]);
-            if(m[4]){info.ctor=signature(m[4]);continue;}
+            if(m[4] !== undefined){info.ctor=signature(m[4]);continue;}
             const name=m[2]||m[5]||m[7]||m[8];if(!name)continue;
             const accessorKind=m[5] ? /\b(get|set)\s+[A-Za-z_]\w*\s*\(/.exec(prefix)?.[1] : null;
             const target=staticMember?info.statics:info.instance;
@@ -3250,6 +3250,18 @@ local part = message[1:7]`;
         while(base&&classes.has(base)&&!visited.has(base)){visited.add(base);base=classes.get(base).base;}
         if(base && visited.has(base)) fail(`Circular class inheritance involving '${name}'.`, info.start);
       }
+      const inheritedConstructor = className => {
+        let current = className;
+        const seen = new Set();
+        while (current && !seen.has(current)) {
+          seen.add(current);
+          const info = classes.get(current);
+          if (!info) return null;
+          if (info.ctor !== null) return info.ctor;
+          current = info.base;
+        }
+        return [];
+      };
       const findMember = (className,member,isStatic=false) => {
         const seen=new Set();let current=className;
         while(current&&!seen.has(current)){seen.add(current);const info=classes.get(current);if(!info)return null;
@@ -3270,7 +3282,7 @@ local part = message[1:7]`;
           const closeAt = findMatchingParen(source, openAt, masked);
           argumentsText = source.slice(openAt + 1, closeAt);
         }
-        checkCall(`${m[3]} constructor`, classes.get(m[3]).ctor || [], argumentsText, m.index + m[0].lastIndexOf('new'));
+        checkCall(`${m[3]} constructor`, inheritedConstructor(m[3]), argumentsText, m.index + m[0].lastIndexOf('new'));
       }
       for(const m of masked.matchAll(/\blocal\s+(\w+)\s*:\s*(\w+)\b/g)){if(classes.has(m[2])&&!knownVariables.has(m[1])) knownVariables.set(m[1],m[2]);}
       // Lexically scoped class inference: a nested `local p = new Child()` must
@@ -3604,7 +3616,7 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.50";
+    const LAUA_VERSION = "3.51";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
