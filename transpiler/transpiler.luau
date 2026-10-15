@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.49"}
+local Transpiler = {Version = "3.50"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -1211,6 +1211,7 @@ local function transpileExports(source: string): (string, {string}, string?)
         local isClass = rest:match("^class%s+") ~= nil or rest:match("^final%s+class%s+") ~= nil or rest:match("^abstract%s+class%s+") ~= nil
         if isClass and className then error(`Only one export class is allowed per module (already exported '{className}', found '{name}')`) end
         if seen[name] then error(`Duplicate export '{name}'`) end
+        if (isClass and #names > 0) or (not isClass and className ~= nil) then error("An exported class must be the only export in its module") end
         if isClass then className = name end
         seen[name] = true
         table.insert(names, name)
@@ -1228,11 +1229,13 @@ local function transpileImports(source: string): string
             table.insert(result, raw)
             continue
         end
-        local name, path = line:match('^import%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
+        local name, alias, path = line:match('^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
+        if not name then name, alias, path = line:match("^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
+        if not name then name, path = line:match('^import%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$') end
         if not name then name, path = line:match("^import%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
         local named, namedPath = line:match('^import%s+[{](.-)[}]%s+from%s+"([^"\n]+)"%s*$')
         if not named then named, namedPath = line:match("^import%s+[{](.-)[}]%s+from%s+'([^'\n]+)'%s*$") end
-        if not name and not named then error("Expected import Name or import {Name} from \"./Module\"") end
+        if not name and not named then error("Expected import Name [as Alias] or import {Name} from \"./Module\"") end
         path = path or namedPath
         if path:sub(1, 2) ~= "./" and path:sub(1, 3) ~= "../" then error("Import path must be relative to script: ./ or ../") end
         local current = "script.Parent"
@@ -1263,7 +1266,7 @@ local function transpileImports(source: string): string
             table.insert(result, indent .. `local {temporary} = require({current})`)
             for _, entry in locals do table.insert(result, indent .. `local {entry.Local} = {temporary}.{entry.External}`) end
         else
-            table.insert(result, indent .. `local {name} = require({current})`)
+            table.insert(result, indent .. `local {alias or name} = require({current})`)
         end
     end
     return table.concat(result, "\n")
@@ -2861,8 +2864,9 @@ local function validateLauaSemantics(source: string): {any}
     for _, importLine in splitLines(masked) do
         local text = trim(importLine.Text)
         local named = text:match('^import%s+%{(.-)%}%s+from%s+')
-        local importedDefault = text:match('^import%s+([%a_][%w_]*)%s+from%s+')
-        if importedDefault then importedSymbols[importedDefault] = true end
+        local importedDefault, importedAlias = text:match('^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+')
+        if not importedDefault then importedDefault = text:match('^import%s+([%a_][%w_]*)%s+from%s+') end
+        if importedDefault then importedSymbols[importedAlias or importedDefault] = true end
         if named then
             for piece in named:gmatch('[^,]+') do
                 local original, replacement = trim(piece):match('^([%a_][%w_]*)%s+as%s+([%a_][%w_]*)$')
@@ -3107,6 +3111,8 @@ local function validateLauaSemantics(source: string): {any}
         for name in line.Text:gmatch("%f[%w_]for%s+([%a_][%w_]*)") do knownCalls[name] = true end
         for name in line.Text:gmatch("%f[%w_]function%s+([%a_][%w_]*)") do knownCalls[name] = true end
         for name in line.Text:gmatch("%f[%w_]import%s+([%a_][%w_]*)") do knownCalls[name] = true end
+        local _, importedAlias = line.Text:match("^%s*import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+")
+        if importedAlias then knownCalls[importedAlias] = true end
         for _, pattern in {"function%s+[%a_][%w_]*%s*%(([^)]*)%)", "function%s+[%a_][%w_]*%s*%b<>%s*%(([^)]*)%)"} do
             for params in line.Text:gmatch(pattern) do
                 for _, part in paramParts(params) do
@@ -3772,7 +3778,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     if awaitCount > 0 and asyncCount == 0 then error("await requires an async function") end
     if source:find("function", 1, true) and source:find("=", 1, true) then source = transpileParameterDefaults(source) end
     if source:find("__laua", 1, true) then source = insertEmbeddedRuntimes(source) end
-    if exportedClassName and #exportedNames == 1 then
+    if exportedClassName then
         source ..= "\nreturn " .. exportedClassName
     elseif #exportedNames > 0 then
         local values = {}
