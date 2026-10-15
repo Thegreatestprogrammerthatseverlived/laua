@@ -1648,6 +1648,7 @@ local part = message[1:7]`;
         const classDeclaration = /^(?:(?:final|abstract)\s+)?class\s+/.test(rest);
         if (classDeclaration && className) throw new Error(`Only one export class is allowed per module (already exported '${className}', found '${name}')`);
         if (found.has(name)) throw new Error(`Duplicate export '${name}'`);
+        if ((classDeclaration && names.length > 0) || (!classDeclaration && className)) throw new Error('An exported class must be the only export in its module');
         if (classDeclaration) className = name;
         found.add(name); names.push(name);
         return match[1].replace(/[^ \t]/g, ' ') + rest + (match[3] || '');
@@ -1660,9 +1661,9 @@ local part = message[1:7]`;
       return splitLinesWithOffsets(source).map(line => {
         const raw = line.text;
         if (!raw.includes('import') || !/^import\b/.test(maskNonCode(raw).trim())) return raw;
-        const match = raw.match(/^([ \t]*)import\s+(?:([A-Za-z_]\w*)|\{([^{}]+)\})\s+from\s+(["'])([^"'\n]+)\4\s*$/);
-        if (!match) throw new Error('Expected import Name or import {Name} from "./Module"');
-        const [, indent, name, named, , path] = match;
+        const match = raw.match(/^([ \t]*)import\s+(?:([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?|\{([^{}]+)\})\s+from\s+(["'])([^"'\n]+)\5\s*$/);
+        if (!match) throw new Error('Expected import Name [as Alias] or import {Name} from "./Module"');
+        const [, indent, name, alias, named, , path] = match;
         if (!path.startsWith('./') && !path.startsWith('../')) throw new Error('Import paths must start with ./ or ../');
         let rest = path, target = 'script.Parent';
         while (rest.startsWith('../')) { target += '.Parent'; rest = rest.slice(3); }
@@ -1672,7 +1673,7 @@ local part = message[1:7]`;
           if (!/^[A-Za-z_]\w*$/.test(part)) throw new Error(`Invalid import path segment '${part}'`);
           target += `:WaitForChild("${part}")`;
         }
-        if (!named) return `${indent}local ${name} = require(${target})`;
+        if (!named) return `${indent}local ${alias || name} = require(${target})`;
         const tmp = `__lauaImported${++serial}`;
         const output = [`${indent}local ${tmp} = require(${target})`];
         const aliases = new Set();
@@ -3158,7 +3159,7 @@ local part = message[1:7]`;
       const classes = new Map(), enums = new Map(), namespaces = new Map();
       const knownVariables = new Map(), functions = new Map();
       const importedSymbols = new Set();
-      for(const imp of source.matchAll(/^\s*import\s+([A-Za-z_]\w*)\s+from\s+["'][^"'\n]+["']/gm)) importedSymbols.add(imp[1]);
+      for(const imp of source.matchAll(/^\s*import\s+([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s+from\s+["'][^"'\n]+["']/gm)) importedSymbols.add(imp[2] || imp[1]);
       for(const imp of source.matchAll(/^\s*import\s+\{([^{}]+)\}\s+from\s+["'][^"'\n]+["']/gm)) {
         for(const part of imp[1].split(',')) {
           const match=/^\s*([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*$/.exec(part);
@@ -3369,7 +3370,7 @@ local part = message[1:7]`;
       for(const m of masked.matchAll(/\b(?:local|const|for|using)\s+([A-Za-z_]\w*)/g)) declarations.add(m[1]);
       for(const m of masked.matchAll(/\b(?:function|constructor|watch|get|set)\s*(?:[A-Za-z_]\w*)?(?:\s*<[^>\n]+>)?\s*\(([^\n)]*)\)/g)) for(const p of signature(m[1])) if(/^[A-Za-z_]\w*$/.test(p.name)) declarations.add(p.name);
       for(const m of masked.matchAll(/\b(?:function|async\s+function)\s+([A-Za-z_]\w*)/g)) declarations.add(m[1]);
-      for(const m of source.matchAll(/^\s*import\s+([A-Za-z_]\w*)\s+from\s+/gm))declarations.add(m[1]);
+      for(const m of source.matchAll(/^\s*import\s+([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s+from\s+/gm))declarations.add(m[2] || m[1]);
       for(const m of source.matchAll(/^\s*import\s+\{([^{}]+)\}\s+from\s+/gm)){
         for(const part of m[1].split(',')){const match=/^\s*([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?\s*$/.exec(part);if(match)declarations.add(match[2]||match[1]);}
       }
@@ -3591,7 +3592,7 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.49";
+    const LAUA_VERSION = "3.50";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
@@ -3659,7 +3660,7 @@ end`;
       let output = awaited.source;
       if (/\bfunction[^\n]*\([^\n)]*=/.test(output)) output = transpileParameterDefaults(output);
       if (output.includes('__laua')) output = insertLauaEmbeddedRuntimes(output);
-      if (exported.className && exported.names.length === 1) output += `\nreturn ${exported.className}`;
+      if (exported.className) output += `\nreturn ${exported.className}`;
       else if (exported.names.length) output += `\nreturn {${exported.names.map(name => `${name} = ${name}`).join(', ')}}`;
       output = output.replace(/[\t ]+(?=\n|$)/g, '');
       // Detect malformed adjacent expression tokens before reporting successful compilation.

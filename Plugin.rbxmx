@@ -1,11 +1,11 @@
-<?xml version="1.0" encoding="utf-8"?>
-<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+<?xml version='1.0' encoding='utf-8'?>
+<roblox xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
 <External>null</External><External>nil</External>
-<Item class="Script" referent="RBXLAUASTUDIOPLUGIN1"><Properties><string name="Name">LauaStudioPlugin</string><bool name="Enabled">true</bool><ProtectedString name="Source"><![CDATA[--!strict
+<Item class="Script" referent="RBXLAUASTUDIOPLUGIN1"><Properties><string name="Name">LauaStudioPlugin</string><bool name="Enabled">true</bool><ProtectedString name="Source">--!strict
 local studioPlugin = plugin
 if not studioPlugin then return end
 
-local VERSION = "0.2.2"
+local VERSION = "0.3.2"
 local PROJECT_NAME = "LauaStudioProject"
 local SOURCES_NAME = "Sources"
 local SNAPSHOTS_NAME = "Snapshots"
@@ -26,7 +26,7 @@ local function fetchCompiler(): string
     compilerLoading = true
     local ok, result = pcall(function()
         local source = game:GetService("HttpService"):GetAsync(COMPILER_URL, true)
-        if #source < 10000 or #source > 1000000 then error("Unexpected compiler download size") end
+        if #source &lt; 10000 or #source &gt; 1000000 then error("Unexpected compiler download size") end
         if not source:find("local Transpiler =", 1, true) or not source:find("return Transpiler", 1, true) then
             error("The GitHub response is not a Laua transpiler")
         end
@@ -132,7 +132,7 @@ local function relativePath(root: Instance, value: Instance): {string}
 end
 
 local function validName(name: string): boolean
-    return name:match("^[%a_][%w_]*$") ~= nil and #name <= 70
+    return name:match("^[%a_][%w_]*$") ~= nil and #name &lt;= 70
 end
 
 local function sourceGuid(source: StringValue): string
@@ -149,7 +149,7 @@ local function listSources(): {StringValue}
         if descendant:IsA("StringValue") then table.insert(out, descendant) end
     end
     table.sort(out, function(a, b)
-        return table.concat(relativePath(root, a), "/") < table.concat(relativePath(root, b), "/")
+        return table.concat(relativePath(root, a), "/") &lt; table.concat(relativePath(root, b), "/")
     end)
     return out
 end
@@ -175,7 +175,7 @@ local function makeTargetPath(source: StringValue, create: boolean): (Folder?, s
     return folder, name
 end
 
-local function projectWrite(label: string, callback: () -> ())
+local function projectWrite(label: string, callback: () -&gt; ())
     local history = game:GetService("ChangeHistoryService")
     local recording = history:TryBeginRecording("Laua " .. label, "Laua: " .. label)
     if not recording then error("Studio could not begin an undo/redo recording. Exit Play mode and retry.") end
@@ -290,7 +290,7 @@ end
 
 local outer = element("Frame", widget, {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(26, 27, 37), BorderSizePixel = 0})
 local header = element("Frame", outer, {Size = UDim2.new(1, -20, 0, 42), Position = UDim2.fromOffset(10, 10), BackgroundTransparency = 1})
-element("TextLabel", header, {Size = UDim2.fromScale(1, 1), Text = "Laua Studio  •  v3.30", TextColor3 = Color3.fromRGB(235, 226, 255), Font = Enum.Font.GothamBold, TextSize = 19, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1})
+element("TextLabel", header, {Size = UDim2.fromScale(1, 1), Text = "Laua Studio  •  Editor + Lint", TextColor3 = Color3.fromRGB(235, 226, 255), Font = Enum.Font.GothamBold, TextSize = 19, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1})
 local buttonBar = element("Frame", outer, {Size = UDim2.new(1, -20, 0, 68), Position = UDim2.fromOffset(10, 53), BackgroundTransparency = 1})
 local primary = element("ScrollingFrame", buttonBar, {Size = UDim2.new(1, 0, 0, 33), BackgroundTransparency = 1, CanvasSize = UDim2.fromOffset(560, 0), ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 2, BorderSizePixel = 0})
 local secondary = element("ScrollingFrame", buttonBar, {Size = UDim2.new(1, 0, 0, 33), Position = UDim2.fromOffset(0, 36), BackgroundTransparency = 1, CanvasSize = UDim2.fromOffset(670, 0), ScrollingDirection = Enum.ScrollingDirection.X, ScrollBarThickness = 2, BorderSizePixel = 0})
@@ -321,7 +321,17 @@ element("UIListLayout", filePane, {Padding = UDim.new(0, 3), SortOrder = Enum.So
 local editorPanel = element("Frame", outer, {Position = UDim2.fromOffset(200, 130), Size = UDim2.new(1, -210, 1, -183), BackgroundColor3 = Color3.fromRGB(33, 34, 47), BorderSizePixel = 0})
 local nameBox = element("TextBox", editorPanel, {Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -136, 0, 30), Text = "", PlaceholderText = "Name or Folder/Name", ClearTextOnFocus = false, TextColor3 = Color3.fromRGB(255, 255, 255), PlaceholderColor3 = Color3.fromRGB(176, 173, 189), BackgroundColor3 = Color3.fromRGB(53, 54, 70), Font = Enum.Font.Code, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left})
 local typeButton = element("TextButton", editorPanel, {Position = UDim2.new(1, -118, 0, 8), Size = UDim2.fromOffset(110, 30), Text = "ModuleScript", BackgroundColor3 = Color3.fromRGB(69, 59, 99), TextColor3 = Color3.fromRGB(255, 255, 255), Font = Enum.Font.GothamMedium, TextSize = 11})
-local editor = element("TextBox", editorPanel, {Position = UDim2.fromOffset(8, 45), Size = UDim2.new(1, -16, 1, -53), Text = "", PlaceholderText = "Create a source, then write Laua here.", MultiLine = true, TextWrapped = false, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextEditable = true, Font = Enum.Font.Code, TextSize = 14, TextColor3 = Color3.fromRGB(231, 228, 243), BackgroundColor3 = Color3.fromRGB(20, 22, 32)})
+local editor = element("TextBox", editorPanel, {Position = UDim2.fromOffset(8, 45), Size = UDim2.new(1, -16, 1, -159), Text = "", PlaceholderText = "Create a source, then write Laua here.", MultiLine = true, TextWrapped = false, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextEditable = true, Font = Enum.Font.Code, TextSize = 14, TextColor3 = Color3.fromRGB(231, 228, 243), BackgroundColor3 = Color3.fromRGB(20, 22, 32)})
+
+local analysisPanel = element("Frame", editorPanel, {Position = UDim2.new(0, 8, 1, -108), Size = UDim2.new(1, -16, 0, 100), BackgroundColor3 = Color3.fromRGB(27, 30, 43), BorderSizePixel = 0})
+local analysisHeader = element("TextLabel", analysisPanel, {Position = UDim2.fromOffset(6, 1), Size = UDim2.new(1, -12, 0, 22), Text = "Laua diagnostics — waiting for source", TextColor3 = Color3.fromRGB(193, 204, 225), BackgroundTransparency = 1, TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium, TextSize = 12})
+local analysisEntries = element("ScrollingFrame", analysisPanel, {Position = UDim2.fromOffset(3, 23), Size = UDim2.new(1, -6, 1, -25), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y})
+element("UIListLayout", analysisEntries, {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder})
+local autocompletePanel = element("Frame", editorPanel, {Position = UDim2.fromOffset(8, 83), Size = UDim2.new(1, -16, 0, 218), BackgroundColor3 = Color3.fromRGB(43, 44, 66), BorderSizePixel = 0, ZIndex = 20, Visible = false})
+element("TextLabel", autocompletePanel, {Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 21), Text = "Laua suggestions · click to insert", TextColor3 = Color3.fromRGB(204, 189, 255), BackgroundTransparency = 1, TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium, TextSize = 11, ZIndex = 21})
+local autocompleteEntries = element("ScrollingFrame", autocompletePanel, {Position = UDim2.fromOffset(4, 28), Size = UDim2.new(1, -8, 1, -32), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 21})
+element("UIListLayout", autocompleteEntries, {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder})
+
 local status = element("TextLabel", outer, {Position = UDim2.new(0, 10, 1, -43), Size = UDim2.new(1, -20, 0, 33), Text = "Ready", TextColor3 = Color3.fromRGB(205, 208, 224), BackgroundTransparency = 1, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, Font = Enum.Font.Gotham, TextSize = 12})
 
 local selected: StringValue? = nil
@@ -350,6 +360,371 @@ local function updateAutoText()
 end
 updateAutoText()
 
+
+local completionKeywords = {
+    "class", "extends", "constructor", "new", "export", "import", "from", "as", "namespace", "enum", "get", "set", "public", "private", "protected", "static", "abstract", "final", "override", "self", "super", "const", "using", "defer", "match", "case", "default", "exhaustive", "memo", "async", "await", "schema", "inline", "operator", "lazy", "watch", "function", "local", "return", "if", "then", "else", "elseif", "end", "for", "while", "do", "repeat", "until", "break", "continue", "and", "or", "not", "nil", "true", "false", "number", "string", "boolean", "any", "unknown", "never", "table"
+}
+local completionGlobals = {"print", "warn", "error", "assert", "require", "game", "workspace", "script", "Instance", "Enum", "Vector3", "CFrame", "UDim2", "Color3", "math", "table", "string", "task", "coroutine", "pcall", "ipairs", "pairs", "type", "typeof", "tonumber", "tostring", "cancelScope"}
+local standardMembers: {[string]: {string}} = {
+    game = {"GetService", "FindFirstChild", "WaitForChild", "IsLoaded", "BindToClose", "Workspace", "Players", "ReplicatedStorage", "ServerStorage", "ServerScriptService"},
+    workspace = {"CurrentCamera", "Gravity", "GetDescendants", "GetChildren", "FindFirstChild", "Raycast", "GetPartBoundsInBox", "GetPartBoundsInRadius"},
+    script = {"Parent", "Name", "FindFirstChild", "WaitForChild", "GetAttribute", "SetAttribute"},
+    table = {"insert", "remove", "sort", "find", "clone", "freeze", "clear", "create", "concat", "map", "filter", "reduce", "findWhere"},
+    math = {"abs", "clamp", "floor", "ceil", "max", "min", "random", "round", "sqrt", "pi"},
+    string = {"format", "sub", "find", "match", "gsub", "gmatch", "lower", "upper", "split"},
+    task = {"wait", "spawn", "defer", "delay", "cancel"},
+    Instance = {"new"}
+}
+local suggestedItems: {{name: string, kind: string}} = {}
+local replacementStart = 0
+local replacementEnd = 0
+local activeAnalysis = 0
+local suppressEditorCompletion = false
+
+local function trimSourceLine(line: string): string
+    return (line:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function normalizedClassHeader(line: string): string?
+    local value = trimSourceLine(line)
+    while true do
+        local word = value:match("^(%a+)%s+")
+        if word ~= "export" and word ~= "final" and word ~= "abstract" then break end
+        value = value:sub(#word + 2)
+    end
+    return value:match("^class%s+([%a_][%w_]*)%f[^%w_]")
+end
+
+local function resolveImportedSource(modulePath: string, fromSource: StringValue?): StringValue?
+    local root = sourcesRoot(false)
+    local source = fromSource or selected
+    if not root or not source then return nil end
+    local parent: Instance = source.Parent
+    local rest = modulePath
+    if not rest:match("^%.%./") and not rest:match("^%./") then return nil end
+    while rest:sub(1, 3) == "../" do
+        if parent == root then return nil end
+        parent = parent.Parent
+        rest = rest:sub(4)
+    end
+    if rest:sub(1, 2) == "./" then rest = rest:sub(3) end
+    if rest == "" then return nil end
+    for segment in rest:gmatch("[^/]+") do
+        if not segment:match("^[%a_][%w_]*$") then return nil end
+        local nextNode = parent:FindFirstChild(segment)
+        if not nextNode then return nil end
+        parent = nextNode
+    end
+    if not parent:IsA("StringValue") then return nil end
+    if parent == source then return nil end
+    if sourceLanguage(parent) ~= "Laua" then return nil end
+    return parent
+end
+
+local function exportedClassName(text: string): string?
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local normalized = trimSourceLine(line)
+        if normalized:match("^export%s+") then
+            local name = normalizedClassHeader(normalized)
+            if name then return name end
+        end
+    end
+    return nil
+end
+
+local function validateDirectClassImports(text: string, fromSource: StringValue): (string?, number?)
+    local lineNo = 0
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        lineNo += 1
+        local trimmed = trimSourceLine(line)
+        local original, alias, path = trimmed:match('^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
+        if not original then original, alias, path = trimmed:match("^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
+        if original and path then
+            local module = resolveImportedSource(path, fromSource)
+            if module then
+                local exported = exportedClassName(module.Value)
+                if exported and exported ~= original then
+                    return "Module '" .. path .. "' exports class '" .. exported .. "', not '" .. original .. "'", lineNo
+                end
+            end
+        end
+        local names, namedPath = trimmed:match('^import%s+%{(.-)%}%s+from%s+"([^"\n]+)"%s*$')
+        if not names then names, namedPath = trimmed:match("^import%s+%{(.-)%}%s+from%s+'([^'\n]+)'%s*$") end
+        if names and namedPath then
+            local module = resolveImportedSource(namedPath, fromSource)
+            if module then
+                local exported = exportedClassName(module.Value)
+                if exported then
+                    return "Module '" .. namedPath .. "' directly returns class '" .. exported .. "'. Use import " .. exported .. " as Alias from '" .. namedPath .. "' instead", lineNo
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function getClassSymbols(text: string, caret: number, includeImports: boolean?): ({[string]: {[string]: string}}, {[string]: string}, {[string]: boolean}, string?)
+    local classes: {[string]: {[string]: string}} = {}
+    local variables: {[string]: string} = {}
+    local symbols: {[string]: boolean} = {}
+    local currentClass: string? = nil
+    local classIndent = -1
+    local caretClass: string? = nil
+    local offset = 1
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local trimmed = trimSourceLine(line)
+        local indent = #(line:match("^%s*") or "")
+        if currentClass and trimmed == "end" and indent &lt;= classIndent then
+            currentClass = nil
+        end
+        local className = normalizedClassHeader(line)
+        if className then
+            currentClass = className
+            classIndent = indent
+            classes[className] = classes[className] or {}
+            symbols[className] = true
+        end
+        if offset &lt;= caret then caretClass = currentClass end
+        local declaration = trimmed:match("^local%s+([%a_][%w_]*)") or trimmed:match("^const%s+([%a_][%w_]*)") or trimmed:match("^function%s+([%a_][%w_]*)")
+        if declaration then symbols[declaration] = true end
+        local localName, newType = trimmed:match("^local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)")
+        if localName and newType then variables[localName] = newType end
+        local typedName, typedClass = trimmed:match("^local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)")
+        if typedName and typedClass and classes[typedClass] then variables[typedName] = typedClass end
+        if currentClass and indent &gt; classIndent and trimmed ~= "" and not trimmed:match("^%-%-") then
+            local member = trimmed:gsub("^public%s+", ""):gsub("^private%s+", ""):gsub("^protected%s+", ""):gsub("^static%s+", ""):gsub("^override%s+", ""):gsub("^final%s+", ""):gsub("^abstract%s+", "")
+            local isStatic = trimmed:match("%f[%w_]static%s+") ~= nil
+            local method = member:match("^function%s+([%a_][%w_]*)%s*%(")
+            local getter = member:match("^get%s+([%a_][%w_]*)%s*%(")
+            local setter = member:match("^set%s+([%a_][%w_]*)%s*%(")
+            local field = member:match("^([%a_][%w_]*)%s*[:=]")
+            if method then classes[currentClass][method] = if isStatic then "static method" else "method"
+            elseif getter then classes[currentClass][getter] = "getter"
+            elseif setter then classes[currentClass][setter] = "setter"
+            elseif field then classes[currentClass][field] = if isStatic then "static field" else "field" end
+        end
+        offset += #line + 1
+    end
+    if includeImports ~= false then
+        for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+            local trimmed = trimSourceLine(line)
+            local original, alias, path = trimmed:match('^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$')
+            if not original then original, alias, path = trimmed:match("^import%s+([%a_][%w_]*)%s+as%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
+            if not original then original, path = trimmed:match('^import%s+([%a_][%w_]*)%s+from%s+"([^"\n]+)"%s*$') end
+            if not original then original, path = trimmed:match("^import%s+([%a_][%w_]*)%s+from%s+'([^'\n]+)'%s*$") end
+            if original and path then
+                local binding = alias or original
+                symbols[binding] = true
+                local remote = resolveImportedSource(path)
+                if remote then
+                    local className = exportedClassName(remote.Value)
+                    if className and (not alias or original == className) then
+                        local remoteClasses = getClassSymbols(remote.Value, #remote.Value + 1, false)
+                        if remoteClasses[className] then classes[binding] = remoteClasses[className] end
+                    end
+                end
+            end
+            local named, namedPath = trimmed:match('^import%s+%{(.-)%}%s+from%s+"([^"\n]+)"%s*$')
+            if not named then named, namedPath = trimmed:match("^import%s+%{(.-)%}%s+from%s+'([^'\n]+)'%s*$") end
+            if named then
+                for part in named:gmatch("[^,]+") do
+                    local _, renamed = trimSourceLine(part):match("^([%a_][%w_]*)%s+as%s+([%a_][%w_]*)$")
+                    local binding = renamed or trimSourceLine(part)
+                    if binding:match("^[%a_][%w_]*$") then symbols[binding] = true end
+                end
+            end
+        end
+        for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+            local typedName, typedClass = trimSourceLine(line):match("^local%s+([%a_][%w_]*)%s*:%s*([%a_][%w_]*)")
+            if typedName and typedClass and classes[typedClass] then variables[typedName] = typedClass end
+        end
+    end
+    return classes, variables, symbols, caretClass
+end
+
+local function autocompleteContext(): (string, string?, string?, number, number)
+    local text = editor.Text
+    local cursor = editor.CursorPosition
+    if cursor &lt; 1 then return "", nil, nil, 0, 0 end
+    local before: string = string.sub(text, 1, cursor - 1)
+    local lineStart = #before
+    while lineStart &gt; 0 and string.sub(before, lineStart, lineStart) ~= "\n" do
+        lineStart -= 1
+    end
+    local currentLine: string = string.sub(before, lineStart + 1)
+    if string.match(currentLine, "%-%-[^\n]*$") then return "", nil, nil, 0, 0 end
+    local receiver: string?, separator: string?, partial: string? = string.match(currentLine, "([%a_][%w_]*)([%.:])([%a_][%w_]*)$")
+    if not receiver then
+        receiver, separator = string.match(currentLine, "([%a_][%w_]*)([%.:])$")
+        partial = ""
+    end
+    if receiver and separator then return partial or "", receiver, separator, cursor - #(partial or ""), cursor end
+    partial = string.match(currentLine, "([%a_][%w_]*)$") or ""
+    return partial, nil, nil, cursor - #partial, cursor
+end
+
+local function fillAutocomplete()
+    autocompletePanel.Visible = false
+    table.clear(suggestedItems)
+    if not selected or not editor:IsFocused() or changingSelection or suppressEditorCompletion then return end
+    if sourceLanguage(selected) ~= "Laua" then return end
+    local typed, receiver, separator, startAt, endAt = autocompleteContext()
+    if startAt == 0 or (not receiver and #typed &lt; 2) then return end
+    replacementStart = startAt
+    replacementEnd = endAt
+    local classes, variables, symbols, classHere = getClassSymbols(editor.Text, startAt)
+    local seen: {[string]: boolean} = {}
+    local candidates: {{name: string, kind: string, sortName: string}} = {}
+    local typedLower: string = string.lower(typed)
+    local function add(name: string, kind: string)
+        if seen[name] or name == typed then return end
+        local lowerName: string = string.lower(name)
+        if typed ~= "" and string.sub(lowerName, 1, #typed) ~= typedLower then return end
+        seen[name] = true
+        table.insert(candidates, {name = name, kind = kind, sortName = lowerName})
+    end
+    if receiver then
+        local className = if receiver == "self" then classHere else variables[receiver] or (if classes[receiver] then receiver else nil)
+        if className and classes[className] then
+            local onClass = receiver ~= "self" and variables[receiver] == nil and classes[receiver] ~= nil
+            if onClass then
+                if separator == "." then add("new", "constructor") end
+                for name, kind in classes[className] do
+                    if separator == "." and (kind == "static method" or kind == "static field") then add(name, kind) end
+                end
+            else
+                for name, kind in classes[className] do
+                    if kind ~= "static method" and kind ~= "static field" and (separator == "." or kind == "method") then add(name, kind) end
+                end
+            end
+        elseif standardMembers[receiver] then
+            for _, name in standardMembers[receiver] do
+                if separator == "." or name:match("^[A-Z]") then add(name, "Roblox / library") end
+            end
+        end
+    else
+        local before = string.sub(editor.Text, 1, math.max(0, startAt - 1))
+        local lastLine = string.match(before, "[^\n]*$") or ""
+        if string.match(lastLine, "^%s*import%s+[%a_][%w_]*$") or string.match(lastLine, "^%s*import%s+$") then
+            for _, source in listSources() do
+                if source ~= selected and sourceLanguage(source) == "Laua" then
+                    local name = exportedClassName(source.Value)
+                    if name then add(name, "Exported class") end
+                end
+            end
+        end
+        for _, keyword in completionKeywords do add(keyword, "Laua keyword") end
+        for _, global in completionGlobals do add(global, "Luau / Roblox") end
+        for name in symbols do add(name, "In this file") end
+        for name in classes do add(name, "Class") end
+    end
+    table.sort(candidates, function(a: {name: string, kind: string, sortName: string}, b: {name: string, kind: string, sortName: string}): boolean
+        if a.sortName == b.sortName then return a.name &lt; b.name end
+        return a.sortName &lt; b.sortName
+    end)
+    for _, item in candidates do
+        if #suggestedItems &gt;= 7 then break end
+        table.insert(suggestedItems, item)
+    end
+    for _, child in autocompleteEntries:GetChildren() do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
+    if #suggestedItems == 0 then return end
+    autocompletePanel.Visible = true
+    for index, item in suggestedItems do
+        local button = element("TextButton", autocompleteEntries, {LayoutOrder = index, Size = UDim2.new(1, -4, 0, 27), BackgroundColor3 = Color3.fromRGB(58, 55, 83), TextColor3 = Color3.fromRGB(235, 228, 250), Font = Enum.Font.Code, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, Text = "  " .. item.name .. "  ·  " .. item.kind, ZIndex = 22})
+        button.MouseButton1Click:Connect(function()
+            if not selected then return end
+            local text = editor.Text
+            if replacementStart &lt; 1 or replacementEnd &gt; #text + 1 then return end
+            local updated = text:sub(1, replacementStart - 1) .. item.name .. text:sub(replacementEnd)
+            suppressEditorCompletion = true
+            editor.Text = updated
+            editor:CaptureFocus()
+            editor.CursorPosition = replacementStart + #item.name
+            editor.SelectionStart = -1
+            autocompletePanel.Visible = false
+            suppressEditorCompletion = false
+        end)
+    end
+end
+
+local function displayDiagnostics(diagnostics: {{line: number, character: number, message: string, severity: string}}, note: string?)
+    for _, child in analysisEntries:GetChildren() do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
+    if #diagnostics == 0 then
+        analysisHeader.Text = note or "Laua diagnostics · no transpiler errors found"
+        analysisHeader.TextColor3 = Color3.fromRGB(160, 225, 177)
+        return
+    end
+    analysisHeader.Text = "Laua diagnostics · " .. #diagnostics .. " issue(s)"
+    analysisHeader.TextColor3 = Color3.fromRGB(250, 178, 169)
+    for i, item in diagnostics do
+        local shade = if item.severity == "Error" then Color3.fromRGB(255, 170, 170) else Color3.fromRGB(255, 215, 150)
+        local button = element("TextButton", analysisEntries, {LayoutOrder = i, Size = UDim2.new(1, -6, 0, 25), BackgroundColor3 = Color3.fromRGB(49, 44, 57), Text = "  " .. item.severity .. " L" .. item.line .. ": " .. item.message, TextTruncate = Enum.TextTruncate.AtEnd, TextColor3 = shade, TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.Code, TextSize = 11})
+        button.MouseButton1Click:Connect(function()
+            local current = editor.Text
+            local line = 1
+            local offset = 1
+            while line &lt; item.line do
+                local newline = current:find("\n", offset, true)
+                if not newline then break end
+                offset = newline + 1
+                line += 1
+            end
+            editor:CaptureFocus()
+            editor.CursorPosition = math.clamp(offset + item.character - 1, 1, #current + 1)
+            editor.SelectionStart = -1
+        end)
+    end
+end
+
+local function runLiveAnalysis()
+    if not selected then displayDiagnostics({}, "Laua diagnostics · select a source"); return end
+    if sourceLanguage(selected) == "Luau" then
+        displayDiagnostics({}, "Luau source · use Studio Script Analysis for Luau")
+        return
+    end
+    if compiler == nil then
+        displayDiagnostics({}, "Laua diagnostics · waiting for GitHub transpiler")
+        return
+    end
+    local text = editor.Text
+    local importError, importLine = validateDirectClassImports(text, selected)
+    if importError then
+        displayDiagnostics({{line = importLine or 1, character = 1, message = importError, severity = "Error"}})
+        return
+    end
+    if #text &gt; 120000 then
+        displayDiagnostics({}, "Laua diagnostics · large source, use Check")
+        return
+    end
+    local ok, err = pcall(function()
+        compiler.Transpile(text, {Mode = "Development", OutputStyle = "Readable"})
+    end)
+    if ok then
+        displayDiagnostics({}, "Laua diagnostics · no transpiler errors found")
+        return
+    end
+    local message = tostring(err)
+    local line = tonumber(message:match("%(line%s+(%d+)%)")) or tonumber(message:match("[Ll]ine%s+(%d+)")) or tonumber(message:match(":(%d+):")) or 1
+    message = message:gsub("^.-Laua semantic error%s*%(line%s*%d+%)%s*:%s*", "")
+    message = message:gsub("^.-Invalid class member:%s*", "Invalid class member: ")
+    message = message:match("([^\n]+)") or message
+    if #message &gt; 400 then message = message:sub(1, 400) end
+    displayDiagnostics({{line = line, character = 1, message = message, severity = "Error"}})
+end
+
+local function scheduleLiveAnalysis()
+    activeAnalysis += 1
+    local revision = activeAnalysis
+    task.delay(0.45, function()
+        if revision ~= activeAnalysis or changingSelection then return end
+        runLiveAnalysis()
+    end)
+end
+
 local function pickSource(source: StringValue?)
     selected = source
     confirmation = nil
@@ -367,6 +742,8 @@ local function pickSource(source: StringValue?)
     end
     typeButton.Text = outputKind
     changingSelection = false
+    autocompletePanel.Visible = false
+    scheduleLiveAnalysis()
 end
 
 local function saveSelected(): boolean
@@ -409,7 +786,7 @@ local function parseNewName(raw: string): ({string}, string, string)
     if path:sub(-5) == ".laua" then path = path:sub(1, -6)
     elseif path:sub(-5) == ".luau" then path = path:sub(1, -6); language = "Luau" end
     local parts = path:split("/")
-    if #parts > 16 then error("Folder nesting is limited to 15 levels") end
+    if #parts &gt; 16 then error("Folder nesting is limited to 15 levels") end
     for _, part in parts do
         if not validName(part) then error("Invalid file or folder name: " .. part) end
     end
@@ -453,6 +830,10 @@ end
 
 local function compileOne(source: StringValue): boolean
     local ok, result = pcall(function()
+        if sourceLanguage(source) == "Laua" then
+            local importError = validateDirectClassImports(source.Value, source)
+            if importError then error(importError) end
+        end
         local compiled = buildSource(source)
         return writeGenerated(source, compiled)
     end)
@@ -632,7 +1013,7 @@ deleteButton.MouseButton1Click:Connect(function()
     if not selected then showStatus("Select a source to delete", true); return end
     if not saveSelected() then return end
     local source: StringValue = selected
-    if not confirmation or confirmation.id ~= "delete" or confirmation.source ~= source or os.clock() > confirmation.expires then
+    if not confirmation or confirmation.id ~= "delete" or confirmation.source ~= source or os.clock() &gt; confirmation.expires then
         confirmation = {id = "delete", source = source, expires = os.clock() + CONFIRM_SECONDS}
         showStatus("Click Delete again within 8 seconds to remove " .. source.Name .. " and its unmodified generated output")
         return
@@ -674,7 +1055,11 @@ checkButton.MouseButton1Click:Connect(function()
     local source = selected :: StringValue
     local ok, result = pcall(function() return buildSource(source) end)
     compileBusy = false
-    if not ok then showStatus(source.Name .. " compilation failed: " .. tostring(result), true); return end
+    if not ok then
+        showStatus(source.Name .. " transpilation failed: " .. tostring(result), true)
+        runLiveAnalysis()
+        return
+    end
     local text = result :: string
     local _, lines = text:gsub("\n", "\n")
     showStatus("Transpiled: " .. source.Name .. " | " .. #text .. " bytes, " .. (lines + 1) .. " lines, " .. string.format("%.1f ms", (os.clock() - started) * 1000) .. " (not validated by Studio Script Analysis)")
@@ -693,7 +1078,7 @@ allButton.MouseButton1Click:Connect(function()
         if compileOne(source) then passed += 1 else failed += 1 end
     end
     compileBusy = false
-    showStatus("Compile All: " .. passed .. " succeeded, " .. failed .. " failed", failed > 0)
+    showStatus("Compile All: " .. passed .. " succeeded, " .. failed .. " failed", failed &gt; 0)
 end)
 
 autoButton.MouseButton1Click:Connect(function()
@@ -729,14 +1114,25 @@ end)
 editor:GetPropertyChangedSignal("Text"):Connect(function()
     local currentSource = selected
     if changingSelection or currentSource == nil then return end
+    scheduleLiveAnalysis()
+    task.defer(fillAutocomplete)
     if editor.Text ~= editorBaseline then
         status.Text = "Unsaved edits to " .. currentSource.Name .. " — click Save or Compile"
         status.TextColor3 = Color3.fromRGB(255, 210, 125)
     end
 end)
 
+editor:GetPropertyChangedSignal("CursorPosition"):Connect(function()
+    task.defer(fillAutocomplete)
+end)
+editor.Focused:Connect(function()
+    task.defer(fillAutocomplete)
+end)
 editor.FocusLost:Connect(function()
     if selected and not changingSelection then saveSelected() end
+    task.delay(0.2, function()
+        if not editor:IsFocused() then autocompletePanel.Visible = false end
+    end)
 end)
 
 importButton.MouseButton1Click:Connect(function()
@@ -809,7 +1205,7 @@ importButton.MouseButton1Click:Connect(function()
             content = text
         end
         table.insert(entries, {name = name, folders = folders, source = content, language = language})
-        if #entries > MAX_IMPORT then showStatus("Import is limited to " .. MAX_IMPORT .. " files per operation", true); return end
+        if #entries &gt; MAX_IMPORT then showStatus("Import is limited to " .. MAX_IMPORT .. " files per operation", true); return end
     end
     if #entries == 0 then showStatus("Selection contains no importable source files or ModuleScripts", true); return end
     local ok, err = pcall(function()
@@ -832,7 +1228,8 @@ updateCompilerButton.MouseButton1Click:Connect(function()
         showStatus(tostring(version) .. (compiler ~= nil and " (keeping compiler v" .. compilerVersion .. ")" or " (no compiler loaded)"), true)
         return
     end
-    showStatus("Loaded Laua compiler v" .. tostring(version) .. " from GitHub")
+    showStatus("Loaded Laua transpiler v" .. tostring(version) .. " from GitHub")
+    scheduleLiveAnalysis()
 end)
 
 local function refreshAfterHistory()
@@ -876,7 +1273,8 @@ task.spawn(function()
         showStatus(tostring(version) .. " — click Refresh Compiler to retry", true)
         return
     end
-    showStatus("Ready. Laua compiler v" .. tostring(version) .. " loaded from GitHub. New creates a source in one click.")
+    showStatus("Ready. Laua transpiler v" .. tostring(version) .. " loaded from GitHub. Live lint and autocomplete enabled.")
+    scheduleLiveAnalysis()
 end)
-]]></ProtectedString></Properties>
+</ProtectedString></Properties>
 </Item></roblox>
