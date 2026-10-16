@@ -5475,20 +5475,13 @@ end`;
       if (symbols.namespaces[owner]) return symbols.namespaces[owner].members;
       if (symbols.enums[owner]) return symbols.enums[owner].members;
       if (symbols.classes[owner]) {
-        // Show the user-declared class API when exploring a Laua class name or
-        // imported alias. The generated `.new` constructor is an implementation
-        // detail: source code instantiates classes with `new ClassName(...)`.
-        // Keep visibility filtering and distinguish instance from static members.
-        const instanceMembers = collectVisibleClassMembers(symbols, owner, cursorOffset, false);
-        const staticMembers = collectVisibleClassMembers(symbols, owner, cursorOffset, true);
-        const declared = {};
-        for (const [name, info] of Object.entries(instanceMembers)) {
-          declared[name] = {...info, detail: `${info.detail || "Laua class member"} (instance)`};
-        }
-        for (const [name, info] of Object.entries(staticMembers)) {
-          declared[name] = {...info, detail: `${info.detail || "Laua class member"} (static)`};
-        }
-        return operator === "." ? declared : {};
+        // An imported class is a constructor, not an instance. Do not offer
+        // fields, getters or methods for `ImportedClass.` or `ImportedClass:`.
+        // They belong to variables created using `new ImportedClass(...)`.
+        if (symbols.classes[owner].importedFrom) return {};
+        // Locally declared classes can expose their actual static API, but
+        // instance members must never appear on the class table itself.
+        return operator === "." ? collectVisibleClassMembers(symbols, owner, cursorOffset, true) : {};
       }
       if (symbols.variables[owner]) return collectVisibleClassMembers(symbols, symbols.variables[owner].className, cursorOffset, false);
 
@@ -5585,7 +5578,10 @@ end`;
         if (localInfo.alias) {
           if (symbols.namespaces[localInfo.alias]) return symbols.namespaces[localInfo.alias].members;
           if (symbols.enums[localInfo.alias]) return symbols.enums[localInfo.alias].members;
-          if (symbols.classes[localInfo.alias]) return collectVisibleClassMembers(symbols, localInfo.alias, cursorOffset, true);
+          if (symbols.classes[localInfo.alias]) {
+            if (symbols.classes[localInfo.alias].importedFrom) return {};
+            return operator === "." ? collectVisibleClassMembers(symbols, localInfo.alias, cursorOffset, true) : {};
+          }
 
           if (operator === ".") {
             const staticMembers = getRobloxDatatypeStaticMembers(localInfo.alias);
@@ -9721,9 +9717,10 @@ end`;
         if(scanCacheImports.has(key))return scanCacheImports.get(key);
         const imports = [];
         const sourceLines = source.split("\n");
+        const maskedLines = maskNonCode(source).split("\n");
         for (let row = 0; row < sourceLines.length; row++) {
           const code = sourceLines[row];
-          const trimmed = maskNonCode(code).trim();
+          const trimmed = maskedLines[row].trim();
           if (!/^import\b/.test(trimmed)) continue;
           const match = code.match(/^\s*import\s+(?:([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?|\{([^{}]+)\})\s+from\s+(["'])([^"'\n]+)\4\s*$/);
           if (!match) continue; // ordinary parser/linter handles malformed imports
@@ -9735,13 +9732,27 @@ end`;
       function scanProjectExports(source) {
         if(scanCacheExports.has(source))return scanCacheExports.get(source);
         const exports = {};
-        const pattern = /^\s*export\s+(?:(?:final|abstract)\s+)?(class|namespace|enum|(?:local\s+)?(?:async\s+)?function|local)\s+([A-Za-z_]\w*)/gm;
-        for (const m of source.matchAll(pattern)) {
+        // Exports mentioned in comments and long strings are not declarations.
+        const code = maskNonCode(source);
+        const pattern = /^[ \t]*export\s+(?:(?:final|abstract)\s+)?(class|namespace|enum|(?:local\s+)?(?:async\s+)?function|local)\s+([A-Za-z_]\w*)/gm;
+        for (const m of code.matchAll(pattern)) {
           const rawKind = m[1];
           const kind = rawKind.endsWith("function") ? "function" : rawKind === "local" ? "field" : rawKind;
           exports[m[2]] = {kind, name:m[2]};
         }
         return cacheProjectScan(scanCacheExports,source,exports);
+      }
+
+      function projectImportExpectsClass(imp, source) {
+        if (!imp.name) return false;
+        const alias = imp.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const code = maskNonCode(source);
+        return new RegExp(`\\b(?:new\\s+|extends\\s+)${alias}\\b`).test(code);
+      }
+
+      function projectModuleDeclaresClass(source, name) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`^[ \t]*(?:export\\s+)?(?:(?:final|abstract)\\s+)?class\\s+${escaped}\\b`, "m").test(maskNonCode(source));
       }
 
       function getProjectSymbols(model) {
@@ -9783,7 +9794,7 @@ end`;
               const original = named[1], alias = named[2] || named[1];
               const info = exports[original];
               if (info.kind === "class" && remoteSymbols.classes[original]) {
-                if (!localSymbols.classes[alias]) localSymbols.classes[alias] = {...remoteSymbols.classes[original], name:alias, start:-1, end:-1};
+                if (!localSymbols.classes[alias]) localSymbols.classes[alias] = {...remoteSymbols.classes[original], name:alias, start:-1, end:-1, importedFrom:imp.target, originalName:original};
               } else if (info.kind === "namespace" && remoteSymbols.namespaces[original]) {
                 if (!localSymbols.namespaces[alias]) localSymbols.namespaces[alias] = {...remoteSymbols.namespaces[original], name:alias, start:-1, end:-1};
               } else if (info.kind === "enum" && remoteSymbols.enums[original]) {
@@ -9819,7 +9830,8 @@ end`;
           if (!imp.target) message = `Invalid project import '${imp.path}'.`;
           else if (!targetFile) message = `Missing project file '${imp.target}' (imported as ${imp.path}).`;
           else {
-            const exports = scanProjectExports(targetFile.model.getValue());
+            const moduleSource = targetFile.model.getValue();
+            const exports = scanProjectExports(moduleSource);
             const directClass = Object.values(exports).find(info => info.kind === "class");
             if (imp.named) {
               for (const part of imp.named.split(",")) {
@@ -9835,6 +9847,12 @@ end`;
               }
             } else if (directClass && imp.importedName !== directClass.name) {
               message = `Module '${imp.target}' exports class '${directClass.name}', not '${imp.importedName}'. Use import ${directClass.name}${imp.name !== imp.importedName ? ` as ${imp.name}` : ""} from "${imp.path}".`;
+            } else if (!directClass && projectModuleDeclaresClass(moduleSource, imp.importedName)) {
+              message = `Class '${imp.importedName}' exists in '${imp.target}' but is not exported. Use export class ${imp.importedName} in the module.`;
+            } else if (!directClass && projectImportExpectsClass(imp, file.model.getValue())) {
+              message = `Module '${imp.target}' does not export class '${imp.importedName}'. Check the class name or add export class ${imp.importedName}.`;
+            } else if (!directClass && !Object.keys(exports).length && !/^\s*return\b/m.test(maskNonCode(moduleSource))) {
+              message = `Module '${imp.target}' does not export class '${imp.importedName}' or return a value.`;
             }
           }
           if (message) markers.push({severity:monaco.MarkerSeverity.Error, startLineNumber:imp.line, endLineNumber:imp.line, startColumn:1, endColumn:Math.max(2,file.model.getLineMaxColumn(imp.line)), message, source:"Laua project"});
