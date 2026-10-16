@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.54"}
+local Transpiler = {Version = "3.55"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -2855,6 +2855,23 @@ local function validateExpressionSyntax(source: string)
         local prev = tokens[position - 1]
         local nextToken = tokens[position + 1]
         local word = token.value
+        -- The keyword `class` can be an ordinary Luau local name, but
+        -- `local class Foo` cannot be a Laua class declaration. Reject the
+        -- invalid declaration before lowering or semantic checking.
+        if word == "local" or word == "const" then
+            local modifier = nextToken and (nextToken.value == "export" or nextToken.value == "final" or nextToken.value == "abstract")
+            local classToken = modifier and tokens[position + 2] or nextToken
+            local nameToken = modifier and tokens[position + 3] or tokens[position + 2]
+            if classToken and classToken.value == "class" and nameToken and nameToken.kind == "word" and nameToken.line == classToken.line then
+                fail("Unexpected 'class' after '" .. word .. "'. Declare classes using 'class Name' or 'export class Name'.", classToken)
+            end
+        end
+        if word == "export" and nextToken and nextToken.value == "local" then
+            local classToken = tokens[position + 2]
+            if classToken and classToken.value == "class" then
+                fail("Invalid 'export local class' declaration. Use 'export class Name'.", classToken)
+            end
+        end
         if openers[word] then
             table.insert(stack, {closing = openers[word], opener = token})
         elseif word == ")" or word == "]" or word == "}" then
