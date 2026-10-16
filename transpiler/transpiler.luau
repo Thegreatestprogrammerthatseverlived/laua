@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.55"}
+local Transpiler = {Version = "3.56"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -597,6 +597,64 @@ local function parseModifiers(header: string)
     return modifiers, rest
 end
 
+-- Constructor parameter properties declare typed fields without extra runtime helpers.
+-- Plain constructor parameters retain their original syntax and behavior.
+local function parseConstructorProperties(params: string): (string, {{Name: string, Visibility: string}})
+    if not params:find("public", 1, true) and not params:find("private", 1, true) and not params:find("protected", 1, true) then return params, {} end
+    local masked = maskNonCode(params)
+    local stack = {}
+    local pieces = {}
+    local first = 1
+    local angles = 0
+    local inType = false
+    for index = 1, #masked do
+        local char = masked:sub(index, index)
+        if char == "(" then table.insert(stack, ")")
+        elseif char == "{" then table.insert(stack, "}")
+        elseif char == "[" then table.insert(stack, "]")
+        elseif char == ")" or char == "}" or char == "]" then
+            if table.remove(stack) ~= char then error("Unbalanced constructor property parameter") end
+        elseif #stack == 0 then
+            if char == ":" and angles == 0 then inType = true
+            elseif char == "=" and angles == 0 then inType = false
+            elseif char == "<" and inType then angles += 1
+            elseif char == ">" and angles > 0 then angles -= 1
+            elseif char == "," and angles == 0 then
+                table.insert(pieces, params:sub(first, index - 1))
+                first = index + 1
+                inType = false
+            end
+        end
+    end
+    if #stack > 0 or angles ~= 0 then error("Unclosed constructor property parameter") end
+    table.insert(pieces, params:sub(first))
+    local normalized = {}
+    local properties = {}
+    local seen = {}
+    for _, raw in pieces do
+        local piece = trim(raw)
+        local name, typeText, visibility = nil, nil, nil
+        for _, candidate in {"public", "private", "protected"} do
+            name, typeText = piece:match("^" .. candidate .. "%s+([%a_][%w_]*)%s*:%s*(.+)$")
+            if name then visibility = candidate; break end
+        end
+        if name then
+            if not typeText or trim(typeText) == "" or maskNonCode(typeText):find("=", 1, true) or seen[name] then
+                error(`Invalid or duplicate constructor parameter property '{name}'`)
+            end
+            seen[name] = true
+            table.insert(normalized, name .. ": " .. trim(typeText))
+            table.insert(properties, {Name = name, Visibility = visibility})
+        else
+            for _, candidate in {"public", "private", "protected"} do
+                if piece:match("^" .. candidate .. "%f[%W]") then error(`Invalid constructor parameter property '{piece}'`) end
+            end
+            table.insert(normalized, piece)
+        end
+    end
+    return table.concat(normalized, ", "), properties
+end
+
 local function getParams(params: string): string
     local names = {}
     for part in params:gmatch("[^,]+") do
@@ -791,13 +849,15 @@ local function transpileClasses(source: string): string
                 continue
             end
             local ctorParams = remainder:match("^constructor%s*%(([^)]*)%)%s*$")
+            local normalizedCtorParams, constructorProperties = nil, {}
+            if ctorParams then normalizedCtorParams, constructorProperties = parseConstructorProperties(ctorParams) end
             if kind or ctorParams then
                 local kindStart = row.Start + (row.Text:find(kind or "constructor", 1, true) or 1) - 1
                 local ending = findBlock(body, kindStart, blockLines)
                 local nextLine = body:find("\n", kindStart, true)
                 local memberBody = nextLine and body:sub(nextLine + 1, ending.Start - 1) or ""
-                local member = {Name = memberName, Kind = kind or "constructor", Params = params or ctorParams,
-                    Body = memberBody, ReturnType = returnType and trim(returnType) or "", Static = modifiers.static == true, Abstract = modifiers.abstract == true,
+                local member = {Name = memberName, Kind = kind or "constructor", Params = params or normalizedCtorParams,
+                    Properties = constructorProperties, Body = memberBody, ReturnType = returnType and trim(returnType) or "", Static = modifiers.static == true, Abstract = modifiers.abstract == true,
                     Final = modifiers.final == true, Override = modifiers.override == true, Attributes = table.concat(attributes, "\n")}
                 attributes = {}
                 if member.Kind == "constructor" then
@@ -834,6 +894,15 @@ local function transpileClasses(source: string): string
             index += 1
         end
 
+        -- Constructor shorthand behaves like declared instance fields for
+        -- duplicate detection, getter conflicts, and watch-field validation.
+        if ctor then
+            for _, property in ctor.Properties do
+                if names[property.Name] then error(`Duplicate class member '{property.Name}'`) end
+                names[property.Name] = true
+                table.insert(fields, {Name = property.Name, Value = nil, Visibility = property.Visibility})
+            end
+        end
         local classTypePrefix = #classTypes > 0 and table.concat(classTypes, "\n") .. "\n" or ""
         local properties = {}
         for _, member in getters do properties[member.Name] = true end
@@ -926,6 +995,7 @@ local function transpileClasses(source: string): string
             for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
             table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
+            if ctor then for _, property in ctor.Properties do table.insert(simple, `    self.{property.Name} = {property.Name}`) end end end
             local simpleCtor = normalized(transpileSource(ctorBody), "    ")
             if simpleCtor ~= "" then table.insert(simple, simpleCtor) end
             table.insert(simple, "end")
@@ -975,6 +1045,7 @@ local function transpileClasses(source: string): string
             table.insert(simple, `function {name}.__init(self: any{not ctor and base and ", ...: any" or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             if parentInit then table.insert(simple, "    " .. parentInit) end
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
+            if ctor then for _, property in ctor.Properties do table.insert(simple, `    self.{property.Name} = {property.Name}`) end end end
             local init = normalized(transpileSource(ctorBody), "    ")
             if init ~= "" then table.insert(simple, init) end
             table.insert(simple, "end")
@@ -1106,6 +1177,12 @@ local function transpileClasses(source: string): string
                 table.insert(generated, `    self.__lauaValues["{field.Name}"] = {transpileSource(field.Value)}`)
             else
                 table.insert(generated, `    self.{field.Name} = {transpileSource(field.Value)}`)
+            end
+        end
+        if ctor then
+            for _, property in ctor.Properties do
+                if watchers[property.Name] then table.insert(generated, `    self.__lauaValues["{property.Name}"] = {property.Name}`)
+                else table.insert(generated, `    self.{property.Name} = {property.Name}`) end
             end
         end
         local innerCtor = normalized(transpileSource(ctorBody), "    ")
@@ -3131,7 +3208,11 @@ local function validateLauaSemantics(source: string): {any}
                     if not info.Instance[dynamicField] then info.Instance[dynamicField] = {Kind = "field"} end
                 end
                 local ctor = clean:match("^constructor%s*%(([^)]*)%)")
-                if ctor then info.Constructor = ctor end
+                if ctor then
+                    local normalizedParams, props = parseConstructorProperties(ctor)
+                    info.Constructor = normalizedParams
+                    for _, property in props do info.Instance[property.Name] = {Kind = "field"} end
+                end
                 local getter = clean:match("^get%s+([%a_][%w_]*)%s*%(")
                 local setter = clean:match("^set%s+([%a_][%w_]*)%s*%(")
                 if getter then info.Instance[getter] = {Kind = "getter"} end
