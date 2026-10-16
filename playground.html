@@ -2741,6 +2741,21 @@ local part = message[1:7]`;
       const stack=[];
       for(let k=0;k<tokens.length;k++) {
         const t=tokens[k],prev=tokens[k-1],next=tokens[k+1];
+        // A Luau local declaration may bind `class` as an ordinary name, but
+        // `local class Foo` is not a valid Laua class declaration. Require a
+        // real leading `class`/`export class` declaration instead of passing
+        // untransformed invalid Luau through to Studio.
+        if (['local','const'].includes(t.value)) {
+          const modifier = ['export','final','abstract'].includes(next?.value) ? next : null;
+          const classToken = modifier ? tokens[k+2] : next;
+          const nameToken = modifier ? tokens[k+3] : tokens[k+2];
+          if (classToken?.value === 'class' && nameToken?.kind === 'word' && nameToken.line === classToken.line) {
+            fail(`Unexpected 'class' after '${t.value}'. Declare classes using 'class Name' or 'export class Name'.`, classToken);
+          }
+        }
+        if (t.value === 'export' && next?.value === 'local' && tokens[k+2]?.value === 'class') {
+          fail("Invalid 'export local class' declaration. Use 'export class Name'.", tokens[k+2]);
+        }
         if(close.has(t.value))stack.push({expected:close.get(t.value),token:t});
         else if ([')',']','}'].includes(t.value)) {
           if (!stack.length || stack[stack.length-1].expected!==t.value)fail(`Unexpected '${t.value}'.`,t);
@@ -3744,7 +3759,7 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.54";
+    const LAUA_VERSION = "3.55";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
