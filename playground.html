@@ -1090,6 +1090,33 @@ print(player.IsAlive)  -- true`;
       return { modifiers, text };
     }
 
+    // Constructor parameter properties are source-level shorthand for fields.
+    // Keep the constructor's Luau parameters ordinary and generate initialization
+    // inside __init, after the parent initializer and before the user body.
+    function parseConstructorProperties(params) {
+      if (!/\b(?:public|private|protected)\s+[A-Za-z_]\w*/.test(params)) return {params, properties:[]};
+      const pieces = splitDefaultParameters(params);
+      const properties = [], normalized = [], seen = new Set();
+      for (const piece of pieces) {
+        const trimmed = piece.trim();
+        const match = /^(public|private|protected)\s+([A-Za-z_]\w*)\s*:\s*(.+)$/.exec(trimmed);
+        if (!match) {
+          if (/^(?:public|private|protected)\b/.test(trimmed)) throw new Error(`Invalid constructor parameter property '${trimmed}': expected a typed field`);
+          normalized.push(trimmed);
+          continue;
+        }
+        const [, visibility, name, rawType] = match;
+        // Default values for property parameters would need to be applied before
+        // the generated field assignment; avoid silently changing initialization.
+        if (maskNonCode(rawType).includes('=')) throw new Error(`Constructor parameter property '${name}' cannot have a default value`);
+        if (!rawType.trim() || seen.has(name)) throw new Error(`Invalid or duplicate constructor parameter property '${name}'`);
+        seen.add(name);
+        normalized.push(`${name}: ${rawType.trim()}`);
+        properties.push({name, visibility});
+      }
+      return {params:normalized.join(', '), properties};
+    }
+
     function transpileClass(source) {
       const classInputSource = source;
       let generatedOffsetShift = 0;
@@ -1243,7 +1270,8 @@ print(player.IsAlive)  -- true`;
             const lineEnd = body.indexOf("\n", memberStart);
             const memberBody = body.slice(lineEnd + 1, memberEnd.start);
             const params = constructorMatch ? constructorMatch[1] : methodMatch[3];
-            const member = { name: methodMatch?.[2], kind, params, returnType: methodMatch?.[4]?.trim() || '', body: memberBody, static: isStatic,
+            const ctorProperties = constructorMatch ? parseConstructorProperties(params) : {params, properties:[]};
+            const member = { name: methodMatch?.[2], kind, params:ctorProperties.params, properties:ctorProperties.properties, returnType: methodMatch?.[4]?.trim() || '', body: memberBody, static: isStatic,
               final: modifiers.has("final"), override: modifiers.has("override"), abstract: modifiers.has("abstract"),
               attributes: attrs.join("\n"), start:headerEnd + 1 + memberStart, bodyStart:headerEnd + 2 + lineEnd };
             attrs = [];
@@ -1300,6 +1328,13 @@ print(player.IsAlive)  -- true`;
         if (attrs.length) {
           const at = headerEnd + 1 + (lines.at(-1)?.start || 0);
           throw classLocation(new Error(`Orphan attribute in class '${name}'`), at, 1);
+        }
+        // Parameter properties participate in ordinary field conflicts and
+        // watch declarations; they have no standalone runtime initializer.
+        for (const property of ctor?.properties || []) {
+          if (declaredNames.has(property.name)) throw classLocation(new Error(`Duplicate class member '${property.name}'`), ctor.start, property.name.length);
+          declaredNames.add(property.name);
+          fields.push({name:property.name, value:null, visibility:property.visibility, parameterProperty:true});
         }
         const propertyNames = new Set([...getters, ...setters].map(item => item.name));
         for (const field of fields) if (propertyNames.has(field.name)) throw classLocation(new Error(`Property '${field.name}' conflicts with an instance field`), field.start, field.name.length);
@@ -1366,6 +1401,7 @@ print(player.IsAlive)  -- true`;
           for (const field of statics) if (field.value !== null) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
           output += `function ${name}.__init(self: any${ctor?.params?.trim() ? ", " + ctor.params : ""})\n`;
           for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const property of ctor?.properties || []) output += `    self.${property.name} = ${property.name}\n`;
           const initBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
           if (initBody) output += initBody + "\n";
           output += `end\nfunction ${name}.new(...: any): any\n    local self: any = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
@@ -1403,6 +1439,7 @@ print(player.IsAlive)  -- true`;
           output += `function ${name}.__init(self: any${arglist})\n`;
           if (parentInit) output += `    ${parentInit}\n`;
           for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
+          for (const property of ctor?.properties || []) output += `    self.${property.name} = ${property.name}\n`;
           const init = normalizeBlockIndent(transpileCore(constructorBody));
           if (init) output += init + '\n';
           output += `end\nfunction ${name}.new(...: any): any\n${isAbstract ? `    error("Cannot instantiate abstract class '${name}'")\n` : ''}    local self: any = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
@@ -1491,6 +1528,10 @@ print(player.IsAlive)  -- true`;
           if (f.value === null) continue;
           if (watchers.some(item => item.name === f.name)) generated += `    self.__lauaValues[${JSON.stringify(f.name)}] = ${transpileCore(f.value)}\n`;
           else generated += `    self.${f.name} = ${transpileCore(f.value)}\n`;
+        }
+        for (const property of ctor?.properties || []) {
+          if (watchers.some(item => item.name === property.name)) generated += `    self.__lauaValues[${JSON.stringify(property.name)}] = ${property.name}\n`;
+          else generated += `    self.${property.name} = ${property.name}\n`;
         }
         constructorBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
         if (constructorBody) generated += constructorBody + "\n";
@@ -3130,7 +3171,16 @@ print(player.IsAlive)  -- true`;
           const member=/^(?:(?:public|private|protected|static|final|override|abstract)\s+)*(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)(?:\s*:\s*([^\n]+))?/.exec(code);
           if(member){info.methods.set(member[1],{params:params(member[2]),result:type(member[3]?.trim()||unknown)});depth++;continue;}
           const ctor=/^constructor\s*\(([^)]*)\)/.exec(code);
-          if(ctor){info.ctor=params(ctor[1]);depth++;continue;}
+          if(ctor){
+            const parsed=parseConstructorProperties(ctor[1]);
+            info.ctor=params(parsed.params);
+            for(const property of parsed.properties){
+              const declaration=splitDefaultParameters(parsed.params).find(part=>new RegExp(`^\\s*${property.name}\\s*:`).test(part));
+              const annotation=declaration?.slice(declaration.indexOf(':')+1).trim() || 'any';
+              info.fields.set(property.name,type(annotation));
+            }
+            depth++;continue;
+          }
           const prop=/^(?:(?:public|private|protected|static|final|override|abstract)\s+)*([A-Za-z_]\w*)\s*:\s*([^=\n]+?)(?:\s*=|\s*$)/.exec(code);
           if(prop){info.fields.set(prop[1],type(prop[2]));continue;}
           const special=/^(?:get|set|watch)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/.exec(code);
@@ -3394,7 +3444,12 @@ print(player.IsAlive)  -- true`;
             const lineEnd=bodyMasked.indexOf('\n',m.index), prefix=bodyMasked.slice(m.index,lineEnd===-1?bodyMasked.length:lineEnd);
             if(/^\s*(?:local|return|self\.|if\b|for\b)/.test(prefix))continue;
             const staticMember=/\bstatic\b/.test(prefix.split(/\b(?:function|lazy|get|set)\b/)[0]);
-            if(m[4] !== undefined){info.ctor=signature(m[4]);continue;}
+            if(m[4] !== undefined){
+              const parsed=parseConstructorProperties(m[4]);
+              info.ctor=signature(parsed.params);
+              for(const property of parsed.properties)info.instance.set(property.name,{kind:'field',params:null});
+              continue;
+            }
             const name=m[2]||m[5]||m[7]||m[8];if(!name)continue;
             const accessorKind=m[5] ? /\b(get|set)\s+[A-Za-z_]\w*\s*\(/.exec(prefix)?.[1] : null;
             const target=staticMember?info.statics:info.instance;
@@ -3785,7 +3840,7 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.55";
+    const LAUA_VERSION = "3.56";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
@@ -3865,6 +3920,7 @@ end`;
       const header = style==='One Line' ? `--[[ Transpiled with laua v${LAUA_VERSION} ]]` : `-- Transpiled with laua v${LAUA_VERSION}`;
       return style==='One Line' ? (generated.startsWith(header + ' ') || generated === header ? generated : `${header} ${generated}`) : (generated.startsWith(header + '\n') || generated === header ? generated : `${header}\n${generated}`);
     }
+
     function buildLauaSymbolIndex(source) {
       const symbols = {
         namespaces: {},
@@ -3957,6 +4013,12 @@ end`;
           }
 
           if (/^constructor\s*\(/.test(trimmed)) {
+            const signature=/^constructor\s*\(([^)]*)\)/.exec(trimmed);
+            if(signature){
+              for(const property of parseConstructorProperties(signature[1]).properties){
+                instanceMembers[property.name]={kind:'field',visibility:property.visibility,detail:`Laua ${property.visibility} constructor field`};
+              }
+            }
             try {
               const start = lines[li].start + raw.indexOf("constructor");
               const blockEnd = findMatchingEndByLines(body, start);
