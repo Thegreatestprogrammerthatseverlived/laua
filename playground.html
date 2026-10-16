@@ -500,9 +500,11 @@
       for (const name of LIBRARY_MEMBERS[owner] || []) {
         // Deprecated standard-library words remain discoverable in completion.
         const definition = owner === "buffer" ? BUFFER_SIGNATURES[name] : null;
+        const signatures = getPlaygroundLibrarySignatures(owner, name);
         members[name] = {
           kind: owner === "math" && ["pi", "huge"].includes(name) || owner === "utf8" && name === "charpattern" ? "field" : "function",
-          params: definition?.[0] || "",
+          params: signatures?.[0] ?? "",
+          signatures: signatures || undefined,
           detail: definition?.[1] || (LAUA_CORE_AVAILABLE.has(`${owner}.${name}`)
             ? `Laua ${owner} extension (transpiled helper)`
             : `${owner} standard library${HIDDEN_DEPRECATED_BUILTINS.has(`${owner}.${name}`) ? " (deprecated)" : ""}`),
@@ -7252,7 +7254,7 @@ end`;
     const PLAYGROUND_LIBRARY_ARITIES = {
       table: {
         find:[2,3], filter:[2,2], map:[2,2], reduce:[3,3], findWhere:[2,2],
-        clear:[1,1], clone:[1,1], concat:[1,3], create:[1,2], freeze:[1,1],
+        clear:[1,1], clone:[1,1], concat:[1,4], create:[1,2], freeze:[1,1],
         insert:[2,3], isfrozen:[1,1], maxn:[1,1], move:[4,5], pack:[0,Infinity],
         remove:[1,2], sort:[1,2], unpack:[1,3]
       },
@@ -7281,7 +7283,7 @@ end`;
         btest:[0,Infinity], bxor:[0,Infinity], extract:[2,3],
         lrotate:[2,2], lshift:[2,2], replace:[3,4], rrotate:[2,2], rshift:[2,2]},
       buffer: {create:[1,1], fromstring:[1,1], tostring:[1,1], len:[1,1],
-        copy:[3,5], fill:[3,4], readstring:[3,3], writestring:[4,4],
+        copy:[3,5], fill:[3,4], readstring:[3,3], writestring:[3,4],
         readbits:[3,3], writebits:[4,4]}
     };
     for (const method of LAUA_TABLE_EXTENSION_NAMES) {
@@ -7294,6 +7296,91 @@ end`;
     for (const format of ["i8", "u8", "i16", "u16", "i32", "u32", "f32", "f64"]) {
       PLAYGROUND_LIBRARY_ARITIES.buffer[`read${format}`] = [2,2];
       PLAYGROUND_LIBRARY_ARITIES.buffer[`write${format}`] = [3,3];
+    }
+
+    // One signature catalog serves completions and Monaco parameter hints.
+    // Hand-authored signatures take priority. The existing arity catalog supplies
+    // generic parameter names for remaining known Luau/Laua library functions.
+    // Unknown arity stays unknown: never display invented zero-parameter calls.
+    const PLAYGROUND_LIBRARY_SIGNATURES = Object.freeze({
+      table: {
+        clear: "t: table", clone: "t: table", concat: "t: table, separator: string?, start: number?, finish: number?",
+        create: "size: number, value: any?", find: "t: table, value: any, start: number?",
+        filter: "t: table, predicate: function", map: "t: table, callback: function",
+        findWhere: "t: table, predicate: function", freeze: "t: table",
+        insert: ["t: table, value: any", "t: table, position: number, value: any"],
+        isfrozen: "t: table", maxn: "t: table", move: "source: table, from: number, to: number, destinationIndex: number, destination: table?",
+        pack: "...: any", remove: "t: table, position: number?", reduce: "t: table, reducer: function, initial: any",
+        sort: "t: table, comparator: function?", unpack: "t: table, start: number?, finish: number?"
+      },
+      string: {
+        byte: "s: string, index: number?, finish: number?", char: "...: number",
+        find: "s: string, pattern: string, init: number?, plain: boolean?",
+        format: "format: string, ...: any", gmatch: "s: string, pattern: string",
+        gsub: "s: string, pattern: string, replacement: any, count: number?",
+        len: "s: string", lower: "s: string", match: "s: string, pattern: string, init: number?",
+        pack: "format: string, ...: any", packsize: "format: string", rep: "s: string, count: number, separator: string?",
+        reverse: "s: string", split: "s: string, separator: string", sub: "s: string, start: number, finish: number?",
+        unpack: "format: string, data: string, position: number?", upper: "s: string"
+      },
+      math: {
+        abs: "x: number", acos: "x: number", asin: "x: number", atan: "y: number, x: number?",
+        cosh: "x: number", sinh: "x: number", tanh: "x: number", frexp: "x: number", ldexp: "mantissa: number, exponent: number", log10: "x: number",
+        atan2: "y: number, x: number", ceil: "x: number", clamp: "value: number, minimum: number, maximum: number",
+        cos: "x: number", deg: "x: number", exp: "x: number", floor: "x: number",
+        fmod: "x: number, y: number", log: "x: number, base: number?", max: "x: number, ...: number",
+        min: "x: number, ...: number", modf: "x: number", noise: "x: number, y: number?, z: number?",
+        pow: "x: number, y: number", rad: "x: number",
+        random: ["", "max: number", "min: number, max: number"],
+        randomseed: "seed: number, additionalSeed: number?", round: "x: number", sign: "x: number",
+        sin: "x: number", sqrt: "x: number", tan: "x: number"
+      },
+      task: { cancel: "thread: thread", defer: "callback: function, ...: any", delay: "seconds: number, callback: function, ...: any",
+        desynchronize: "", spawn: "callback: function, ...: any", synchronize: "", wait: "seconds: number?" },
+      coroutine: { close: "thread: thread", create: "callback: function", isyieldable: "",
+        resume: "thread: thread, ...: any", running: "", status: "thread: thread", wrap: "callback: function", yield: "...: any" },
+      utf8: { char: "...: number", codes: "s: string", codepoint: "s: string, start: number?, finish: number?",
+        graphemes: "s: string", len: "s: string, start: number?, finish: number?",
+        nfcnormalize: "s: string", nfdnormalize: "s: string", offset: "s: string, count: number, position: number?" },
+      os: { clock: "", date: "format: string?, timestamp: number?", difftime: "later: number, earlier: number", time: "date: table?" },
+      bit32: { arshift: "value: number, displacement: number", band: "...: number", bnot: "value: number",
+        bor: "...: number", btest: "...: number", bxor: "...: number", countlz: "value: number", countrz: "value: number",
+        extract: "value: number, field: number, width: number?", lrotate: "value: number, displacement: number",
+        lshift: "value: number, displacement: number", replace: "value: number, replacement: number, field: number, width: number?",
+        rrotate: "value: number, displacement: number", rshift: "value: number, displacement: number" },
+      buffer: Object.fromEntries(Object.entries(BUFFER_SIGNATURES).map(([name, definition]) => [name, definition[0]])),
+      debug: { info: ["level: number | function, options: string", "thread: thread, level: number | function, options: string"],
+        traceback: ["message: string?, level: number?", "thread: thread, message: string?, level: number?"],
+        profilebegin: "label: string", profileend: "", setmemorycategory: "category: string", resetmemorycategory: "" }
+    });
+
+    const PLAYGROUND_GLOBAL_SIGNATURES = Object.freeze({
+      assert: "condition: any, message: string?", error: "message: any, level: number?",
+      print: "...: any", warn: "...: any", require: "module: ModuleScript | number",
+      type: "value: any", typeof: "value: any", tostring: "value: any", tonumber: "value: any, base: number?",
+      pairs: "t: table", ipairs: "t: table", next: "t: table, index: any?",
+      pcall: "callback: function, ...: any", xpcall: "callback: function, errorHandler: function, ...: any",
+      select: "index: number | string, ...: any", getmetatable: "value: any",
+      setmetatable: "t: table, metatable: table?", rawequal: "a: any, b: any",
+      rawget: "t: table, key: any", rawset: "t: table, key: any, value: any", rawlen: "value: table | string",
+      unpack: "t: table, start: number?, finish: number?", newproxy: "withMetatable: boolean?",
+      gcinfo: "", tick: "", time: "", elapsedTime: "", wait: "seconds: number?",
+      delay: "seconds: number, callback: function, ...: any", spawn: "callback: function, ...: any",
+      UserSettings: "", settings: "", cancelScope: ""
+    });
+
+    function getPlaygroundLibrarySignatures(library, name) {
+      const exact = PLAYGROUND_LIBRARY_SIGNATURES[library]?.[name];
+      if (exact !== undefined) return Array.isArray(exact) ? exact : [exact];
+      const range = PLAYGROUND_LIBRARY_ARITIES[library]?.[name];
+      if (!range) return null;
+      const [minimum, maximum] = range;
+      const names = [];
+      for (let i = 0; i < Math.max(minimum, Number.isFinite(maximum) ? maximum : minimum); i++) {
+        names.push(`argument${i + 1}: any${i >= minimum ? "?" : ""}`);
+      }
+      if (!Number.isFinite(maximum)) names.push("...: any");
+      return [names.join(", ")];
     }
 
     function playgroundCallArgs(source, masked, openParen) {
@@ -9312,66 +9399,145 @@ end`;
         return {label, params, activeParameter: (anonymous[1].match(/,/g) || []).length};
       }
 
+      // Find the open call containing the cursor, rather than assuming the
+      // current line ends with a flat `method(...)` expression. This handles
+      // nested calls, strings/comments with commas, tables and multiline calls.
+      function findActiveLauaCall(source, cursorOffset) {
+        const prefix = source.slice(0, cursorOffset);
+        const masked = maskNonCode(prefix);
+        const stack = [];
+        for (let i = 0; i < masked.length; i++) {
+          const ch = masked[i];
+          if (ch === "(" || ch === "[" || ch === "{") {
+            stack.push({char: ch, open: i, commas: 0});
+          } else if (ch === ")" || ch === "]" || ch === "}") {
+            const expected = ch === ")" ? "(" : ch === "]" ? "[" : "{";
+            if (stack.length && stack[stack.length - 1].char === expected) stack.pop();
+          } else if (ch === "," && stack.length) {
+            stack[stack.length - 1].commas++;
+          }
+        }
+        for (let i = stack.length - 1; i >= 0; i--) {
+          const frame = stack[i];
+          if (frame.char !== "(") continue;
+          const left = masked.slice(0, frame.open);
+          const target = /([A-Za-z_]\w*(?:\s*[.:]\s*[A-Za-z_]\w*)*)\s*$/.exec(left);
+          if (!target) continue;
+          const before = left.slice(0, target.index);
+          if (/\b(?:function|constructor|get|set|watch)\s*$/.test(before)) continue;
+          // Incomplete member chains do not represent a callable expression.
+          const name = target[1].replace(/\s*([.:])\s*/g, "$1");
+          const separatorAt = Math.max(name.lastIndexOf("."), name.lastIndexOf(":"));
+          if (separatorAt >= 0) return {
+            name, owner: name.slice(0, separatorAt), operator: name[separatorAt],
+            member: name.slice(separatorAt + 1), activeParameter: frame.commas,
+            open: frame.open, receiverPrefix: prefix.slice(0, frame.open)
+          };
+          // A method after a nested receiver call, such as
+          // game:GetService("Players"):GetPlayers(), has a method name but the
+          // immediate regex cannot contain the receiver call's parentheses.
+          const chain = /([A-Za-z_]\w*(?:\s*\([^()\n]*\))?(?:\s*[.:]\s*[A-Za-z_]\w*(?:\s*\([^()\n]*\))?)*)\s*([.:])\s*$/.exec(prefix.slice(0, frame.open - name.length));
+          if (chain) return {
+            name: `${chain[1]}${chain[2]}${name}`, owner: chain[1], operator: chain[2], member: name,
+            activeParameter: frame.commas, open: frame.open
+          };
+          return {name, owner: null, member: null, operator: null, activeParameter: frame.commas, open: frame.open};
+        }
+        return null;
+      }
+
+      function splitLauaSignatureParameters(raw) {
+        if (!raw || !raw.trim()) return [];
+        const result = [], masked = maskNonCode(raw);
+        let start = 0, parens = 0, braces = 0, brackets = 0, angles = 0;
+        for (let i = 0; i <= masked.length; i++) {
+          const ch = masked[i];
+          if (i < masked.length) {
+            if (ch === "(") parens++;
+            else if (ch === ")") parens = Math.max(0, parens - 1);
+            else if (ch === "{") braces++;
+            else if (ch === "}") braces = Math.max(0, braces - 1);
+            else if (ch === "[") brackets++;
+            else if (ch === "]") brackets = Math.max(0, brackets - 1);
+            else if (ch === "<") angles++;
+            else if (ch === ">") angles = Math.max(0, angles - 1);
+          }
+          if (i === masked.length || (ch === "," && !parens && !braces && !brackets && !angles)) {
+            const item = raw.slice(start, i).trim();
+            if (item) result.push(item);
+            start = i + 1;
+          }
+        }
+        return result;
+      }
+
+      function makeLauaSignatureHelp(name, declarations, activeParameter, description = "Laua/Luau function") {
+        if (!declarations?.length) return null;
+        const signatures = declarations.map(raw => {
+          const parameters = splitLauaSignatureParameters(raw).map(label => ({label}));
+          return {label: `${name}(${raw})`, documentation: description, parameters};
+        });
+        // Prefer a matching overload, but keep other alternatives visible.
+        const activeSignature = Math.max(0, signatures.findIndex((sig, index) => {
+          if (index < signatures.length - 1 && activeParameter >= sig.parameters.length &&
+              !sig.parameters.at(-1)?.label.startsWith("...")) return false;
+          return true;
+        }));
+        const selected = signatures[activeSignature];
+        return {
+          value: {signatures, activeSignature,
+            activeParameter: Math.min(activeParameter, Math.max(0, selected.parameters.length - 1))},
+          dispose() {}
+        };
+      }
+
       monaco.languages.registerSignatureHelpProvider("laua", {
         signatureHelpTriggerCharacters: ["(", ","],
-
+        signatureHelpRetriggerCharacters: [","] ,
         provideSignatureHelp(model, position) {
           const callback = findLauaCallbackHint(model, position);
-          if (callback) {
-            const parameters = callback.params ? callback.params.split(/,\s*/).filter(Boolean) : [];
-            return {
-              value: {
-                signatures: [{label: `${callback.label}(${callback.params})`, documentation: "Expected callback parameters (you can rename the variables)", parameters: parameters.map(label => ({label}))}],
-                activeSignature: 0,
-                activeParameter: Math.min(callback.activeParameter, Math.max(0, parameters.length - 1))
-              },
-              dispose() {}
-            };
-          }
-          const line = model.getLineContent(position.lineNumber).slice(0, position.column - 1);
-          const match = line.match(/([A-Za-z_][A-Za-z0-9_]*)(?:([.:])([A-Za-z_][A-Za-z0-9_]*))?\s*\(([^()]*)$/);
-          if (!match) return null;
+          if (callback) return makeLauaSignatureHelp(callback.label, [callback.params], callback.activeParameter,
+            "Expected callback parameters (you can rename the variables)");
 
-          const symbols = getLauaSymbols(model.getValue());
-          const owner = match[1];
-          const operator = match[2];
-          const member = match[3];
-          const currentArgs = match[4];
-          let fnName = owner;
-          let params = "";
-
-          if (member) {
-            const members = getSymbolMembers(symbols, owner, operator, model.getOffsetAt(position));
+          const source = model.getValue();
+          const cursorOffset = model.getOffsetAt(position);
+          const context = findActiveLauaCall(source, cursorOffset);
+          if (!context) return null;
+          const symbols = getProjectSymbols(model);
+          const {name, owner, member, operator, activeParameter} = context;
+          let declarations = null;
+          let documentation = "Laua/Luau function";
+          if (owner && member) {
+            // A local named like a library shadows that global. Until its
+            // actual callable members are known, do not present built-in hints.
+            if (LIBRARY_MEMBERS[owner] && (symbols.locals[owner] || symbols.variables[owner])) return null;
+            // Built-in catalog and arity checks share the same metadata.
+            // Respect local shadows instead of inventing a library signature
+            // for a user-defined variable named `table`, `math`, etc.
+            if (LIBRARY_MEMBERS[owner] && !symbols.locals[owner] && !symbols.variables[owner]) {
+              declarations = getPlaygroundLibrarySignatures(owner, member);
+              documentation = `${owner} library function`;
+            }
+            const members = owner.includes("(") || owner.includes(".") || owner.includes(":")
+              ? getChainedMembers(symbols, owner, cursorOffset)
+              : getSymbolMembers(symbols, owner, operator, cursorOffset);
             const info = members?.[member];
-            if (!info || info.kind !== "function") return null;
-
-            fnName = `${owner}${operator}${member}`;
-            params = info.params || "";
-          } else if (symbols.localFunctions[owner]) {
-            params = symbols.localFunctions[owner].params || "";
-          } else {
-            return null;
+            if (info && (info.kind === "function" || info.kind === "method")) {
+              if (!declarations) declarations = info.signatures || (typeof info.params === "string" ? [info.params] : null);
+              if (info.apiMember && Array.isArray(info.apiMember.Parameters)) {
+                declarations = [info.apiMember.Parameters.map(param =>
+                  `${param.Name || "value"}: ${displayRobloxCallbackType(param.Type)}`).join(", ")];
+              }
+              documentation = info.documentation || info.detail || documentation;
+            }
+          } else if (symbols.localFunctions[name]) {
+            declarations = [symbols.localFunctions[name].params || ""];
+          } else if (!symbols.locals[name] && !symbols.variables[name] &&
+                     Object.prototype.hasOwnProperty.call(PLAYGROUND_GLOBAL_SIGNATURES, name)) {
+            declarations = [PLAYGROUND_GLOBAL_SIGNATURES[name]];
+            documentation = "Luau global function";
           }
-
-          const parameterNames = params
-            ? params.split(",").map(x => x.trim()).filter(Boolean)
-            : [];
-
-          return {
-            value: {
-              signatures: [{
-                label: `${fnName}(${params})`,
-                documentation: "Laua/Luau function",
-                parameters: parameterNames.map(x => ({ label: x }))
-              }],
-              activeSignature: 0,
-              activeParameter: Math.min(
-                currentArgs.trim() === "" ? 0 : currentArgs.split(",").length - 1,
-                Math.max(0, parameterNames.length - 1)
-              )
-            },
-            dispose() {}
-          };
+          return makeLauaSignatureHelp(name, declarations, activeParameter, documentation);
         }
       });
 
