@@ -202,7 +202,8 @@
         <summary aria-label="More Laua actions">More ▾</summary>
         <div class="more-panel">
           <span class="more-section">Project and files</span>
-          <button id="exampleBtn" title="Load the built-in starter example into main.laua (other files stay unchanged)">Default main.laua</button>
+          <button type="button" id="exampleBtn" title="Reset main.laua to the built-in starter; your previous main.laua is backed up">Default main.laua</button>
+          <button type="button" id="restoreMainBtn" hidden title="Restore the previous main.laua before the last reset">Undo Default main.laua</button>
           <button id="clearBtn">Clear</button>
           <button id="exportBtn" title="Export active file as Luau">Export Luau</button>
           <button id="exportProjectBtn" title="Export compiled ModuleScripts only; keep .laua sources separately">Export Project .rbxmx</button>
@@ -572,7 +573,7 @@
       return suggestions;
     }
 
-    const STARTER = `--!strict
+    const BROKEN_MAIN_STARTER = `--!strict
 class Character
     private Health = 100
 
@@ -608,6 +609,31 @@ local mapped = table.map(numbers, doubled)
 local allNumbers = {...numbers, ...mapped}
 local message = "Welcome to Laua"
 local part = message[1:7]`;
+
+    const STARTER = `-- Laua starter: classes, constructors, methods, and getters
+class PlayerData
+    public Health: number = 100
+    public Name: string = "Player"
+
+    constructor(name: string)
+        self.Name = name
+    end
+
+    function TakeDamage(amount: number)
+        self.Health = math.max(0, self.Health - amount)
+    end
+
+    get IsAlive(): boolean
+        return self.Health > 0
+    end
+end
+
+local player = new PlayerData("Explorer")
+player:TakeDamage(25)
+
+print(player.Name)     -- Explorer
+print(player.Health)   -- 75
+print(player.IsAlive)  -- true`;
 
     const PREVIOUS_MAIN_STARTER = "import Zombie from \"./Zombie\"\nimport Player from \"./Player\"\n\nlocal zombie = new Zombie\nlocal player = new Player\nprint(zombie.Health, player.Name)";
 
@@ -9664,6 +9690,7 @@ end`;
       // Keep the existing key to preserve v3.10-v3.12 user projects.
       const PROJECT_KEY = "laua-playground-project-v3.10";
       const RECOVERY_KEY = "laua-playground-startup-recovery-v3.13";
+      const DEFAULT_MAIN_BACKUP_KEY = "laua-playground-default-main-previous-v3.55";
       let activeFile = null;
       let projectReady = false;
       let playgroundInitialized = false;
@@ -9923,7 +9950,7 @@ end`;
             seen.add(name);
             // The old demo or a blank main file should never result in an empty
             // startup editor. Keep an exact recovery copy of the old project.
-            const oldDemo = name === "main.laua" && entry.source === PREVIOUS_MAIN_STARTER;
+            const oldDemo = name === "main.laua" && (entry.source === PREVIOUS_MAIN_STARTER || entry.source === BROKEN_MAIN_STARTER);
             const blankMain = name === "main.laua" && entry.source.trim() === "";
             if (blankMain || oldDemo) {
               try {
@@ -10967,23 +10994,86 @@ end`;
         status.textContent = `Exported ${activeFile} as Luau`;
         status.className = "ok";
       });
-      function loadDefaultMain() {
-        let main = projectFiles.get("main.laua");
-        if (!main) {
-          main = createProjectFile("main.laua", STARTER);
-        } else if (main.model.getValue() !== STARTER) {
-          const isUntouchedOldDemo = main.model.getValue() === PREVIOUS_MAIN_STARTER;
-          // Do not silently discard a user's saved edits or deliberately empty file.
-          if (!isUntouchedOldDemo && !confirm("Replace main.laua with the default example? Your current main.laua code will be overwritten. Other files are unchanged.")) return;
-          main.model.setValue(STARTER);
-        }
-        switchProjectFile("main.laua");
-        runTranspile();
-        status.textContent = "Loaded default example into main.laua · Other files unchanged";
-        status.className = "ok";
+      function updateDefaultMainUndoButton() {
+        const button = document.getElementById("restoreMainBtn");
+        if (!button) return;
+        let backup = null;
+        try { backup = JSON.parse(localStorage.getItem(DEFAULT_MAIN_BACKUP_KEY) || "null"); } catch {}
+        button.hidden = typeof backup?.source !== "string";
       }
 
-      document.getElementById("exampleBtn").addEventListener("click", loadDefaultMain);
+      function replaceMainSource(main, source) {
+        if (main.model.getValue() === source) return;
+        // Unlike setValue(), pushEditOperations preserves Monaco's undo history.
+        main.model.pushStackElement();
+        main.model.pushEditOperations([], [{range:main.model.getFullModelRange(),text:source}], () => null);
+        main.model.pushStackElement();
+      }
+
+      function loadDefaultMain() {
+        try {
+          let main = projectFiles.get("main.laua");
+          let backupSaved = false;
+          if (!main) {
+            main = createProjectFile("main.laua", STARTER);
+          } else if (main.model.getValue() !== STARTER) {
+            const oldSource = main.model.getValue();
+            try {
+              localStorage.setItem(DEFAULT_MAIN_BACKUP_KEY, JSON.stringify({source:oldSource,savedAt:Date.now()}));
+              backupSaved = true;
+            } catch (error) {
+              console.warn("Could not persist the previous main.laua backup:", error);
+            }
+            replaceMainSource(main, STARTER);
+          }
+          switchProjectFile("main.laua");
+          updateDefaultMainUndoButton();
+          const output = runTranspile();
+          if (output === null) {
+            const detail = status.textContent;
+            status.textContent = "Default main.laua loaded, but transpilation failed: " + detail;
+            status.className = "error";
+          } else {
+            status.textContent = "Default main.laua loaded." + (backupSaved ? " Previous main.laua backed up; use Undo Default main.laua to restore it." : " Other files unchanged.");
+            status.className = "ok";
+          }
+        } catch (error) {
+          status.textContent = "Could not load Default main.laua: " + (error?.message || String(error));
+          status.className = "error";
+          console.error("Default main.laua reset error", error);
+        }
+      }
+
+      function undoDefaultMain() {
+        try {
+          const backup = JSON.parse(localStorage.getItem(DEFAULT_MAIN_BACKUP_KEY) || "null");
+          if (typeof backup?.source !== "string") {
+            status.textContent = "No previous main.laua backup is available.";
+            status.className = "error";
+            updateDefaultMainUndoButton();
+            return;
+          }
+          let main = projectFiles.get("main.laua");
+          if (!main) main = createProjectFile("main.laua", backup.source);
+          else replaceMainSource(main, backup.source);
+          switchProjectFile("main.laua");
+          localStorage.removeItem(DEFAULT_MAIN_BACKUP_KEY);
+          updateDefaultMainUndoButton();
+          const output = runTranspile();
+          if (output === null) {
+            const detail = status.textContent;
+            status.textContent = "Previous main.laua restored, but transpilation failed: " + detail;
+            status.className = "error";
+          } else {
+            status.textContent = "Restored the previous main.laua. Other files unchanged.";
+            status.className = "ok";
+          }
+        } catch (error) {
+          status.textContent = "Could not restore main.laua: " + (error?.message || String(error));
+          status.className = "error";
+        }
+      }
+
       document.getElementById("clearBtn").addEventListener("click", () => {
         lauaEditor.setValue("");
         luauEditor.setValue("");
@@ -11016,6 +11106,18 @@ end`;
         status.className = "error";
       }
       playgroundInitialized = true;
+      // Expose ready handlers to the toolbar listener installed before Monaco loads.
+      window.__lauaLoadDefaultMain = loadDefaultMain;
+      window.__lauaUndoDefaultMain = undoDefaultMain;
+      updateDefaultMainUndoButton();
+      if (window.__lauaPendingDefaultMain) {
+        window.__lauaPendingDefaultMain = false;
+        loadDefaultMain();
+      }
+      if (window.__lauaPendingUndoDefaultMain) {
+        window.__lauaPendingUndoDefaultMain = false;
+        undoDefaultMain();
+      }
       if (savedProject && projectFiles.get(initialProjectFile())?.model.getValue() !== STARTER) {
         status.textContent += ` · Your saved ${initialProjectFile()} was restored unchanged.`;
       }
@@ -11035,6 +11137,23 @@ end`;
   </script>
   <script>
     (() => {
+      // Register the starter/reset controls immediately, not inside Monaco's
+      // asynchronous loading callback. A tap during startup is safely queued.
+      const resetButton = document.getElementById('exampleBtn');
+      const undoButton = document.getElementById('restoreMainBtn');
+      const reportPending = () => {
+        const status = document.getElementById('status');
+        status.textContent = "The editor is loading. Default main.laua will open when it is ready.";
+        status.className = "";
+      };
+      resetButton?.addEventListener('click', () => {
+        if (typeof window.__lauaLoadDefaultMain === 'function') window.__lauaLoadDefaultMain();
+        else { window.__lauaPendingDefaultMain = true; reportPending(); }
+      });
+      undoButton?.addEventListener('click', () => {
+        if (typeof window.__lauaUndoDefaultMain === 'function') window.__lauaUndoDefaultMain();
+        else { window.__lauaPendingUndoDefaultMain = true; reportPending(); }
+      });
       const more = document.getElementById('headerMore');
       more?.addEventListener('click', event => {
         if (event.target.closest('button')) more.open = false;
