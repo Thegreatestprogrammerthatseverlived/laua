@@ -6003,6 +6003,17 @@ end`;
       return lineOffset + (firstNonWhitespace === -1 ? 0 : firstNonWhitespace);
     }
 
+    function validLazyFieldStatement(maskedLine, originalLine) {
+      // maskNonCode hides strings as well as comments. A valid literal-only
+      // initializer therefore looks blank in the masked source.
+      const declaration = /^lazy\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*/.exec(maskedLine);
+      if (!declaration) return false;
+      if (maskedLine.slice(declaration[0].length).trim()) return true;
+      const initializer = originalLine.slice(declaration[0].length).trim();
+      if (!initializer || initializer.startsWith("--")) return false;
+      return /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\[(=*)\[[\s\S]*?\]\1\])/.test(initializer);
+    }
+
     function lintLuauStatementSyntax(source, maskedSource, pushMarker) {
       const maskedLines = maskedSource.split("\n");
       const sourceLines = source.split("\n");
@@ -6132,21 +6143,7 @@ end`;
           if (!/^defer\s*$/.test(trimmed)) issue(lineStart, trimmed.length, "Use 'defer' on its own line before its cleanup block.");
           add("defer", headerIndex);
         } else if (/^lazy\s+/.test(trimmed)) {
-          if (!/^lazy\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$/.test(trimmed)) issue(lineStart, trimmed.length, "lazy requires a field and an initializer.");
-        } else if (/^export\s+/.test(trimmed)) {
-          if (!/^export\s+(?:(?:abstract|final)\s+)?(?:class|enum|namespace|type|(?:local\s+)?(?:async\s+)?function|local)\b/.test(trimmed)) issue(lineStart, trimmed.length, "Unsupported export declaration.");
-          if (/^export\s+(?:(?:final|abstract)\s+)?class\b/.test(trimmed)) add("class", headerIndex);
-          if (/^export\s+enum\b/.test(trimmed)) add("enum", headerIndex);
-          if (/^export\s+namespace\b/.test(trimmed)) add("namespace", headerIndex);
-        } else if (/^lazy\s+/.test(trimmed)) {
-          if (!/^lazy\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$/.test(trimmed)) issue(lineStart, trimmed.length, "lazy requires a field and an initializer.");
-        } else if (/^export\s+/.test(trimmed)) {
-          if (!/^export\s+(?:(?:abstract|final)\s+)?(?:class|enum|namespace|type|(?:local\s+)?(?:async\s+)?function|local)\b/.test(trimmed)) issue(lineStart, trimmed.length, "Unsupported export declaration.");
-          if (/^export\s+(?:(?:final|abstract)\s+)?class\b/.test(trimmed)) add("class", headerIndex);
-          if (/^export\s+enum\b/.test(trimmed)) add("enum", headerIndex);
-          if (/^export\s+namespace\b/.test(trimmed)) add("namespace", headerIndex);
-        } else if (/^lazy\s+/.test(trimmed)) {
-          if (!/^lazy\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$/.test(trimmed)) issue(lineStart, trimmed.length, "lazy requires a field and an initializer.");
+          if (!validLazyFieldStatement(trimmed, rawLine.trim())) issue(lineStart, trimmed.length, "lazy requires a field and an initializer.");
         } else if (/^export\s+/.test(trimmed)) {
           if (!/^export\s+(?:(?:abstract|final)\s+)?(?:class|enum|namespace|type|(?:local\s+)?(?:async\s+)?function|local)\b/.test(trimmed)) issue(lineStart, trimmed.length, "Unsupported export declaration.");
           if (/^export\s+(?:(?:final|abstract)\s+)?class\b/.test(trimmed)) add("class", headerIndex);
