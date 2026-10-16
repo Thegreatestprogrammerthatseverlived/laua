@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.52"}
+local Transpiler = {Version = "3.54"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -684,6 +684,8 @@ local function transpileClasses(source: string): string
         local lines = splitLines(body)
         local blockLines = splitLines(maskNonCode(body))
         local fields, statics, methods, getters, setters, operators, lazies, watchers = {}, {}, {}, {}, {}, {}, {}, {}
+        local classTypes = {}
+        local classTypeNames = {}
         local attributes = {}
         local names = {}
         local ctor = nil
@@ -702,6 +704,31 @@ local function transpileClasses(source: string): string
                 continue
             end
             local modifiers, remainder = parseModifiers(headerText)
+            local aliasName = remainder:match("^type%s+([%a_][%w_]*)%s*=") or remainder:match("^type%s+([%a_][%w_]*)%s*%b<>%s*=")
+            if aliasName then
+                if next(modifiers) or #attributes > 0 then error("Class type aliases cannot have member modifiers or attributes") end
+                if classTypeNames[aliasName] then error(`Duplicate class type alias '{aliasName}'`) end
+                classTypeNames[aliasName] = true
+                local typeLines = {remainder}
+                local depth = 0
+                local function countBraces(line: string)
+                    local visible = maskNonCode(line)
+                    for char in visible:gmatch("[{}]") do
+                        if char == "{" then depth += 1 else depth -= 1 end
+                        if depth < 0 then error(`Unbalanced type alias '{aliasName}'`) end
+                    end
+                end
+                countBraces(remainder)
+                while depth > 0 do
+                    index += 1
+                    if index > #lines then error(`Unclosed type alias '{aliasName}'`) end
+                    table.insert(typeLines, lines[index].Text)
+                    countBraces(lines[index].Text)
+                end
+                table.insert(classTypes, table.concat(typeLines, "\n"))
+                index += 1
+                continue
+            end
             local kind, memberName, params, returnType = nil, nil, nil, nil
             if not kind then
                 for _, possible in LAUA_METHOD_KINDS do
@@ -807,6 +834,7 @@ local function transpileClasses(source: string): string
             index += 1
         end
 
+        local classTypePrefix = #classTypes > 0 and table.concat(classTypes, "\n") .. "\n" or ""
         local properties = {}
         for _, member in getters do properties[member.Name] = true end
         for _, member in setters do properties[member.Name] = true end
@@ -918,7 +946,7 @@ local function transpileClasses(source: string): string
                 if code ~= "" then table.insert(simple, code) end
                 table.insert(simple, "end")
             end
-            source = source:sub(1, declarationStart - 1) .. table.concat(simple, "\n") .. source:sub(closing.Finish + 1)
+            source = source:sub(1, declarationStart - 1) .. classTypePrefix .. table.concat(simple, "\n") .. source:sub(closing.Finish + 1)
             continue
         end
 
@@ -975,7 +1003,7 @@ local function transpileClasses(source: string): string
                 end
                 table.insert(simple, "end")
             end
-            source = source:sub(1, declarationStart - 1) .. table.concat(simple, "\n") .. source:sub(closing.Finish + 1)
+            source = source:sub(1, declarationStart - 1) .. classTypePrefix .. table.concat(simple, "\n") .. source:sub(closing.Finish + 1)
             continue
         end
 
@@ -1126,7 +1154,7 @@ local function transpileClasses(source: string): string
             end
             table.insert(generated, "end")
         end
-        source = source:sub(1, declarationStart - 1) .. table.concat(generated, "\n") .. source:sub(closing.Finish + 1)
+        source = source:sub(1, declarationStart - 1) .. classTypePrefix .. table.concat(generated, "\n") .. source:sub(closing.Finish + 1)
     end
 end
 
@@ -2473,6 +2501,129 @@ local function validateKnownVisibility(source: string)
     end
 end
 
+-- Output-only, syntax-aware line joining. The result is a single physical line.
+-- Preserve lexical boundaries and refuse directives that require their own line.
+local function oneLineGeneratedOutput(source: string): string
+    local chunks: {string} = {}
+    local tail = ""
+    local parens, brackets, braces = 0, 0, 0
+    local length = #source
+    local function add(fragment: string)
+        if fragment == "" then return end
+        chunks[#chunks + 1] = fragment
+        tail = (tail .. fragment):sub(-128)
+    end
+    local function separator(index: number)
+        local nextIndex = index
+        while nextIndex <= length and source:sub(nextIndex, nextIndex):match("[%s]") do
+            nextIndex += 1
+        end
+        local nextChar = source:sub(nextIndex, nextIndex)
+        local previous = trim(tail)
+        if previous == "" or nextChar == "" or previous:sub(-1) == ";" or previous:sub(-1) == "{" then
+            add(" ")
+            return
+        end
+        local lastChar = previous:sub(-1)
+        local lastWord = previous:match("([%a_]+)$") or ""
+        local nextWord = source:sub(nextIndex):match("^([%a_]+)") or ""
+        if parens > 0 or brackets > 0 or braces > 0
+            or ("=+*/%^~#<>:|&?,.([-"):find(lastChar, 1, true)
+            or (".,:)]}[+*/%^~#<>?=|&-"):find(nextChar, 1, true)
+            or lastWord == "and" or lastWord == "or" or lastWord == "not" or lastWord == "return"
+            or lastWord == "local" or lastWord == "type" or lastWord == "export"
+            or nextWord == "and" or nextWord == "or" then
+            add(" ")
+        else
+            add("; ")
+        end
+    end
+    local index = 1
+    while index <= length do
+        if source:sub(index, index + 1) == "--" then
+            local marker = source:sub(index):match("^%-%-%[(=*)%[")
+            if marker then
+                local closing = "]" .. marker .. "]"
+                local endIndex = source:find(closing, index + #marker + 4, true)
+                if not endIndex then error("One Line: unterminated block comment") end
+                add(" ")
+                index = endIndex + #closing
+            else
+                local ending = source:find("\n", index, true)
+                local comment = source:sub(index, ending and ending - 1 or length)
+                if comment:match("^%-%-[!#]") then
+                    error("One Line cannot preserve line-based Luau directives; use Readable or Compact.")
+                end
+                index = ending or (length + 1)
+            end
+        else
+            local char = source:sub(index, index)
+            if char == '"' or char == "'" or char == "`" then
+                local start = index
+                local quote = char
+                local closed = false
+                index += 1
+                while index <= length do
+                    local current = source:sub(index, index)
+                    if current == "\\" then
+                        index += 2
+                    elseif current == quote then
+                        index += 1
+                        closed = true
+                        break
+                    else
+                        index += 1
+                    end
+                end
+                if not closed then error("One Line: unterminated string") end
+                local literal = source:sub(start, index - 1)
+                if literal:find("\n", 1, true) or literal:find("\r", 1, true) then
+                    if quote == "`" then error("One Line cannot safely flatten multiline interpolated strings; use Readable or Compact.") end
+                    literal = literal:gsub("\\\r\n", "\\n"):gsub("\\\n", "\\n")
+                    if literal:find("\n", 1, true) or literal:find("\r", 1, true) then
+                        error("One Line cannot safely flatten this multiline quoted string; use Readable or Compact.")
+                    end
+                end
+                add(literal)
+            elseif char == "[" and source:sub(index):match("^%[(=*)%[") then
+                local marker = source:sub(index):match("^%[(=*)%[") or ""
+                local closing = "]" .. marker .. "]"
+                local ending = source:find(closing, index + #marker + 2, true)
+                if not ending then error("One Line: unterminated long string") end
+                local literal = source:sub(index, ending + #closing - 1)
+                if literal:find("\n", 1, true) or literal:find("\r", 1, true) then
+                    local body = source:sub(index + #marker + 2, ending - 1)
+                    body = body:gsub("\r\n", "\n"):gsub("\r", "\n")
+                    if body:sub(1, 1) == "\n" then body = body:sub(2) end
+                    body = body:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\t", "\\t")
+                    body = body:gsub("[%c]", function(value: string): string
+                        return "\\x" .. string.format("%02X", string.byte(value))
+                    end)
+                    add('"' .. body .. '"')
+                else
+                    add(literal)
+                end
+                index = ending + #closing
+            elseif char == "\n" or char == "\r" then
+                if char == "\r" and source:sub(index + 1, index + 1) == "\n" then index += 1 end
+                separator(index + 1)
+                index += 1
+            else
+                if char == "(" then parens += 1
+                elseif char == ")" then parens = math.max(0, parens - 1)
+                elseif char == "[" then brackets += 1
+                elseif char == "]" then brackets = math.max(0, brackets - 1)
+                elseif char == "{" then braces += 1
+                elseif char == "}" then braces = math.max(0, braces - 1) end
+                add(char)
+                index += 1
+            end
+        end
+    end
+    local flattened = trim(table.concat(chunks))
+    return flattened:gsub(";%s*$", "")
+end
+
 local function compactGeneratedOutput(source: string): string
     if source:find("[[]=*[[]") or source:find("`",1,true) then return source end
     local result = {}
@@ -3747,7 +3898,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     local mode = type(options) == "table" and options.Mode or "Development"
     if mode ~= "Development" and mode ~= "Release" and mode ~= "Debug" then error("Invalid Laua compile mode") end
     local style = type(options) == "table" and options.OutputStyle or "Readable"
-    if style ~= "Readable" and style ~= "Compact" then error("Invalid Laua output style") end
+    if style ~= "Readable" and style ~= "Compact" and style ~= "One Line" then error("Invalid Laua output style") end
 
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
     validateExpressionSyntax(source)
@@ -3769,7 +3920,7 @@ function Transpiler.Transpile(source: string, options: any?): string
     if source:find("schema", 1, true) then source = nativeTranspileContracts(source) end
     if source:find("cancelScope", 1, true) then source = nativeCancelScopes(source) end
     if source:find("inline", 1, true) then source = transpileInlineFunctions(source) end
-    validateKnownVisibility(source)
+    if type(options) ~= "table" or options.SemanticCheck ~= false then validateKnownVisibility(source) end
     validatePendingFeatures(source)
     if source:find("|>", 1, true) then source = transpilePipelines(source) end
     if source:find("memo", 1, true) then source = transpileMemo(source) end
@@ -3813,8 +3964,12 @@ function Transpiler.Transpile(source: string, options: any?): string
             error("Generated Luau contains an expression immediately followed by a number without a separator")
         end
     end
-    local generated = style == "Compact" and compactGeneratedOutput(source) or source
-    local header = "-- Transpiled with laua v" .. Transpiler.Version
+    local generated = style == "Compact" and compactGeneratedOutput(source) or (style == "One Line" and oneLineGeneratedOutput(source) or source)
+    local header = style == "One Line" and ("--[[ Transpiled with laua v" .. Transpiler.Version .. " ]]") or ("-- Transpiled with laua v" .. Transpiler.Version)
+    if style == "One Line" then
+        if generated:sub(1, #header + 1) == header .. " " or generated == header then return generated end
+        return header .. " " .. generated
+    end
     if generated:sub(1, #header + 1) == header .. "\n" or generated == header then return generated end
     return header .. "\n" .. generated
 end
