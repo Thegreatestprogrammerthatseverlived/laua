@@ -1100,6 +1100,8 @@ local part = message[1:7]`;
         const lines = splitLinesWithOffsets(body);
         const blockIndex = {lines, masked: maskNonCode(body)};
         const fields = [], statics = [], methods = [], getters = [], setters = [], operators = [], lazyFields = [], watchers = [];
+        const classTypeAliases = [];
+        const classTypeNames = new Set();
         let ctor = null;
         let attrs = [];
         const declaredNames = new Set();
@@ -1127,6 +1129,34 @@ local part = message[1:7]`;
             continue;
           }
           const { modifiers, text } = parseLauaModifiers(original);
+          // Type aliases inside a class are compile-time declarations, not runtime fields.
+          // Lift them ahead of generated class code so Luau can resolve their names.
+          const aliasDeclaration = /^type\s+([A-Za-z_]\w*)(?:\s*<[^>\n]+>)?\s*=\s*(.*)$/.exec(text);
+          if (aliasDeclaration) {
+            if (modifiers.size || attrs.length) throw new Error('Class type aliases cannot have member modifiers or attributes');
+            if (classTypeNames.has(aliasDeclaration[1])) throw new Error(`Duplicate class type alias '${aliasDeclaration[1]}'`);
+            classTypeNames.add(aliasDeclaration[1]);
+            const aliasLines = [text];
+            let depth = 0;
+            const countBraces = line => {
+              const visible = maskNonCode(line);
+              for (const ch of visible) {
+                if (ch === '{') depth++;
+                else if (ch === '}' && --depth < 0) throw new Error(`Unbalanced type alias '${aliasDeclaration[1]}'`);
+              }
+            };
+            countBraces(text);
+            while (depth > 0) {
+              li++;
+              if (li >= lines.length) throw new Error(`Unclosed type alias '${aliasDeclaration[1]}'`);
+              const next = lines[li].text;
+              aliasLines.push(next);
+              countBraces(next);
+            }
+            classTypeAliases.push(aliasLines.join('\n'));
+            li++;
+            continue;
+          }
           const isStatic = modifiers.has("static");
           const methodMatch = text.match(/^(async function|function|get|set)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([^=]+))?$/);
           const operatorMatch = text.match(/^operator\s+([^\s(]+)\s*\(([^)]*)\)\s*$/);
@@ -1319,8 +1349,9 @@ local part = message[1:7]`;
             if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
             output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
-          generatedOffsetShift += output.trimEnd().length - (endPos.end - declStart);
-          source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
+          const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + output.trimEnd();
+          generatedOffsetShift += emitted.length - (endPos.end - declStart);
+          source = source.slice(0, declStart) + emitted + source.slice(endPos.end);
           continue;
         }
         // A known hook-free class hierarchy can use Luau's ordinary __index
@@ -1360,8 +1391,9 @@ local part = message[1:7]`;
             else if (body) output += body + '\n';
             output += 'end\n';
           }
-          generatedOffsetShift += output.trimEnd().length - (endPos.end - declStart);
-          source = source.slice(0, declStart) + output.trimEnd() + source.slice(endPos.end);
+          const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + output.trimEnd();
+          generatedOffsetShift += emitted.length - (endPos.end - declStart);
+          source = source.slice(0, declStart) + emitted + source.slice(endPos.end);
           continue;
         }
         // Inherited-only metadata is immutable from Laua declarations in this subclass.
@@ -1463,8 +1495,9 @@ local part = message[1:7]`;
           else if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
         }
-        generatedOffsetShift += generated.length - (endPos.end - declStart);
-          source = source.slice(0, declStart) + generated + source.slice(endPos.end);
+        const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + generated;
+        generatedOffsetShift += emitted.length - (endPos.end - declStart);
+          source = source.slice(0, declStart) + emitted + source.slice(endPos.end);
       }
       return source;
     }
@@ -3708,7 +3741,7 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.53";
+    const LAUA_VERSION = "3.54";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
@@ -3731,7 +3764,7 @@ end`;
       if (!['Readable','Compact','One Line'].includes(style))throw new Error('Invalid Laua output style');
       // Visibility diagnostics must use original positions before opt-in
       // Schema transformations expand the source.
-      validateKnownVisibility(source);
+      if (options?.SemanticCheck !== false) validateKnownVisibility(source);
 
       // Skip whole-file transforms when their syntax cannot occur. Check the
       // current text at each stage because an earlier pass can introduce syntax.
@@ -10406,7 +10439,7 @@ end`;
           if(!force && preflight.errors>0)throw new Error(`Laua preflight detected ${preflight.errors} error(s). Fix marked source before transpiling.`);
           const importErrors = isCompiledLuauFile(file) ? [] : projectImportMarkers(file);
           if (!force && importErrors.length) throw new Error(importErrors.map(item=>item.message).join("; "));
-          const output = isCompiledLuauFile(file) ? lauaEditor.getValue() : transpile(lauaEditor.getValue(), {Mode: document.getElementById("modeSelect").value,OutputStyle:document.getElementById("outputStyleSelect").value});
+          const output = isCompiledLuauFile(file) ? lauaEditor.getValue() : transpile(lauaEditor.getValue(), {Mode: document.getElementById("modeSelect").value,OutputStyle:document.getElementById("outputStyleSelect").value,SemanticCheck: !force});
           if (recordForDiff) {
             diffSnapshots.push({
               filename: activeFile,
