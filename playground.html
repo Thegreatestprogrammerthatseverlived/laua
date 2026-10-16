@@ -196,7 +196,8 @@
       <button id="transpileBtn">Transpile</button>
       <button id="forceTranspileBtn" title="Bypass lint and preflight errors; syntax/transpilation errors still stop output">Force Transpile</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
-      <a id="githubBtn" class="github-btn" href="https://github.com/Thegreatestprogrammerthatseverlived/laua" target="_blank" rel="noopener noreferrer" title="Open Laua on GitHub">Github</a>
+      <a id="githubBtn" class="github-btn" href="https://github.com/Thegreatestprogrammerthatseverlived/laua" target="_blank" rel="noopener noreferrer" title="Open Laua on GitHub">GitHub</a>
+      <a id="discordBtn" class="github-btn" href="https://discord.gg/9drrUjhQcQ" target="_blank" rel="noopener noreferrer" title="Join the Laua Discord server">Discord</a>
       <details class="header-more" id="headerMore">
         <summary aria-label="More Laua actions">More ▾</summary>
         <div class="more-panel">
@@ -4607,7 +4608,14 @@ end`;
         zero: null, one: null, xAxis: null, yAxis: null
       },
       CFrame: {
-        new: ["...", "Construct a CFrame"],
+        new: [[
+          "x: number, y: number, z: number",
+          "",
+          "position: Vector3",
+          "position: Vector3, lookAt: Vector3",
+          "x: number, y: number, z: number, qX: number, qY: number, qZ: number, qW: number",
+          "x: number, y: number, z: number, r00: number, r01: number, r02: number, r10: number, r11: number, r12: number, r20: number, r21: number, r22: number"
+        ], "Construct a CFrame (multiple overloads)"],
         Angles: ["rx: number, ry: number, rz: number", "Construct a rotation CFrame"],
         fromEulerAnglesXYZ: ["rx: number, ry: number, rz: number", "Construct an XYZ CFrame rotation"],
         fromEulerAnglesYXZ: ["rx: number, ry: number, rz: number", "Construct a YXZ CFrame rotation"],
@@ -4679,7 +4687,9 @@ end`;
       for (const [name, signature] of Object.entries(staticMembers)) {
         members[name] = signature === null
           ? { kind: "field", detail: `${globalName} static constant · Roblox datatype` }
-          : { kind: "function", params: signature[0], detail: `${globalName} static constructor · Roblox datatype`, documentation: signature[1] };
+          : { kind: "function", params: Array.isArray(signature[0]) ? signature[0][0] : signature[0],
+              signatures: Array.isArray(signature[0]) ? signature[0] : [signature[0]],
+              detail: `${globalName} static constructor · Roblox datatype`, documentation: signature[1] };
       }
       return members;
     }
@@ -5340,10 +5350,25 @@ end`;
     // or type suggestions. Includes call receivers such as UserSettings(): and
     // game:GetService("Players"):; unresolved expressions must return nothing.
     function isTypeAnnotationCompletion(lineBefore, symbols, cursorOffset, isLaua) {
-      if (/^\s*(?:local|const|type|export\s+type)\s+[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9]*$/.test(lineBefore)) return true;
-      if (/\b(?:function|constructor)\s*(?:[A-Za-z_]\w*)?\s*\([^()]*\b[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9]*$/.test(lineBefore)) return true;
-      return Boolean(isLaua && findClassAtOffset(symbols, cursorOffset) &&
-        /^\s*[A-Za-z_]\w*\s*:\s+[A-Za-z_0-9]*$/.test(lineBefore));
+      // A colon in `object:Method` is NOT a type position. Only annotation
+      // grammar introduces type suggestions. This is shared with inline hints.
+      const prefix = lineBefore.replace(/\s+$/, "");
+      const typeSuffix = "[A-Za-z_0-9.<>?]*";
+      if (new RegExp(`::\\s*${typeSuffix}$`).test(prefix)) return true;
+      if (/\b(?:export\s+)?type\s+[A-Za-z_]\w*(?:\s*<[^=\n]*>)?\s*=.*$/.test(prefix)) return true;
+      if (/\b(?:local|const)\s+[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9.<>?]*$/.test(prefix)) return true;
+      // Typed parameters, including later comma-separated parameters, and
+      // function/method return annotations after the closing parenthesis.
+      if (/\b(?:function|constructor|get|set|watch)\b[^\n]*\([^\n)]*$/.test(prefix) &&
+          /(?:\(|,)\s*[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9.<>?]*$/.test(prefix)) return true;
+      if (/\b(?:function|constructor|get|set|watch)\b[^\n]*\)\s*:\s*[A-Za-z_0-9.<>?]*$/.test(prefix)) return true;
+      // Class field annotations. Avoid interpreting `instance:Method` as one.
+      if (isLaua && findClassAtOffset(symbols, cursorOffset) &&
+          /^\s*(?:(?:public|private|protected|static|readonly)\s+)*[A-Za-z_]\w*\s*:\s*[A-Za-z_0-9.<>?]*$/.test(prefix)) return true;
+      // Table type definitions, e.g. `type T = { Value: num`.
+      if (/\b(?:export\s+)?type\s+[A-Za-z_]\w*(?:\s*<[^=\n]*>)?\s*=/.test(prefix) &&
+          /[{:;,|&]\s*[A-Za-z_0-9.<>?]*$/.test(prefix)) return true;
+      return false;
     }
 
     function getCompletionMemberContext(lineBefore) {
@@ -7383,6 +7408,66 @@ end`;
       return [names.join(", ")];
     }
 
+    function splitLauaSignatureParameters(raw) {
+      if (!raw || !raw.trim()) return [];
+      const result = [], masked = maskNonCode(raw);
+      let start = 0, parens = 0, braces = 0, brackets = 0, angles = 0;
+      for (let i = 0; i <= masked.length; i++) {
+        const ch = masked[i];
+        if (i < masked.length) {
+          if (ch === "(") parens++;
+          else if (ch === ")") parens = Math.max(0, parens - 1);
+          else if (ch === "{") braces++;
+          else if (ch === "}") braces = Math.max(0, braces - 1);
+          else if (ch === "[") brackets++;
+          else if (ch === "]") brackets = Math.max(0, brackets - 1);
+          else if (ch === "<") angles++;
+          else if (ch === ">") angles = Math.max(0, angles - 1);
+        }
+        if (i === masked.length || (ch === "," && !parens && !braces && !brackets && !angles)) {
+          const item = raw.slice(start, i).trim();
+          if (item) result.push(item);
+          start = i + 1;
+        }
+      }
+      return result;
+    }
+
+    // Complete the arity catalog from the same signature metadata used by
+    // autocomplete and parameter hints. A library method with a published
+    // signature must not be silently skipped by argument validation.
+    // Unknown/dynamic methods remain unknown rather than becoming zero-arg.
+    function inferPlaygroundSignatureArity(declarations) {
+      if (!declarations || !declarations.length) return null;
+      let minimum = Infinity, maximum = 0;
+      for (const signature of declarations) {
+        const parameters = splitLauaSignatureParameters(signature);
+        let required = 0, possible = 0;
+        for (const parameter of parameters) {
+          if (/^\.\.\./.test(parameter)) { possible = Infinity; continue; }
+          if (possible !== Infinity) possible++;
+          // Optional names or optional types do not increase minimum arity.
+          const colon = parameter.indexOf(":");
+          const name = (colon < 0 ? parameter : parameter.slice(0, colon)).trim();
+          const type = (colon < 0 ? "" : parameter.slice(colon + 1)).trim();
+          if (!name.endsWith("?") && !type.endsWith("?")) required++;
+        }
+        minimum = Math.min(minimum, required);
+        maximum = Math.max(maximum, possible);
+      }
+      return Number.isFinite(minimum) ? [minimum, maximum] : null;
+    }
+
+    function resolvePlaygroundLibraryArity(library, name) {
+      const arities = PLAYGROUND_LIBRARY_ARITIES[library];
+      const known = arities?.[name];
+      if (known) return known;
+      const exact = PLAYGROUND_LIBRARY_SIGNATURES[library]?.[name];
+      if (exact === undefined) return null;
+      const declarations = Array.isArray(exact) ? exact : [exact];
+      return inferPlaygroundSignatureArity(declarations);
+    }
+
     function playgroundCallArgs(source, masked, openParen) {
       let nested = 0, start = openParen + 1;
       const args = [];
@@ -7409,13 +7494,13 @@ end`;
       // Only real global library receivers are checked. Shadowing is treated
       // conservatively rather than claiming arbitrary user tables are Luau APIs.
       const shadowed = new Set();
-      for (const match of masked.matchAll(/\b(?:local|const)\s+(table|string|math|task|coroutine|utf8|os|bit32|buffer)\b/g)) shadowed.add(match[1]);
-      const calls = /\b(table|string|math|task|coroutine|utf8|os|bit32|buffer)\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
+      for (const match of masked.matchAll(/\b(?:local|const)\s+(table|string|math|task|coroutine|utf8|os|bit32|buffer|debug)\b/g)) shadowed.add(match[1]);
+      const calls = /\b(table|string|math|task|coroutine|utf8|os|bit32|buffer|debug)\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
       let match;
       while ((match = calls.exec(masked)) !== null) {
         const [whole, library, member] = match;
         if (shadowed.has(library)) continue;
-        const spec = PLAYGROUND_LIBRARY_ARITIES[library]?.[member];
+        const spec = resolvePlaygroundLibraryArity(library, member);
         if (!spec) continue;
         const opening = match.index + whole.lastIndexOf("(");
         const parsed = playgroundCallArgs(source, masked, opening);
@@ -8752,7 +8837,8 @@ end`;
           });
 
           const isLaua = model.getLanguageId() === "laua";
-          const typeContext = /(?:\b(?:type|export\s+type)\s+[A-Za-z_][A-Za-z_0-9]*(?:<[^>]*>)?\s*=|::|:|\||&)\s*[A-Za-z_0-9]*$/.test(lineBefore);
+          const sourceSymbols = getProjectSymbols(model);
+          const typeContext = isTypeAnnotationCompletion(lineBefore, sourceSymbols, cursorOffset, isLaua);
           const typedPrefix = word.word.toLowerCase();
           // Engine classes and enums are fetched from the Roblox Client Tracker
           // when needed. The local fallback is still usable offline.
@@ -8762,7 +8848,7 @@ end`;
           const suggestions = [
             ...LUAU_KEYWORDS.map(name => makeKeyword(name)),
             ...(isLaua ? LAUA_KEYWORDS.filter(name => name !== "self").map(name => makeKeyword(name, "Laua keyword")) : []),
-            ...LUAU_TYPE_WORDS.map(name => makeName(name, monaco.languages.CompletionItemKind.TypeParameter, "Luau type", "0200")),
+            ...(typeContext ? LUAU_TYPE_WORDS.map(name => makeName(name, monaco.languages.CompletionItemKind.TypeParameter, "Luau type", "0200")) : []),
             ...LUAU_GLOBAL_FUNCTIONS.map(name => makeName(
               name,
               monaco.languages.CompletionItemKind.Function,
@@ -8771,7 +8857,7 @@ end`;
             )),
             ...LUAU_GLOBAL_OBJECTS.map(name => makeName(name, monaco.languages.CompletionItemKind.Variable, "Roblox/Luau global", "0300")),
             ...LUAU_LIBRARIES.map(name => makeName(name, monaco.languages.CompletionItemKind.Module, "Luau library", "0300")),
-            ...LUAU_BUILTIN_TYPES.map(name => makeName(name, monaco.languages.CompletionItemKind.Class, "Roblox datatype or type", "0200")),
+            ...(typeContext ? LUAU_BUILTIN_TYPES : LUAU_RUNTIME_CONSTRUCTORS).map(name => makeName(name, monaco.languages.CompletionItemKind.Class, typeContext ? "Roblox datatype or type" : "Roblox constructor", typeContext ? "0200" : "0300")),
             ...LUAU_GLOBAL_CONSTANTS.map(name => makeName(name, monaco.languages.CompletionItemKind.Constant, "Luau global constant", "0300")),
             ...(isLaua ? LAUA_GLOBAL_FUNCTIONS.map(name => makeName(name, monaco.languages.CompletionItemKind.Function, "Laua built-in", "0300")) : [])
           ];
@@ -8789,7 +8875,6 @@ end`;
           // Roblox Studio-style names only. Do not insert boilerplate templates,
           // generalized-iteration snippets, or speculative multi-line code.
 
-          const sourceSymbols = getProjectSymbols(model);
           const directImportPosition = /^\s*import\s+([A-Za-z_]\w*)?$/.exec(lineBefore);
           if (isLaua && directImportPosition && findFileByModel(model)) {
             const exportedClasses = new Set();
@@ -9087,7 +9172,7 @@ end`;
           const masked = maskNonCode(source, true);
           const isMasked = cursorOffset > 0 && masked[cursorOffset - 1] === " ";
           const isLaua = model.getLanguageId() === "laua";
-          const typeContext = /(?:\b(?:type|export\s+type)\s+[A-Za-z_][A-Za-z_0-9]*(?:<[^>]*>)?\s*=|::|:|\||&)\s*[A-Za-z_0-9]*$/.test(before);
+          const typeContext = isTypeAnnotationCompletion(before, getProjectSymbols(model), cursorOffset, isLaua);
           const makeSuggestion = name => ({
             insertText: name,
             range: new monaco.Range(position.lineNumber, position.column - partial.length, position.lineNumber, position.column)
@@ -9444,31 +9529,6 @@ end`;
           return {name, owner: null, member: null, operator: null, activeParameter: frame.commas, open: frame.open};
         }
         return null;
-      }
-
-      function splitLauaSignatureParameters(raw) {
-        if (!raw || !raw.trim()) return [];
-        const result = [], masked = maskNonCode(raw);
-        let start = 0, parens = 0, braces = 0, brackets = 0, angles = 0;
-        for (let i = 0; i <= masked.length; i++) {
-          const ch = masked[i];
-          if (i < masked.length) {
-            if (ch === "(") parens++;
-            else if (ch === ")") parens = Math.max(0, parens - 1);
-            else if (ch === "{") braces++;
-            else if (ch === "}") braces = Math.max(0, braces - 1);
-            else if (ch === "[") brackets++;
-            else if (ch === "]") brackets = Math.max(0, brackets - 1);
-            else if (ch === "<") angles++;
-            else if (ch === ">") angles = Math.max(0, angles - 1);
-          }
-          if (i === masked.length || (ch === "," && !parens && !braces && !brackets && !angles)) {
-            const item = raw.slice(start, i).trim();
-            if (item) result.push(item);
-            start = i + 1;
-          }
-        }
-        return result;
       }
 
       function makeLauaSignatureHelp(name, declarations, activeParameter, description = "Laua/Luau function") {
@@ -10304,6 +10364,35 @@ end`;
       lauaEditor.onDidChangeCursorPosition(refreshCallbackHint);
       lauaEditor.onDidChangeModelContent(refreshCallbackHint);
       lauaEditor.onDidChangeModel(refreshCallbackHint);
+
+      // Virtual keyboards sometimes insert text without firing Monaco's normal
+      // signature trigger character. Re-request hints after editing/navigation
+      // when the cursor is genuinely inside a call. Monaco's provider remains
+      // responsible for deciding if that call has a known signature.
+      let lauaSignatureRecoveryTimer = null;
+      let lauaSignatureLastContext = "";
+      function recoverLauaParameterHints() {
+        if (lauaSignatureRecoveryTimer !== null) clearTimeout(lauaSignatureRecoveryTimer);
+        lauaSignatureRecoveryTimer = setTimeout(() => {
+          lauaSignatureRecoveryTimer = null;
+          const model = lauaEditor.getModel();
+          const position = lauaEditor.getPosition();
+          if (!model || !position || !lauaEditor.hasTextFocus()) {
+            lauaSignatureLastContext = "";
+            return;
+          }
+          const current = findActiveLauaCall(model.getValue(), model.getOffsetAt(position));
+          if (!current) { lauaSignatureLastContext = ""; return; }
+          const key = `${model.uri.toString()}:${current.open}:${current.name}:${current.activeParameter}`;
+          if (key === lauaSignatureLastContext) return;
+          lauaSignatureLastContext = key;
+          lauaEditor.trigger("laua-signature-recovery", "editor.action.triggerParameterHints", {});
+        }, 65);
+      }
+      lauaEditor.onDidChangeCursorPosition(recoverLauaParameterHints);
+      lauaEditor.onDidChangeModelContent(recoverLauaParameterHints);
+      lauaEditor.onDidFocusEditorText(recoverLauaParameterHints);
+      lauaEditor.onDidChangeModel(() => { lauaSignatureLastContext = ""; recoverLauaParameterHints(); });
 
       // Insert the matching block ending when Enter is pressed on a header.
       // Unlike a plain snippet, this respects the existing auto-closed `)`
