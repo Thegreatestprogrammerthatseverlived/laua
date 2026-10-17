@@ -202,7 +202,7 @@
         <summary aria-label="More Laua actions">More ▾</summary>
         <div class="more-panel">
           <span class="more-section">Project and files</span>
-          <button type="button" id="exampleBtn" title="Reset main.laua to the built-in starter; your previous main.laua is backed up">Default main.laua</button>
+          <button type="button" id="exampleBtn" title="Load the complete v3.58 feature stress test into main.laua; your previous main.laua is backed up">Default main.laua</button>
           <button type="button" id="restoreMainBtn" hidden title="Restore the previous main.laua before the last reset">Undo Default main.laua</button>
           <button id="clearBtn">Clear</button>
           <button id="exportBtn" title="Export active file as Luau">Export Luau</button>
@@ -210,6 +210,7 @@
           <button id="exportStudioBtn" title="Export original Laua and Luau sources for Studio">Export Editable Studio .rbxmx</button>
           <button id="importProjectBtn" title="Import compiled modules or an editable Studio project">Import Project .rbxmx</button>
           <span class="more-section">Tools</span>
+          <button id="formatCodeBtn" title="Automatically indent the active Laua or Luau file (Shift+Alt+F)">Format Code</button>
           <button id="refreshApiBtn" title="Fetch the latest Roblox Studio API dump again">Refresh Roblox API</button>
           <button id="testsBtn" title="Run compiler regression tests">Tests</button>
           <button id="diffBtn" title="Compare the last two successful manual transpiles">Output Diff</button>
@@ -331,6 +332,14 @@
       ["inline", "Request inline transpilation where supported."],
       ["const", "Declare an immutable binding."],
       ["schema", "Declare a runtime validation schema."],
+      ["interface", "Declare a compile-time class contract."],
+      ["implements", "Require a class to satisfy an interface."],
+      ["readonly", "Allow field initialization, but forbid later direct writes."],
+      ["guard", "Return or exit early when a condition fails."],
+      ["unless", "Run code if the condition is false."],
+      ["try", "Run operations through a protected call."],
+      ["catch", "Handle errors from a try block."],
+      ["finally", "Run cleanup after try or catch."],
     ];
     const LAUA_KEYWORDS = [...new Set(LAUA_LANGUAGE_FEATURES.map(([name]) => name))];
     const LAUA_KEYWORD_DOCS = Object.fromEntries(LAUA_LANGUAGE_FEATURES);
@@ -610,30 +619,444 @@ local allNumbers = {...numbers, ...mapped}
 local message = "Welcome to Laua"
 local part = message[1:7]`;
 
-    const STARTER = `-- Laua starter: classes, constructors, methods, and getters
-class PlayerData
-    public Health: number = 100
-    public Name: string = "Player"
+    const STARTER = `-- Laua v3.58 full feature runtime stress test (Development mode).
+-- Website default main.laua: demonstrates Laua v3.58 language features.
+-- Click Transpile to test syntax and generated Luau in the Playground.
+-- The Playground does not execute Luau. Runtime PASS/FAIL checks run only
+-- when generated Luau is executed in a suitable Roblox environment.
+-- This script avoids HTTP and DataStore access.
 
-    constructor(name: string)
-        self.Name = name
-    end
+local report = {Passed = 0, Failed = 0, AsyncFinished = false}
 
-    function TakeDamage(amount: number)
-        self.Health = math.max(0, self.Health - amount)
-    end
-
-    get IsAlive(): boolean
-        return self.Health > 0
+local function check(name: string, actual: any, expected: any)
+    if actual == expected then
+        report.Passed += 1
+        print("PASS", name)
+    else
+        report.Failed += 1
+        warn("FAIL", name, "expected:", expected, "got:", actual)
     end
 end
 
-local player = new PlayerData("Explorer")
-player:TakeDamage(25)
+-- Native Luau: types, loops, compound assignments, table iteration.
+type Stats = {Health: number, Speed: number}
+local stats: Stats = {Health = 100, Speed = 16}
+local sum = 0
+for _, value in {1, 2, 3, 4} do
+    sum += value
+end
+check("native Luau iteration", sum, 10)
+check("typed record", stats.Speed, 16)
 
-print(player.Name)     -- Explorer
-print(player.Health)   -- 75
-print(player.IsAlive)  -- true`;
+-- Enums, namespaces, classes, inheritance, constructors, overriding.
+enum Mode
+    Idle
+    Running
+    Finished
+end
+check("enum numbering", Mode.Running, 1)
+
+namespace MathTools
+    function Double(value: number): number
+        return value * 2
+    end
+end
+check("namespace call", MathTools.Double(7), 14)
+
+class Creature
+    Name = "None"
+    constructor(name: string)
+        self.Name = name
+    end
+    function Describe()
+        return self.Name
+    end
+end
+
+class Zombie extends Creature
+    Health = 100
+    constructor(name: string)
+        super(name)
+        self.Health = 75
+    end
+    override function Describe()
+        return super:Describe()
+    end
+    function Damage(amount: number)
+        self.Health -= amount
+    end
+end
+
+local zombie = new Zombie("Runner")
+check("constructor/super", zombie:Describe(), "Runner")
+check("class initial health", zombie.Health, 75)
+zombie:Damage(25)
+check("class method", zombie.Health, 50)
+check("class is parent", zombie is Creature, true)
+
+-- Computed getters/setters, lazy properties, and watchers.
+local watchCount = 0
+class Observed
+    Health = 20
+    lazy Inventory = {"Potion", "Bandage"}
+    get IsAlive()
+        return self.Health > 0
+    end
+    set NewHealth(value)
+        self.Health = value
+    end
+    watch Health(oldValue, newValue)
+        watchCount += 1
+    end
+end
+
+local observed = new Observed
+check("getter", observed.IsAlive, true)
+check("lazy field", observed.Inventory[1], "Potion")
+observed.NewHealth = 15
+check("setter", observed.Health, 15)
+check("watcher", watchCount, 1)
+-- Visibility, static fields, constructors, and metamethod operators.
+class Score
+    public Value = 0
+    private Secret = 5
+    protected Bonus = 2
+    static Default = 10
+    constructor(value: number)
+        self.Value = value
+    end
+    function Total()
+        return self.Value + self.Secret + self.Bonus
+    end
+    operator +(other: any)
+        return new Score(self.Value + other.Value)
+    end
+end
+local scoreA = new Score(3)
+local scoreB = new Score(4)
+check("static member", Score.Default, 10)
+check("private/protected internal", scoreA:Total(), 10)
+check("operator +", (scoreA + scoreB).Value, 7)
+
+-- Destructuring, spread, slices, optional chaining, nil coalescing.
+local record = {Health = 33, Speed = 12}
+local {Health, Speed: WalkSpeed} = record
+check("destructure field", Health, 33)
+check("destructure alias", WalkSpeed, 12)
+
+local list1 = {1, 2}
+local list2 = {3, 4}
+local combined = {...list1, ...list2}
+check("spread", #combined, 4)
+
+local text = "LauaCompiler"
+check("string slice", text[1:4], "Laua")
+
+local absent: any = nil
+check("optional property", absent?.Health, nil)
+check("optional index", absent?.["Health"], nil)
+local emptyCallback: any = nil
+check("optional callback", emptyCallback?.(10), nil)
+local methodObject: any = {Value = 9}
+function methodObject:GetValue()
+    return self.Value
+end
+check("optional method", methodObject?.:GetValue(), 9)
+check("coalesce", absent ?? 42, 42)
+local setOnce: any = nil
+setOnce ??= 12
+check("coalesce assignment", setOnce, 12)
+local falseDestination: any = false
+falseDestination ??= true
+check("coalesce assignment preserves false", falseDestination, false)
+local keepFalse: any = false
+check("coalesce preserves false", keepFalse ?? true, false)
+
+local function guard(value: any): any
+    local present = value?
+    return present * 2
+end
+check("postfix guard with value", guard(8), 16)
+check("postfix guard with nil", guard(nil), nil)
+
+-- Default arguments, inline functions, memoization, arrow functions, pipes.
+local function Heal(amount = 10)
+    return amount
+end
+check("default argument", Heal(nil), 10)
+
+local inline function AddOne(value: number): number
+    return value + 1
+end
+check("inline function", AddOne(9), 10)
+
+memo local function Square(value: number)
+    return value * value
+end
+
+check("memo function", Square(6), 36)
+
+local triple = (n: number) => n * 3
+check("arrow function", triple(4), 12)
+local piped = 5 |> MathTools.Double |> tostring
+check("pipeline", piped, "10")
+
+local doubled = table.map({1, 2, 3}, function(n: number)
+    return n * 2
+end)
+check("table.map", doubled[3], 6)
+local filtered = table.filter({1, 2, 3, 4}, function(n: number)
+    return n % 2 == 0
+end)
+check("table.filter", #filtered, 2)
+local reduced = table.reduce({1, 2, 3}, function(acc: number, n: number)
+    return acc + n
+end, 0)
+check("table.reduce", reduced, 6)
+local located = table.findWhere({1, 2, 3}, function(n: number)
+    return n == 2
+end)
+check("table.findWhere", located, 2)
+
+-- Match statements, named table patterns, guarded cases.
+local stateName = "unknown"
+match Mode.Running
+    case Mode.Idle
+        stateName = "idle"
+    case Mode.Running
+        stateName = "running"
+    default
+        stateName = "other"
+end
+check("match enum", stateName, "running")
+
+local matched = false
+match {Health = 0, Stats = {Level = 3}}
+    case {Health = 0}
+        matched = true
+    default
+        matched = false
+end
+check("match table pattern", matched, true)
+
+-- Cleanup at function exit (including using and defer).
+local disposed = false
+local deferred = false
+local function CleanupTest()
+    using resource = {Dispose = function(self)
+        disposed = true
+    end}
+    defer
+        deferred = true
+    end
+end
+CleanupTest()
+check("using cleanup", disposed, true)
+check("defer cleanup", deferred, true)
+
+-- ===========================================================================
+-- v3.58 FEATURES AND ADDITIONAL LONG-STANDING FEATURES
+-- ===========================================================================
+
+-- Interfaces require matching fields, method parameters, and declared returns.
+interface IHealthUnit
+    Health: number
+    function ReceiveDamage(amount: number): number
+end
+
+-- Constructor parameter properties, shared class-scoped locals, static methods,
+-- class-table assignments, readonly and explicit type annotations.
+class GuardedUnit implements IHealthUnit
+    local defaultShield = 4
+    readonly UnitId: number
+    public Health: number = 100
+    GuardedUnit.SharedStats = {Created = 0}
+
+    constructor(id: number, public Tag: string)
+        self.UnitId = id
+        GuardedUnit.SharedStats.Created += 1
+    end
+
+    static function StartingShield(): number
+        return defaultShield
+    end
+
+    function ReceiveDamage(amount: number): number
+        guard amount > 0 else
+            return self.Health
+        end
+        unless self.Health <= 0 then
+            self.Health -= amount
+        end
+        return self.Health
+    end
+end
+
+local guarded = new GuardedUnit(31, "alpha")
+check("interface/constructor", guarded.Health, 100)
+check("readonly first assignment", guarded.UnitId, 31)
+check("constructor parameter property", guarded.Tag, "alpha")
+check("static method and class local", GuardedUnit.StartingShield(), 4)
+check("class-table assignment", GuardedUnit.SharedStats.Created, 1)
+check("guard early exit", guarded:ReceiveDamage(0), 100)
+check("unless on positive health", guarded:ReceiveDamage(15), 85)
+check("class is current class", guarded is GuardedUnit, true)
+
+-- Unknown dynamic values exercise the runtime readonly guard without bypassing
+-- the compile-time readonly checker. This should error at runtime.
+local function AttemptDynamicChange(value: any)
+    value.UnitId = 99
+end
+local readonlySucceeded = pcall(function()
+    AttemptDynamicChange(guarded)
+end)
+check("readonly runtime enforcement", readonlySucceeded, false)
+
+-- Try/catch/finally: errors are caught and cleanup always runs.
+local caughtError = false
+local finallyCount = 0
+try
+    error("intentional stress-test failure")
+catch err
+    caughtError = string.find(tostring(err), "intentional stress-test") ~= nil
+finally
+    finallyCount += 1
+end
+check("try catch", caughtError, true)
+check("finally on error", finallyCount, 1)
+
+local successFinally = false
+try
+    local testValue = 42
+    check("try success", testValue, 42)
+finally
+    successFinally = true
+end
+check("finally on success", successFinally, true)
+
+-- Normal const declarations and static class-table fields.
+const MAX_LEVEL = 50
+check("const read", MAX_LEVEL, 50)
+
+-- Runtime schemas are separate from compile-time interfaces.
+schema PayloadSchema
+    Name: string
+    Level: number
+    Active: boolean?
+end
+local schemaPassed, schemaError = PayloadSchema.Validate({Name = "test", Level = 10})
+check("schema valid", schemaPassed, true)
+local schemaFailed = PayloadSchema.Validate({Name = 5, Level = "invalid"})
+check("schema invalid", schemaFailed, false)
+local checkedPayload = PayloadSchema.Assert({Name = "good", Level = 2})
+check("schema Assert", checkedPayload.Level, 2)
+
+-- CancelScope and its cleanup callback.
+local cancelCount = 0
+local cancel = cancelScope()
+cancel:OnCancel(function()
+    cancelCount += 1
+end)
+cancel:Cancel()
+cancel:Cancel()
+check("cancellation idempotent", cancelCount, 1)
+
+-- Abstract and final classes/methods; only instantiate concrete subclasses.
+abstract class NumberProcessor
+    abstract function Process(value: number): number
+    end
+end
+class DoublingProcessor extends NumberProcessor
+    override function Process(value: number): number
+        return value * 2
+    end
+end
+local processor = new DoublingProcessor()
+check("abstract override", processor:Process(8), 16)
+final class FixedClass
+    public Count: number = 5
+    final function GetCount(): number
+        return self.Count
+    end
+end
+check("final class", (new FixedClass()).Count, 5)
+
+-- Class-local type aliases and protected or private fields.
+class TypedHolder
+    type HolderRecord = {Value: number}
+    private Internal: number = 7
+    protected Extra: number = 3
+    function Total(): number
+        return self.Internal + self.Extra
+    end
+end
+check("class type and visibility", (new TypedHolder()):Total(), 10)
+
+-- memo.clear invalidates the memo cache; the value remains the same.
+local cachedCalls = 0
+memo local function MemoAnswer(value: number)
+    cachedCalls += 1
+    return value * value
+end
+check("memo first call", MemoAnswer(4), 16)
+check("memo cache hit", MemoAnswer(4), 16)
+check("memo called once", cachedCalls, 1)
+memo.clear(MemoAnswer)
+check("memo cleared", MemoAnswer(4), 16)
+check("memo recomputed", cachedCalls, 2)
+
+-- Exhaustive enum match: all variants are handled.
+enum MatchState
+    Ready
+    Busy
+end
+local currentMatch: MatchState = MatchState.Ready
+local exhaustiveText = "none"
+match exhaustive currentMatch
+    case MatchState.Ready
+        exhaustiveText = "ready"
+    case MatchState.Busy
+        exhaustiveText = "busy"
+end
+check("exhaustive match", exhaustiveText, "ready")
+
+-- Native Luau generic types, compound assignment, table iteration and typed fields.
+type TypedPair<T> = {First: T, Second: T}
+local typedPair: TypedPair<number> = {First = 3, Second = 8}
+check("Luau generic type alias", typedPair.First + typedPair.Second, 11)
+
+-- String contents, comments and nested callback code should be preserved.
+local keywordString = "class try catch finally unless guard readonly interface"
+check("keywords in string literal", string.find(keywordString, "readonly") ~= nil, true)
+-- interface Absent; readonly Never; try catch; these words are COMMENTS.
+
+
+-- Async/await. Results are checked after the scheduled callback completes.
+local async function GetAnswer()
+    return 21
+end
+local async function DoAsyncTest()
+    local answer = await GetAnswer()
+    return answer * 2
+end
+DoAsyncTest():andThen(function(value: number)
+    check("async/await", value, 42)
+    report.AsyncFinished = true
+    print("LAUA FINAL:", report.Passed, "passed;", report.Failed, "failed; async finished:", report.AsyncFinished)
+end):catch(function(err: any)
+    report.Failed += 1
+    report.AsyncFinished = true
+    warn("FAIL async/await:", err)
+end)
+
+--#if DEBUG
+print("Compiled with Debug mode")
+--#else
+print("Compiled with Development or Release mode")
+--#end
+
+print("LAUA SYNC RESULTS:", report.Passed, "passed;", report.Failed, "failed")
+return report`;
 
     const PREVIOUS_MAIN_STARTER = "import Zombie from \"./Zombie\"\nimport Player from \"./Player\"\n\nlocal zombie = new Zombie\nlocal player = new Player\nprint(zombie.Health, player.Name)";
 
@@ -835,7 +1258,7 @@ print(player.IsAlive)  -- true`;
             /^operator\s+/.test(maskedLine) ||
             /^watch\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(maskedLine) ||
             /^constructor\s*\(/.test(maskedLine) ||
-            /^(get|set)\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(maskedLine) ||
+            /^(?:(?:public|private|protected)\s+)?(?:get|set)\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(maskedLine) ||
             /^defer\s*$/.test(maskedLine) ||
             /^async\s+function\b/.test(maskedLine) ||
             /^local\s+async\s+function\b/.test(maskedLine) ||
@@ -3997,13 +4420,282 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.57";
+    // Laua v3.58: compile-time interfaces/readonly and structured control flow.
+    // This pass never adds runtime type annotations or external dependencies.
+    function lowerV358Features(source) {
+      if (!/\b(?:interface|implements|readonly|guard|unless|try|catch|finally)\b/.test(maskNonCode(source))) return source;
+      const lines = splitLinesWithOffsets(source);
+      const masked = maskNonCode(source);
+      const rows = lines.map((line, i) => ({raw:line.text, code:masked.slice(line.start,line.end).trim(), indent:line.text.match(/^[ \t]*/)[0], offset:line.start, i}));
+      const fail = (message, row) => { throw locatedLauaError(new Error(message), source, row.offset + row.indent.length, Math.max(1, row.code.split(/\s/)[0].length)); };
+      const interfaces = new Map(), classes = new Map(), removed = new Set(), replacements = new Map(), readonlyFields = new Map();
+      const readonlyDefaults = new Map(), readonlyBackingNames = new Set();
+      const matchAt = (start) => {
+        let depth = 0;
+        for (let i = start; i < rows.length; i++) {
+          const c = rows[i].code;
+          if (v358OpensBlock(c)) depth++;
+          if (/^end\b/.test(c) || /^until\b/.test(c)) {
+            if (--depth === 0) return i;
+          }
+        }
+        fail('Expected end for declaration', rows[start]);
+      };
+      // Parse and erase interfaces; they are compile-time contracts only.
+      for (let i=0; i<rows.length; i++) {
+        const r=rows[i], match=/^interface\s+([A-Za-z_]\w*)$/.exec(r.code);
+        if (!match) continue;
+        if (interfaces.has(match[1])) fail(`Duplicate interface '${match[1]}'`,r);
+        const end=rows.findIndex((line,j)=>j>i && line.code==='end'), fields=new Map(), methods=new Map();
+        if(end<0)fail(`Unclosed interface '${match[1]}'`,r);
+        for (let j=i+1; j<end; j++) {
+          const line=rows[j]; if (!line.code) continue;
+          const method=/^function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?::\s*(.+))?$/.exec(line.raw.trim());
+          const field=/^([A-Za-z_]\w*)\s*:\s*(.+)$/.exec(line.raw.trim());
+          if (method) {
+            if (methods.has(method[1]) || fields.has(method[1])) fail(`Duplicate interface member '${method[1]}'`,line);
+            methods.set(method[1],{params:method[2].trim(),ret:(method[3]||'').trim()});
+            // Interface methods are signatures; they must not have bodies.
+          } else if (field && !/^function\b/.test(line.code)) {
+            if (fields.has(field[1]) || methods.has(field[1])) fail(`Duplicate interface member '${field[1]}'`,line);
+            fields.set(field[1],field[2].trim());
+          } else fail(`Invalid interface member: ${line.raw.trim()}`,line);
+        }
+        interfaces.set(match[1],{fields,methods});
+        for(let j=i;j<=end;j++)removed.add(j);
+        i=end;
+      }
+      // Collect class members at their declaration level, ignoring method bodies.
+      for (let i=0; i<rows.length; i++) {
+        if (removed.has(i)) continue;
+        const r=rows[i];
+        const head=/^(?:export\s+)?(?:(?:abstract|final)\s+)?class\s+([A-Za-z_]\w*)(?:\s+extends\s+([A-Za-z_][\w.]*))?(?:\s+implements\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*))?$/.exec(r.code);
+        if (!head) continue;
+        const end=matchAt(i), fields=new Map(), methods=new Map(), ownReadonly=new Map();
+        classes.set(head[1],{name:head[1],base:head[2]||null,interfaces:head[3]?.split(',').map(x=>x.trim())||[],fields,methods,readonly:ownReadonly,start:i,end});
+        if (head[3]) replacements.set(i,r.raw.replace(/\s+implements\s+[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s*$/, ''));
+        for (let j=i+1;j<end;j++) {
+          if (removed.has(j) || !rows[j].code) continue;
+          const line=rows[j];
+          const clean=line.raw.trim().replace(/^(?:(?:public|private|protected|static|override|final|abstract)\s+)*/,'');
+          const readonly=/^(?:(?:public|private|protected)\s+)?readonly\s+([A-Za-z_]\w*)\s*(?::\s*([^=]+?))?\s*(?:=\s*(.+))?$/.exec(line.raw.trim());
+          if (readonly) {
+            if (!readonly[2] && !readonly[3]) fail(`readonly field '${readonly[1]}' needs a type or initializer`,line);
+            if (ownReadonly.has(readonly[1])) fail(`Duplicate readonly field '${readonly[1]}'`,line);
+            ownReadonly.set(readonly[1],{initializer:!!readonly[3],writes:0,owner:head[1]});
+            fields.set(readonly[1],{type:(readonly[2]||'').trim()});
+            // A getter/setter pair keeps the key OFF the instance table, so
+            // __newindex always traps aliases and writes after initialization.
+            // Weak-key storage avoids retaining destroyed instances.
+            const stateName = `__lauaReadonly_${head[1]}_${readonly[1]}`;
+            if (readonlyBackingNames.has(stateName)) fail(`Conflicting readonly storage '${readonly[1]}'`,line);
+            readonlyBackingNames.add(stateName);
+            const visibility = /^(public|private|protected)\s+/.exec(line.raw.trim())?.[1];
+            const modifier = visibility ? visibility+' ' : '';
+            replacements.set(j, [
+              line.indent+`local ${stateName} = setmetatable({}, {__mode = "k"})`,
+              line.indent+`local ${stateName}_nil = {}`,
+              line.indent+`${modifier}get ${readonly[1]}()`,
+              line.indent+`    local result = ${stateName}[self]`,
+              line.indent+`    if result == ${stateName}_nil then return nil end`,
+              line.indent+`    return result`,
+              line.indent+`end`,
+              line.indent+`${modifier}set ${readonly[1]}(value)`,
+              line.indent+`    if ${stateName}[self] ~= nil then error("Cannot assign to readonly property: ${readonly[1]}", 2) end`,
+              line.indent+`    ${stateName}[self] = value == nil and ${stateName}_nil or value`,
+              line.indent+`end`
+            ].join('\n'));
+            if(readonly[3]) {
+              const list = readonlyDefaults.get(head[1]) || [];
+              list.push(`self.${readonly[1]} = ${readonly[3].trim()}`);
+              readonlyDefaults.set(head[1],list);
+            }
+            continue;
+          }
+          if (/\breadonly\b/.test(line.code) && /^.*\breadonly\b/.test(line.code) && !/^--/.test(line.code) && /\breadonly\b/.test(clean)) fail('readonly is only valid on class fields',line);
+          const field=/^(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)\s*(?::\s*([^=]+?))?\s*=\s*(.+)$/.exec(clean) || /^([A-Za-z_]\w*)\s*:\s*(.+)$/.exec(clean);
+          if (field && !/^local\b/.test(clean) && !/\bstatic\s+/.test(line.raw)) fields.set(field[1],{type:(field[2]||'').trim()});
+          const method=/^(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?::\s*(.+))?$/.exec(clean);
+          if (method) {
+            if(!/\bstatic\s+/.test(line.raw))methods.set(method[1],{params:method[2].trim(),ret:(method[3]||'').trim()});
+            j=matchAt(j);continue;
+          }
+          if (/^constructor\s*\(/.test(clean)) {
+            const props=/^constructor\s*\((.*)\)/.exec(clean);
+            if(props)for(const p of props[1].split(',')) {
+              const m=/^(?:public|private|protected)\s+([A-Za-z_]\w*)\s*:\s*(.+)$/.exec(p.trim());
+              if(m)fields.set(m[1],{type:m[2].trim()});
+            }
+            j=matchAt(j);continue;
+          }
+          if (/^(?:get|set|watch|operator)\b/.test(clean)) {j=matchAt(j);continue;}
+        }
+        i=end;
+      }
+      const getMember=(cls,name,kind,seen=new Set())=>{
+        if(!cls||seen.has(cls))return null;seen.add(cls);
+        const info=classes.get(cls);if(!info)return null;
+        return info[kind].get(name)||getMember(info.base,name,kind,seen);
+      };
+      for (const cls of classes.values()) for(const name of cls.interfaces) {
+        const spec=interfaces.get(name);if(!spec)fail(`Unknown interface '${name}'`,rows[cls.start]);
+        for(const [field,required] of spec.fields) {
+          const actual=getMember(cls.name,field,'fields');
+          if(!actual)fail(`Class '${cls.name}' does not implement interface '${name}': missing field '${field}'`,rows[cls.start]);
+          if(required.replace(/\s/g,'') !== actual.type.replace(/\s/g,''))fail(`Interface '${name}' field '${field}' requires type '${required}', found '${actual.type}'`,rows[cls.start]);
+        }
+        for(const [method,signature] of spec.methods) {
+          const actual=getMember(cls.name,method,'methods');
+          if(!actual)fail(`Class '${cls.name}' does not implement interface '${name}': missing method '${method}'`,rows[cls.start]);
+          const split=s=>s? s.split(',').map(x=>x.trim()).filter(Boolean):[];
+          if(split(actual.params).length!==split(signature.params).length)fail(`Interface '${name}' method '${method}' has incompatible parameter count`,rows[cls.start]);
+          for(let j=0;j<split(signature.params).length;j++) {
+            const expected=split(signature.params)[j].split(':').slice(1).join(':').trim();
+            const found=split(actual.params)[j].split(':').slice(1).join(':').trim();
+            if(expected && expected.replace(/\s/g,'')!==found.replace(/\s/g,''))fail(`Interface '${name}' method '${method}' has incompatible parameter types`,rows[cls.start]);
+          }
+          if(signature.ret && signature.ret.replace(/\s/g,'')!==actual.ret.replace(/\s/g,''))fail(`Interface '${name}' method '${method}' has incompatible return type`,rows[cls.start]);
+        }
+      }
+      // Readonly: enforce known direct writes (including known `new` instance bindings).
+      // Resolve known instance bindings in source order, including aliases.
+      // Never use a future declaration to type-check an earlier assignment.
+      const bindings=new Map();
+      const classForRow=i=>[...classes.values()].find(x=>i>x.start && i<x.end);
+      const resolveInstance=expression=>{
+        const value=expression.trim();
+        const constructed=/^new\s+([A-Za-z_]\w*)\b/.exec(value);
+        if(constructed)return classes.has(constructed[1])?constructed[1]:null;
+        const alias=/^([A-Za-z_]\w*)$/.exec(value);
+        return alias?bindings.get(alias[1])||null:null;
+      };
+      for(let i=0;i<rows.length;i++) {
+        if(removed.has(i))continue;
+        const row=rows[i],c=row.code;
+        const declared=/^local\s+([A-Za-z_]\w*)(?:\s*:\s*[A-Za-z_]\w*\??)?\s*=\s*(.+)$/.exec(c);
+        if(declared){
+          const instance=resolveInstance(declared[2]);
+          if(instance)bindings.set(declared[1],instance);
+          else bindings.delete(declared[1]);
+        }else{
+          const reassigned=/^([A-Za-z_]\w*)\s*=\s*(.+)$/.exec(c);
+          if(reassigned && bindings.has(reassigned[1])){
+            const instance=resolveInstance(reassigned[2]);
+            if(instance)bindings.set(reassigned[1],instance);
+            else bindings.delete(reassigned[1]);
+          }
+        }
+        const assignment=/(?:^|[; \t])([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*(\.\.=|\/\/=|\?\?=|[+\-*\/%^]?=)(?!=)/.exec(c);
+        if(!assignment)continue;
+        const target=assignment[1],prop=assignment[2];
+        const cls=target==='self'?classForRow(i)?.name:(classes.has(target)?target:bindings.get(target));
+        if(!cls)continue;
+        const field=getMember(cls,prop,'readonly');if(!field)continue;
+        if(target!=='self') fail(`Cannot reassign readonly field '${prop}'`,row);
+        const info=classForRow(i);
+        if(!info)fail(`Cannot reassign readonly field '${prop}'`,row);
+        const ctorIndex=rows.findIndex((r,j)=>j>info.start&&j<info.end&&/^constructor\s*\(/.test(r.code));
+        const inConstructor=ctorIndex>=0 && i>ctorIndex && i<matchAt(ctorIndex);
+        if(!inConstructor || field.owner!==info.name || field.initializer || assignment[3]!=='=') fail(`Readonly field '${prop}' can only be initialized once in the constructor`,row);
+        if(++field.writes>1)fail(`Readonly field '${prop}' initialized more than once`,row);
+      }
+      for(const info of classes.values())for(const [key,field] of info.readonly)if(!field.initializer && field.writes!==1)fail(`Readonly field '${key}' must be initialized in the constructor`,rows[info.start]);
+      // readonly defaults must initialize during construction, not lazily on read.
+      // Insert them after an explicit super(...) call (if present), otherwise at
+      // the beginning of the constructor. A synthetic constructor preserves
+      // ordinary implicit parent-argument forwarding.
+      const readonlyInsertions = new Map();
+      for (const cls of classes.values()) {
+        const defaults = readonlyDefaults.get(cls.name);
+        if (!defaults?.length) continue;
+        let ctor = -1;
+        for (let k=cls.start+1; k<cls.end; k++) {
+          if (/^constructor\s*\(/.test(rows[k].code)) {ctor=k;break;}
+        }
+        const indent = rows[cls.start].indent+'    ';
+        if (ctor<0) {
+          readonlyInsertions.set(cls.end, `${indent}constructor(...)\n${defaults.map(x=>indent+'    '+x).join('\n')}\n${indent}end`);
+        } else {
+          let at = ctor+1;
+          while (at<cls.end && !rows[at].code) at++;
+          if (/^super\s*\(/.test(rows[at]?.code||'')) at++;
+          readonlyInsertions.set(at,(readonlyInsertions.get(at)||'') + defaults.map(x=>rows[ctor].indent+'    '+x).join('\n'));
+        }
+      }
+      // Rewrite structured flow from source-level block tracking, not regex over generated Luau.
+      const stack=[], output=[];let serial=0;
+      for(let i=0;i<rows.length;i++) {
+        const row=rows[i],c=row.code,indent=row.indent;
+        if (readonlyInsertions.has(i)) output.push(readonlyInsertions.get(i));
+        if(removed.has(i)) continue;
+        if(/^readonly\b/.test(c) && !classForRow(i))fail("readonly must declare a class field",row);
+        if(/^guard\b/.test(c) && !/^guard\s+.+\s+else(?:\s+.+)?$/.test(c))fail("guard requires a condition and else",row);
+        if(/^unless\b/.test(c) && !/^unless\s+.+\s+then$/.test(c))fail("unless requires a condition and then",row);
+        const text=replacements.get(i)??row.raw;
+        const guard=/^guard\s+(.+?)\s+else(?:\s+(.+))?$/.exec(c);
+        if(guard) {
+          if(!guard[1])fail('guard requires a condition',row);
+          output.push(indent+`if not (${row.raw.trim().slice(6).replace(/\s+else(?:\s+.*)?$/,'').trim()}) then`+(guard[2]?` ${guard[2]} end`:''));
+          if(!guard[2])stack.push({kind:'guard'});
+          continue;
+        }
+        const unless=/^unless\s+(.+?)\s+then$/.exec(c);
+        if(unless) { output.push(indent+`if not (${row.raw.trim().slice(7,-5).trim()}) then`);stack.push({kind:'unless'});continue; }
+        if(c==='try') {
+          const id=`__lauaTry358_${++serial}`;
+          output.push(indent+`do\n${indent}    local ${id}_ok\n${indent}    local ${id}_err\n${indent}    ${id}_ok, ${id}_err = pcall(function()`);
+          stack.push({kind:'try',id,indent,phase:'try',hadCatch:false,hadFinally:false,enter:i});continue;
+        }
+        const top=stack.at(-1);
+        const catchMatch=/^catch(?:\s+([A-Za-z_]\w*))?$/.exec(c);
+        if(catchMatch) {
+          if(!top||top.kind!=='try'||top.phase!=='try')fail('catch must follow try',row);
+          top.phase='catch';top.hadCatch=true;
+          output.push(`${indent}    end)\n${indent}    local ${top.id}_catch_ok = true\n${indent}    local ${top.id}_catch_err\n${indent}    if not ${top.id}_ok then\n${indent}        local ${catchMatch[1]||'err'} = ${top.id}_err\n${indent}        ${top.id}_catch_ok, ${top.id}_catch_err = pcall(function()`);
+          continue;
+        }
+        if(c==='finally') {
+          if(!top||top.kind!=='try'||top.hadFinally)fail('finally must follow try or catch',row);
+          top.hadFinally=true;
+          if(top.phase==='try')output.push(`${indent}    end)\n${indent}    local ${top.id}_finally_ok\n${indent}    local ${top.id}_finally_err\n${indent}    ${top.id}_finally_ok, ${top.id}_finally_err = pcall(function()`);
+          else output.push(`${indent}        end)\n${indent}    end\n${indent}    local ${top.id}_finally_ok\n${indent}    local ${top.id}_finally_err\n${indent}    ${top.id}_finally_ok, ${top.id}_finally_err = pcall(function()`);
+          top.phase='finally';continue;
+        }
+        if(/^end\b/.test(c) && top) {
+          stack.pop();
+          if(top.kind==='try') {
+            if(top.phase==='try')output.push(`${indent}    end)\n${indent}    if not ${top.id}_ok then error(${top.id}_err, 0) end\n${indent}end`);
+            else if(top.phase==='catch')output.push(`${indent}        end)\n${indent}    end\n${indent}    if not ${top.id}_catch_ok then error(${top.id}_catch_err, 0) end\n${indent}end`);
+            else output.push(`${indent}    end)\n${indent}    if not ${top.id}_finally_ok then error(${top.id}_finally_err, 0) end\n${indent}${top.hadCatch?`    if not ${top.id}_catch_ok then error(${top.id}_catch_err, 0) end\n${indent}`:`    if not ${top.id}_ok then error(${top.id}_err, 0) end\n${indent}`}end`);
+            continue;
+          }
+          output.push(text);continue;
+        }
+        if(stack.some(x=>x.kind==='try') && /\b(?:return|break|continue)\b/.test(c)) fail('return, break and continue inside try/catch/finally are unsupported; move control flow after the protected block',row);
+        output.push(text);
+        if(v358OpensBlock(c))stack.push({kind:'ordinary'});
+      }
+      const unclosed=stack.find(x=>['try','guard','unless'].includes(x.kind));
+      if(unclosed)fail(`Missing end for ${unclosed.kind} block`,rows.at(-1));
+      return output.join('\n').replace(/^(?:[ \t]*\r?\n)+/, '');
+    }
+    function v358OpensBlock(c) {
+      if (/^(?:interface|try|unless|guard)\b/.test(c))return true;
+      if (/^(?:export\s+)?(?:(?:abstract|final)\s+)?class\b|^constructor\s*\(|^(?:public|private|protected|static|override|abstract|final|async|\s)*\s*(?:async\s+)?function\b|^local\s+(?:async\s+)?function\b|^function\b|^(?:get|set|watch|operator|schema|namespace|enum|match)\b|^do\s*$|^repeat\s*$/.test(c))return true;
+      if (/^if\b.*\bthen\b/.test(c))return !/\bend\s*[);]?\s*$/.test(c);
+      if (/^(?:for|while)\b.*\bdo\s*$/.test(c))return true;
+      if (/\bfunction\s*\(/.test(c))return !/\bend\s*[);]?\s*$/.test(c);
+      return false;
+    }
+
+    const LAUA_VERSION = "3.58";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
       const mode = typeof options === 'object' && options !== null ? (options.Mode || 'Development') : 'Development';
       if (!['Development','Release','Debug'].includes(mode)) throw new Error('Invalid Laua compile mode');
       if (source.includes('--#')) source = preprocessMode(source, mode);
+      source = lowerV358Features(source);
       validateExpressionSyntax(source);
       if (source.includes('enum')) validateEnumLocations(source);
       if (source.includes('namespace')) validateNamespacePlacement(source);
@@ -4014,7 +4706,7 @@ end`;
       }
       const semanticSource=maskExportedClassDeclarations(contractPresent?maskLauaContractBlocks(source):source);
       let getterRewrites=[];
-      if (options?.SemanticCheck !== false) {validateLauaReservedBindings(source);validateClassContracts(semanticSource);validateScopedReferences(semanticSource);getterRewrites=validateLauaSemantics(semanticSource)||[];validateTypedSemantics(semanticSource);}
+      if (options?.SemanticCheck !== false) {validateLauaReservedBindings(originalLauaSource);validateClassContracts(semanticSource);validateScopedReferences(semanticSource);getterRewrites=validateLauaSemantics(semanticSource)||[];validateTypedSemantics(semanticSource);}
       for(const edit of getterRewrites.reverse())source=replaceRange(source,edit.start,edit.end,edit.replacement);
       const style=options?.OutputStyle || 'Readable';
       if (!['Readable','Compact','One Line'].includes(style))throw new Error('Invalid Laua output style');
@@ -6117,7 +6809,24 @@ end`;
     }
 
     function getLauaSymbols(source) {
-      return enrichLocalSymbols(source, buildLauaSymbolIndex(source));
+      // Keep one offset-preserving v3.58 view for *all* editor consumers.
+      // The project marker path supplies this index to updateLauaDiagnostics;
+      // indexing raw `class X implements Y` used to omit the class entirely,
+      // causing false "constructor outside class" and UnknownVariable markers.
+      // Use the same normalized source as the legacy diagnostic scanners,
+      // without changing the actual Laua code sent to the transpiler.
+      const needsV358View = /\b(?:interface|implements|readonly|guard|unless|try|catch|finally)\b/.test(maskNonCode(source));
+      const indexedSource = needsV358View ? editorLintV358Source(source) : source;
+      const symbols = enrichLocalSymbols(indexedSource, buildLauaSymbolIndex(indexedSource));
+      // Preserve readonly declarations from the ORIGINAL source. The legacy
+      // index intentionally masks their keyword, which previously meant
+      // editor linting lost their mutability information altogether.
+      const masked = maskNonCode(source);
+      for (const match of masked.matchAll(/^[ \t]*(?:(?:public|private|protected)\s+)?readonly\s+([A-Za-z_]\w*)\s*(?::|=)/gm)) {
+        const cls = findClassAtOffset(symbols, match.index + match[0].lastIndexOf(match[1]));
+        if (cls) (cls.readonlyMembers ||= {})[match[1]] = true;
+      }
+      return symbols;
     }
 
     function makeRangeFromOffsets(model, start, end) {
@@ -6217,7 +6926,8 @@ end`;
       "class", "extends", "constructor", "private", "public", "protected",
       "static", "new", "namespace", "super", "abstract", "override", "enum",
       "final", "get", "set", "defer", "using", "async", "await",
-      "match", "case", "default", "import", "from", "operator", "lazy", "watch", "export", "as"
+      "match", "case", "default", "import", "from", "operator", "lazy", "watch", "export", "as",
+      "interface", "implements", "readonly", "guard", "unless", "try", "catch", "finally"
     ];
 
     function lintEditDistance(a, b) {
@@ -8300,7 +9010,7 @@ end`;
         .map(match => ({text: match[0], start: match.index, end: match.index + match[0].length, word: /^[A-Za-z_]\w*$/.test(match[0])}));
       const skipped = new Set();
       const keywords = new Set([...LUAU_KEYWORDS, ...LAUA_KEYWORDS, 'typeof', 'export', 'continue']);
-      const globals = new Set([...LUAU_GLOBALS, 'require', 'warn', 'tick', 'time', 'elapsedTime', 'gcinfo', 'settings', 'UserSettings', 'plugin', 'delay', 'spawn', 'wait', 'collectgarbage', 'debug', 'vector', 'typeof', 'utf8', 'bit32', 'buffer', 'printidentity', '_ENV']);
+      const globals = new Set([...LUAU_GLOBALS, ...LAUA_GLOBAL_FUNCTIONS, 'require', 'warn', 'tick', 'time', 'elapsedTime', 'gcinfo', 'settings', 'UserSettings', 'plugin', 'delay', 'spawn', 'wait', 'collectgarbage', 'debug', 'vector', 'typeof', 'utf8', 'bit32', 'buffer', 'printidentity', '_ENV']);
       for (const name of Object.keys(symbols.classes)) globals.add(name);
       for (const name of Object.keys(symbols.enums)) globals.add(name);
       for (const name of Object.keys(symbols.namespaces)) globals.add(name);
@@ -8598,6 +9308,103 @@ end`;
       return result;
     }
 
+    // Offset-preserving view for the legacy editor lint scanners. The actual
+    // transpiler validates v3.58 syntax directly; this view prevents the older
+    // Luau-only block scanner from marking legitimate keywords as mistakes.
+    function editorLintV358Source(source) {
+      const masked=maskNonCode(source),rows=splitLinesWithOffsets(source),chars=source.split('');
+      const setLine=(row,text)=>{
+        const size=row.end-row.start;
+        const value=text.slice(0,size).padEnd(size,' ');
+        for(let k=0;k<size;k++)chars[row.start+k]=value[k];
+      };
+      const blank=(row)=>setLine(row,'');
+      const blocked=new Set();
+      for(let i=0;i<rows.length;i++) {
+        const row=rows[i],code=masked.slice(row.start,row.end).trim();
+        if(/^interface\s+[A-Za-z_]\w*$/.test(code)){
+          const close=rows.findIndex((r,j)=>j>i&&masked.slice(r.start,r.end).trim()==='end');
+          if(close>=0){for(let j=i;j<=close;j++){blank(rows[j]);blocked.add(j);}i=close;}
+        }
+      }
+      for(let i=0;i<rows.length;i++){
+        if(blocked.has(i))continue;
+        const row=rows[i],raw=source.slice(row.start,row.end),code=masked.slice(row.start,row.end).trim(),indent=raw.match(/^[ \t]*/)[0];
+        if(/^(?:export\s+)?(?:(?:abstract|final)\s+)?class\s+/.test(code) && /\s+implements\s+/.test(code)){
+          const begin=raw.search(/\s+implements\s+/);
+          if(begin>=0)setLine(row,raw.slice(0,begin));
+        } else if(/^((?:public|private|protected)\s+)?readonly\s+/.test(code)){
+          setLine(row,raw.replace(/\breadonly\s+/,m=>' '.repeat(m.length)));
+        } else if(/^guard\s+.+\s+else\s+\S/.test(code)){
+          setLine(row,indent+'do end');
+        } else if(/^guard\s+.+\s+else$/.test(code)||/^unless\s+.+\s+then$/.test(code)){
+          setLine(row,indent+'if true then');
+        } else if(code==='try')setLine(row,indent+'do');
+        else if(/^catch\s+([A-Za-z_]\w*)$/.test(code))setLine(row,indent+'local '+/^catch\s+([A-Za-z_]\w*)$/.exec(code)[1]);
+        else if(code==='catch'||code==='finally')blank(row);
+      }
+      return chars.join('');
+    }
+
+    // Report readonly writes independently from full transpilation. The first
+    // compiler error should not suppress other readonly diagnostics in Monaco.
+    // Follow known local instance aliases; never guess the type of a dynamic
+    // value, as that would cause incorrect readonly warnings.
+    function lintReadonlyAssignments(source, masked, symbols, pushMarker, existing = []) {
+      if (!/\breadonly\b/.test(masked) && !Object.values(symbols.classes).some(c => c.readonlyMembers && Object.keys(c.readonlyMembers).length)) return;
+      const bindings = new Map();
+      const readonlyOwner = (name, property) => {
+        const visited = new Set();
+        while (name && !visited.has(name)) {
+          visited.add(name);
+          const cls = symbols.classes[name];
+          if (!cls) return null;
+          if (cls.readonlyMembers?.[property]) return name;
+          name = cls.base;
+        }
+        return null;
+      };
+      const resolve = expression => {
+        const value = expression.trim();
+        const created = /^new\s+([A-Za-z_]\w*)\b/.exec(value);
+        if (created) return symbols.classes[created[1]] ? created[1] : null;
+        const alias = /^([A-Za-z_]\w*)$/.exec(value);
+        return alias ? bindings.get(alias[1]) || null : null;
+      };
+      for (const row of splitLinesWithOffsets(source)) {
+        const code = masked.slice(row.start, row.end);
+        const trimmed = code.trim();
+        const declared = /^local\s+([A-Za-z_]\w*)(?:\s*:\s*([A-Za-z_]\w*\??))?\s*=\s*(.+)$/.exec(trimmed);
+        if (declared) {
+          const cls = resolve(declared[3]) || (symbols.classes[declared[2]] ? declared[2] : null);
+          if (cls) bindings.set(declared[1], cls);
+          else bindings.delete(declared[1]);
+        } else {
+          const reassigned = /^([A-Za-z_]\w*)\s*=\s*(.+)$/.exec(trimmed);
+          if (reassigned && bindings.has(reassigned[1])) {
+            const cls = resolve(reassigned[2]);
+            if (cls) bindings.set(reassigned[1], cls);
+            else bindings.delete(reassigned[1]);
+          }
+        }
+        const writes = /(?:^|[; \t])([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*(\.\.=|\/\/=|\?\?=|[+\-*\/%^]?=)(?!=)/g;
+        let write;
+        while ((write = writes.exec(code)) !== null) {
+          const target = write[1], member = write[2];
+          // A constructor may assign its own readonly field exactly once.
+          // The transpiler checks initializer counts and method scope.
+          if (target === 'self') continue;
+          const cls = bindings.get(target);
+          if (!cls || !readonlyOwner(cls, member)) continue;
+          const at = row.start + write.index + write[0].lastIndexOf(member);
+          const line = source.slice(0, at).split('\n').length;
+          if (existing.some(item => item.startLineNumber === line && /readonly/i.test(item.message))) continue;
+          pushMarker(at, at + member.length, monaco.MarkerSeverity.Error,
+            `Cannot reassign readonly property '${member}' of '${cls}'.`, 'lint', 'ReadonlyAssignment');
+        }
+      }
+    }
+
     function updateLauaDiagnostics(model, projectSymbols = null) {
       if (model.getLanguageId() !== "laua") return;
 
@@ -8605,7 +9412,7 @@ end`;
       // The older editor hints do not parse v3.41 declaration bodies. Give
       // them an offset-preserving `local Name` instead of bogus block ends.
       // The actual transpiler still validates the full unmodified source.
-      const lintSource = editorLintContractSource(source);
+      const lintSource = editorLintContractSource(editorLintV358Source(source));
       const masked = maskNonCode(lintSource);
       const symbols = projectSymbols || getLauaSymbols(lintSource);
       const markers = [];
@@ -8795,6 +9602,7 @@ end`;
           pushMarker(at,at+matched[1].length,monaco.MarkerSeverity.Warning,`Global function '${matched[1]}': use 'local function' or define the global intentionally. Forward calls may fail strict analysis.`,'lint','ImplicitGlobal');
         }
       }
+      lintReadonlyAssignments(source, maskNonCode(source), symbols, pushMarker, markers);
       lintSpecialSyntax(source, masked, pushMarker);
       lintLuauStatementSyntax(source, masked, pushMarker);
       lintBalancedDelimiters(masked, pushMarker);
@@ -10634,6 +11442,7 @@ end`;
         tabSize: 4,
         insertSpaces: true,
         autoIndent: "full",
+        formatOnPaste: false, // Laua supplies a single predictable paste-formatting pass.
         quickSuggestions: { other: true, comments: false, strings: false },
         suggestOnTriggerCharacters: true,
         snippetSuggestions: "none",
@@ -10734,7 +11543,11 @@ end`;
         if (/\b(?:async\s+)?function\s*(?:[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)?\s*)?\([^()]*\)\s*(?::\s*[A-Za-z_][\w?.{}<>| ]*)?$/.test(header) ||
             /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*constructor\s*\([^()]*\)\s*(?::\s*[^\n]+)?$/.test(header) ||
             /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*(?:get|set|watch)\s+[A-Za-z_]\w*\s*\([^()]*\)\s*(?::\s*[^\n]+)?$/.test(header)) closing = "end";
-        else if (/^(?:export\s+)?(?:(?:abstract|final)\s+)?(?:class|namespace|enum|schema)\b\s+[A-Za-z_]\w*(?:\s+extends\s+[A-Za-z_]\w*)?\s*$/.test(header)) closing = "end";
+        else if (/^(?:export\s+)?(?:(?:abstract|final)\s+)?(?:class|namespace|enum|schema)\b\s+[A-Za-z_]\w*(?:\s+extends\s+[A-Za-z_]\w*)?\s*$/.test(header) ||
+                 /^interface\s+[A-Za-z_]\w*\s*$/.test(header) ||
+                 /^try\s*$/.test(header) ||
+                 /^guard\s+.+\s+else\s*$/.test(header) ||
+                 /^unless\s+.+\s+then\s*$/.test(header)) closing = "end";
         else if (/^match\b.+$/.test(header) || /^if\b.+\bthen\s*$/.test(header) ||
                  /^for\b.+\bdo\s*$/.test(header) || /^while\b.+\bdo\s*$/.test(header) ||
                  /^do\s*$/.test(header)) closing = "end";
@@ -10782,6 +11595,18 @@ end`;
         }
         return false;
       }
+      // Interface methods are signatures, not function blocks. Inserting an
+      // automatic `end` after one would close the interface prematurely.
+      function lauaInsideInterfaceSignature(model, lineNumber) {
+        const lines = maskNonCode(model.getValue()).split(/\r?\n/);
+        let inInterface = false;
+        for (let index = 0; index < lineNumber - 1; index++) {
+          const line = (lines[index] || "").trim();
+          if (/^interface\s+[A-Za-z_]\w*\s*$/.test(line)) inInterface = true;
+          else if (inInterface && /^end\s*$/.test(line)) inInterface = false;
+        }
+        return inInterface;
+      }
       function tryAutoCloseLauaBlock() {
         const selection = lauaEditor.getSelection();
         const model = lauaEditor.getModel();
@@ -10793,6 +11618,8 @@ end`;
         const following = position.lineNumber < model.getLineCount() ? model.getLineContent(position.lineNumber + 1) : "";
         const closing = lauaBlockClosingPlan(before, after, following);
         if (!closing) return false;
+        if (/^function\s+[A-Za-z_]\w*\s*\(/.test(before.trim()) &&
+            lauaInsideInterfaceSignature(model, position.lineNumber)) return false;
         // A closing `end` further down may belong to the enclosing class,
         // namespace, if, or function. Only avoid insertion for this block's
         // own ending, including a callback's existing `end)`.
@@ -10822,6 +11649,9 @@ end`;
         const visible = maskNonCode(rows.join("\n")).split("\n");
         let blockLevel = 0;
         let caseOpen = false;
+        // Keep block kinds so an interface method *signature* does not start
+        // a function body (there is no matching `end` for that signature).
+        const blockKinds = [];
         const delimiters = [];
         const result = [];
         const extraIndent = () => delimiters.reduce((count, entry) => count + (entry.indent ? 1 : 0), 0);
@@ -10839,11 +11669,12 @@ end`;
             continue;
           }
           const closingBlock = /^(?:end\b|until\b)/.test(meaningful);
-          const branch = /^(?:else\b|elseif\b)/.test(meaningful);
+          const branch = /^(?:else\b|elseif\b|catch(?:\s+[A-Za-z_]\w*)?\s*$|finally\s*$)/.test(meaningful);
           const caseBranch = /^(?:case\b|default\b)/.test(meaningful);
           if (closingBlock) {
             if (caseOpen) { blockLevel--; caseOpen = false; }
             blockLevel--;
+            blockKinds.pop();
           }
           if (caseBranch && caseOpen) { blockLevel--; caseOpen = false; }
           // Reduce continuation indentation for } and ] at line start.
@@ -10857,19 +11688,31 @@ end`;
           const currentLevel = blockLevel + extraIndent() - (branch ? 1 : 0);
           const desiredWidth = Math.max(0, baseWidth + tabWidth * currentLevel);
           if (i === 0 && partialFirstLine) result.push(raw);
-          else result.push(" ".repeat(desiredWidth) + trimmed);
+          else result.push(" ".repeat(desiredWidth) + raw.replace(/^[ \t]*/, ""));
 
           // Track language blocks, including callbacks such as pcall(function().
-          const opensBlock = /^(?:export\s+)?(?:(?:abstract|final)\s+)?(?:class|namespace|enum|schema)\b/.test(meaningful) ||
+          const isInterface = /^interface\s+[A-Za-z_]\w*\s*$/.test(meaningful);
+          const interfaceSignature = blockKinds[blockKinds.length - 1] === "interface" &&
+            /^function\s+[A-Za-z_]\w*\s*\(/.test(meaningful);
+          const isGuardBlock = /^guard\s+.+\s+else\s*$/.test(meaningful);
+          const opensBlock = !interfaceSignature && (
+            isInterface ||
+            /^(?:export\s+)?(?:(?:abstract|final)\s+)?(?:class|namespace|enum|schema)\b/.test(meaningful) ||
             /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*(?:constructor\s*\(|(?:watch|operator|get|set)\s+)/.test(meaningful) ||
             /^(?:local\s+)?(?:async\s+)?function\b/.test(meaningful) ||
             /\bfunction\s*\([^)]*\)/.test(meaningful) ||
             /^if\b.*\bthen\s*$/.test(meaningful) ||
             /^(?:for|while)\b.*\bdo\s*$/.test(meaningful) ||
-            /^(?:repeat|do|defer)\s*$/.test(meaningful) ||
-            /^match\b.*$/.test(meaningful);
+            /^(?:repeat|do|defer|try)\s*$/.test(meaningful) ||
+            /^unless\s+.+\s+then\s*$/.test(meaningful) ||
+            isGuardBlock ||
+            /^match\b.*$/.test(meaningful)
+          );
           if (caseBranch) { blockLevel++; caseOpen = true; }
-          else if (opensBlock && !/\bend\s*(?:\)|;)?\s*$/.test(meaningful)) blockLevel++;
+          else if (opensBlock && !/\bend\s*(?:\)|;)?\s*$/.test(meaningful)) {
+            blockLevel++;
+            blockKinds.push(isInterface ? "interface" : "block");
+          }
 
           // Continuation groups: nested table literals and multi-line calls.
           // A callback's call parenthesis is not an *extra* indentation level
@@ -10892,40 +11735,122 @@ end`;
         return result.join(eol);
       }
 
-      function lauaIndentPasteInEditor(event) {
-        const model = lauaEditor.getModel();
-        if (!model || !["laua", "lua"].includes(model.getLanguageId()) || !event?.range) return;
-        const range = event.range;
-        if (range.endLineNumber <= range.startLineNumber) return;
-        const pasted = model.getValueInRange(range);
-        if (!pasted.includes("\n")) return;
-        const options = model.getOptions();
-        const width = options.tabSize || 4;
-        let base = 0;
-        if (range.startColumn > 1) {
-          const current = model.getLineContent(range.startLineNumber);
-          const prefix = /^\s*/.exec(current)?.[0] || "";
-          base = [...prefix].reduce((n, ch) => n + (ch === "\t" ? width : 1), 0);
-        } else {
-          for (let line = range.startLineNumber - 1; line >= 1; line--) {
-            const preceding = model.getLineContent(line);
-            if (!preceding.trim() || preceding.trim().startsWith("--")) continue;
-            const prefix = /^\s*/.exec(preceding)?.[0] || "";
-            base = [...prefix].reduce((n, ch) => n + (ch === "\t" ? width : 1), 0);
-            const code = maskNonCode(preceding).trim();
-            if (/^(?:export\s+)?(?:class|namespace|enum|schema)\b/.test(code) ||
-                /^(?:constructor|function|if|for|while|do|repeat|match)\b/.test(code) ||
-                /\bfunction\s*\([^)]*\)\s*$/.test(code) || /[\{\[(]\s*$/.test(code)) base += width;
-            break;
-          }
+      // Each format operation changes only leading whitespace. Using separate
+      // line edits prevents Monaco from replacing the entire source and losing
+      // the caret or collapsing unrelated undo history.
+      function lauaIndentEditsForRange(model, selection) {
+        if (!model || !["laua", "lua"].includes(model.getLanguageId())) return [];
+        const original = model.getValue();
+        const width = model.getOptions().tabSize || 4;
+        const formatted = lauaIndentPastedText(original, 0, width);
+        if (original === formatted) return [];
+        const before = original.split(/\r?\n/);
+        const after = formatted.split(/\r?\n/);
+        if (before.length !== after.length) return []; // Never change line count.
+        const first = Math.max(1, selection?.startLineNumber || 1);
+        let last = Math.min(before.length, selection?.endLineNumber || before.length);
+        if (selection && selection.endColumn === 1 && last > first) last--;
+        const edits = [];
+        for (let row = first - 1; row < last; row++) {
+          if (before[row] === after[row]) continue;
+          const previous = /^(?:[ \t]*)/.exec(before[row])[0];
+          const desired = /^(?:[ \t]*)/.exec(after[row])[0];
+          // Don't change comment contents, multiline literals, or any code
+          // token; only change the leading whitespace on affected lines.
+          if (before[row].slice(previous.length).trimEnd() !== after[row].slice(desired.length).trimEnd()) continue;
+          edits.push({range: new monaco.Range(row + 1, 1, row + 1, previous.length + 1), text: desired});
         }
-        const formatted = lauaIndentPastedText(pasted, base, width, range.startColumn > 1);
-        if (formatted === pasted) return;
-        lauaEditor.executeEdits("laua-paste-indent", [{range, text: formatted, forceMoveMarkers: true}]);
+        return edits;
       }
-      // Monaco fires this for keyboard, context-menu and mobile paste.
-      if (typeof lauaEditor.onDidPaste === "function") lauaEditor.onDidPaste(lauaIndentPasteInEditor);
 
+      for (const language of ["laua", "lua"]) {
+        monaco.languages.registerDocumentFormattingEditProvider(language, {
+          provideDocumentFormattingEdits(model) { return lauaIndentEditsForRange(model); }
+        });
+        monaco.languages.registerDocumentRangeFormattingEditProvider(language, {
+          provideDocumentRangeFormattingEdits(model, range) { return lauaIndentEditsForRange(model, range); }
+        });
+      }
+
+      let lauaApplyingPasteIndent = false;
+      let lauaPasteFormatTimer = null;
+      let lauaPasteTargetModel = null;
+      let lauaPasteArmed = false;
+      let lauaPasteArmTimer = null;
+      const lauaPasteSurface = lauaEditor.getDomNode();
+      // One debounced post-paste pass. iPadOS Safari and desktop Monaco can
+      // dispatch paste, onDidPaste, and change events in different orders.
+      // Formatting after Monaco commits avoids the race in the old microtask.
+      function lauaSchedulePasteIndent(model) {
+        if (!model || lauaApplyingPasteIndent) return;
+        lauaPasteTargetModel = model;
+        if (lauaPasteFormatTimer !== null) clearTimeout(lauaPasteFormatTimer);
+        lauaPasteFormatTimer = setTimeout(() => {
+          lauaPasteFormatTimer = null;
+          if (lauaEditor.getModel() !== lauaPasteTargetModel) return;
+          const edits = lauaIndentEditsForRange(model);
+          if (!edits.length) return;
+          lauaApplyingPasteIndent = true;
+          try {
+            lauaEditor.pushUndoStop();
+            lauaEditor.executeEdits("laua-auto-indent-paste", edits);
+            lauaEditor.pushUndoStop();
+          } finally { lauaApplyingPasteIndent = false; }
+          status.textContent = "Pasted code auto-indented.";
+          status.className = "ok";
+        }, 120);
+      }
+      function lauaArmPaste() {
+        lauaPasteArmed = true;
+        if (lauaPasteArmTimer !== null) clearTimeout(lauaPasteArmTimer);
+        lauaPasteArmTimer = setTimeout(() => { lauaPasteArmed = false; }, 1200);
+        lauaSchedulePasteIndent(lauaEditor.getModel());
+      }
+      // Capture paste on the editor node AND document. iPad's edit-menu paste
+      // can bypass Monaco's onDidPaste but still emit a composed DOM event.
+      lauaPasteSurface?.addEventListener("paste", lauaArmPaste, true);
+      document.addEventListener("paste", event => {
+        if (lauaPasteSurface?.contains(event.target) ||
+            event.composedPath?.().includes(lauaPasteSurface) ||
+            lauaEditor.hasTextFocus() || lauaEditor.hasWidgetFocus?.()) {
+          lauaArmPaste();
+        }
+      }, true);
+      if (typeof lauaEditor.onDidPaste === "function") {
+        lauaEditor.onDidPaste(() => lauaSchedulePasteIndent(lauaEditor.getModel()));
+      }
+      lauaEditor.onDidChangeModelContent(event => {
+        if (lauaApplyingPasteIndent || event.isFlush || event.isUndoing || event.isRedoing) return;
+        const model = lauaEditor.getModel();
+        if (!model) return;
+        // A mobile clipboard can insert without dispatching *any* paste event.
+        // Large multiline insertions into a focused editor are still formatted;
+        // short two-newline auto-end insertions are not mistaken for pastes.
+        const pasted = event.changes.some(change => change.text.includes("\n") &&
+          (lauaPasteArmed || (change.text.length >= 80 &&
+            (change.text.match(/\n/g) || []).length >= 2 &&
+            (lauaEditor.hasTextFocus() || lauaEditor.hasWidgetFocus?.()))));
+        if (pasted) lauaSchedulePasteIndent(model);
+      });
+
+      // Users can fix existing pasted code, even if Safari blocked the normal
+      // paste events or the project was loaded before this website update.
+      document.getElementById("formatCodeBtn").addEventListener("click", () => {
+        const model = lauaEditor.getModel();
+        if (!model) return;
+        const edits = lauaIndentEditsForRange(model);
+        if (!edits.length) {
+          status.textContent = "Code indentation is already formatted.";
+          status.className = "ok";
+          return;
+        }
+        lauaEditor.pushUndoStop();
+        lauaEditor.executeEdits("laua-format-document", edits);
+        lauaEditor.pushUndoStop();
+        status.textContent = "Formatted code indentation (undo available).";
+        status.className = "ok";
+      });
+      // Shift+Alt+F is Monaco's standard Format Document shortcut.
       const luauEditor = monaco.editor.create(document.getElementById("luauEditor"), {
         value: "",
         language: "lua",
@@ -11433,7 +12358,7 @@ end`;
             status.textContent = "Default main.laua loaded, but transpilation failed: " + detail;
             status.className = "error";
           } else {
-            status.textContent = "Default main.laua loaded." + (backupSaved ? " Previous main.laua backed up; use Undo Default main.laua to restore it." : " Other files unchanged.");
+            status.textContent = "Feature test main.laua loaded and transpiled." + (backupSaved ? " Previous main.laua backed up; use Undo Default main.laua to restore it." : " Other files unchanged.");
             status.className = "ok";
           }
         } catch (error) {
