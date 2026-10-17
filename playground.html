@@ -861,6 +861,28 @@ print(player.IsAlive)  -- true`;
       throw new Error("Expected 'end'");
     }
 
+    // Index instance fields initialized in constructors without changing the
+    // generated Luau or silently introducing type annotations.
+    function findConstructorAssignments(source, masked, classStart, classEnd) {
+      const result = [];
+      const classCode = masked.slice(classStart, classEnd);
+      for (const ctor of classCode.matchAll(/^[ \t]*constructor\s*\([^\n)]*\)/gm)) {
+        const start = classStart + ctor.index + ctor[0].indexOf('constructor');
+        let closing;
+        try { closing = findMatchingEndByLines(source, start); }
+        catch { continue; }
+        if (closing.start > classEnd) continue;
+        // Match only complete assignment statements, not comparisons, member
+        // chains, compound writes, text in strings, or comments.
+        const code = masked.slice(start, closing.start);
+        for (const match of code.matchAll(/^[ \t]*self\s*\.\s*([A-Za-z_]\w*)[ \t]*=(?!=)/gm)) {
+          result.push({name:match[1], offset:start + match.index + match[0].indexOf(match[1])});
+        }
+        break;
+      }
+      return result;
+    }
+
     function transpileNew(source) {
       const masked = maskNonCode(source);
       const pieces = [];
@@ -3200,6 +3222,11 @@ print(player.IsAlive)  -- true`;
           if(/^(?:if|for|while|do|repeat|match)\b/.test(code))depth++;
         }
       }
+      for (const info of classes.values()) {
+        for (const assignment of findConstructorAssignments(source, masked, info.start, info.end)) {
+          if (!info.fields.has(assignment.name)) info.fields.set(assignment.name, unknown);
+        }
+      }
       for(const [name,info] of classes)for(const [field,t] of info.fields)if(typeof t==='string'&&classes.has(t))info.fields.set(field,`class:${t}`);
       const memberType=(owner,key)=>{
         if(typeof owner==='string'&&owner.startsWith('class:')){
@@ -3474,6 +3501,15 @@ print(player.IsAlive)  -- true`;
         if(ns){try{const end=findMatchingEndByLines(source,line.start).end;const members=new Map();for(const row of masked.slice(line.end+1,end).split('\n')){const m=/^\s*(?:export\s+)?(?:function\s+|(?:local|const)\s+)?(\w+)\s*(?:\(|=)/.exec(row);if(m){const fn=/^\s*(?:export\s+)?function\s+(\w+)\s*\(([^)]*)\)/.exec(row);members.set(m[1],fn?{kind:'function',params:signature(fn[2])}:{kind:'value'});}}namespaces.set(ns[1],members);}catch{}}
         const fn=/^(?:local\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)/.exec(clean);
         if(fn && !source.slice(0,line.start).match(/\bclass\b[^]*$/)) { /* Function lookup added in second pass. */ }
+      }
+      // An assignment inside the class constructor creates an instance field,
+      // even if the source used the ordinary `self.field = value` syntax.
+      // Only the constructor is considered: arbitrary method writes should
+      // not turn misspelled reads into valid members.
+      for (const info of classes.values()) {
+        for (const assignment of findConstructorAssignments(source, masked, info.start, info.end)) {
+          if (!info.instance.has(assignment.name)) info.instance.set(assignment.name, {kind:'field',params:null});
+        }
       }
       // Top-level and local function signatures, excluding members contained in classes.
       for(const m of masked.matchAll(/\b(?:local\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)(?:\s*<[^>\n]+>)?\s*\(([^\n)]*)\)/g)){
@@ -4126,6 +4162,19 @@ end`;
           li++;
         }
 
+        // Constructor assignments are visible on instances in autocomplete.
+        // Keep these separate from fields with explicit type declarations, so
+        // strict mode can warn rather than pretending a type was supplied.
+        const constructorMask = maskNonCode(body);
+        for (const assignment of findConstructorAssignments(body, constructorMask, 0, body.length)) {
+          if (!Object.prototype.hasOwnProperty.call(instanceMembers, assignment.name)) {
+            instanceMembers[assignment.name] = {
+              kind: 'field', visibility: 'public', inferredFromConstructor: true,
+              declarationOffset: assignment.offset,
+              detail: 'Laua constructor-initialized field (type not declared)'
+            };
+          }
+        }
         return { instanceMembers, staticMembers };
       }
 
@@ -6836,76 +6885,84 @@ end`;
     }
 
     function lintClassMembers(source, symbols, pushMarker) {
+      // Only direct class-body declarations are class members. A method's
+      // local table, SetAsync payload, callback, or nested table key is not.
       for (const classInfo of Object.values(symbols.classes)) {
         const headerEnd = source.indexOf("\n", classInfo.start);
-        if (headerEnd === -1) continue;
-
-        const endLineStart = source.lastIndexOf("\n", classInfo.end);
-        const bodyEnd = endLineStart > headerEnd
-          ? endLineStart
-          : classInfo.end;
-
-        const body = source.slice(headerEnd + 1, bodyEnd);
+        if (headerEnd < 0) continue;
+        const closingStart = source.lastIndexOf("\n", classInfo.end);
+        const bodyEnd = closingStart > headerEnd ? closingStart : classInfo.end;
+        const bodyStart = headerEnd + 1;
+        const body = source.slice(bodyStart, bodyEnd);
+        const rows = splitLinesWithOffsets(body);
+        const masked = maskNonCode(body);
         const seenMembers = new Set();
         let constructorCount = 0;
-        let offset = headerEnd + 1;
+        let delimiterDepth = 0;
 
-        for (const line of body.split("\n")) {
+        for (let li = 0; li < rows.length; li++) {
+          const row = rows[li];
+          const raw = row.text;
+          const line = masked.slice(row.start, row.end);
           const trimmed = line.trim();
+          if (!trimmed) continue;
 
-          if (!trimmed || trimmed.startsWith("--")) {
-            offset += line.length + 1;
-            continue;
-          }
-
-          const constructorMatch = trimmed.match(/^constructor\s*\(/);
-
-          if (constructorMatch) {
-            constructorCount += 1;
-
-            if (constructorCount > 1) {
-              const start = offset + Math.max(0, line.indexOf("constructor"));
-
-              pushMarker(
-                start,
-                start + "constructor".length,
-                monaco.MarkerSeverity.Error,
-                `Class '${classInfo.name}' has more than one constructor.`
-              );
+          // A table literal can span lines. Its keys must never be indexed as
+          // class members, even when they resemble field declarations.
+          if (delimiterDepth > 0) {
+            for (const symbol of line.match(/[({\[)\]}]/g) || []) {
+              delimiterDepth += "({[".includes(symbol) ? 1 : -1;
             }
-
-            offset += line.length + 1;
+            delimiterDepth = Math.max(0, delimiterDepth);
             continue;
           }
 
-          let remaining = trimmed;
-
-          while (true) {
-            const modifier = remaining.match(/^(public|private|protected|static|override|abstract|final)\s+/);
-            if (!modifier) break;
-            remaining = remaining.slice(modifier[0].length);
+          const stripped = trimmed.replace(/^(?:(?:public|private|protected|static|override|abstract|final)\s+)*/, "");
+          const ctor = /^constructor\s*\(/.test(stripped);
+          const method = /^(?:async\s+function|function|get|set|watch|operator)\s+/.test(stripped);
+          if (ctor || method) {
+            if (ctor && ++constructorCount > 1) {
+              const start = bodyStart + row.start + Math.max(0, raw.indexOf("constructor"));
+              pushMarker(start, start + 11, monaco.MarkerSeverity.Error,
+                `Class '${classInfo.name}' has more than one constructor.`);
+            }
+            const keyword = ctor ? "constructor" : /^(?:async\s+function|function|get|set|watch|operator)/.exec(stripped)?.[0];
+            if (keyword) {
+              const at = row.start + raw.indexOf(keyword);
+              try {
+                const end = findMatchingEndByLines(body, at);
+                // Resume on the first full line after this method, even if
+                // it contains deeply nested callbacks and table literals.
+                while (li + 1 < rows.length && rows[li + 1].start <= end.end) li++;
+              } catch {
+                // Incomplete methods are being edited: never infer class
+                // members from their contents while the method is open.
+                const headerIndent = /^\s*/.exec(raw)?.[0].length || 0;
+                while (li + 1 < rows.length) {
+                  const next = rows[li + 1].text;
+                  if (next.trim() && !next.trim().startsWith("--") &&
+                      (/^\s*/.exec(next)?.[0].length || 0) <= headerIndent) break;
+                  li++;
+                }
+              }
+            }
+            continue;
           }
 
-          const functionMatch = remaining.match(/^(?:function|get|set)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
-          const fieldMatch = remaining.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*[^=\n]+)?\s*=|^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^=\n]+$/);
-          const name = functionMatch?.[1] || fieldMatch?.[1] || fieldMatch?.[2];
-
+          const field = stripped.match(/^([A-Za-z_]\w*)(?:\s*:\s*[^=\n]+)?\s*=|^([A-Za-z_]\w*)\s*:\s*[^=\n]+$/);
+          const name = field?.[1] || field?.[2];
           if (name) {
-            if (seenMembers.has(name) && !/^(get|set)\b/.test(remaining)) {
-              const start = offset + Math.max(0, line.indexOf(name));
-
-              pushMarker(
-                start,
-                start + name.length,
-                monaco.MarkerSeverity.Warning,
-                `Duplicate class member '${name}'.`
-              );
+            if (seenMembers.has(name)) {
+              const start = bodyStart + row.start + Math.max(0, raw.indexOf(name));
+              pushMarker(start, start + name.length, monaco.MarkerSeverity.Warning,
+                `Duplicate class member '${name}'.`);
             }
-
             seenMembers.add(name);
           }
-
-          offset += line.length + 1;
+          for (const symbol of line.match(/[({\[)\]}]/g) || []) {
+            delimiterDepth += "({[".includes(symbol) ? 1 : -1;
+          }
+          delimiterDepth = Math.max(0, delimiterDepth);
         }
       }
     }
@@ -8582,6 +8639,17 @@ end`;
         }
       }
       if(directives.mode==='strict'){
+        for (const classInfo of Object.values(symbols.classes)) {
+          for (const [name, member] of Object.entries(classInfo.instanceMembers || {})) {
+            if (!member.inferredFromConstructor) continue;
+            // A declared field (including a typed constructor parameter
+            // property) takes priority over constructor inference.
+            const at = source.indexOf('\n', classInfo.start) + 1 + member.declarationOffset;
+            pushMarker(at, at + name.length, monaco.MarkerSeverity.Error,
+              `Strict class field '${classInfo.name}.${name}' needs an explicit typed declaration (for example, public ${name}: number).`,
+              'type', 'StrictFieldDeclaration');
+          }
+        }
         // Static hint only: not a full Luau type checker. Catch the numeric-arrow
         // pattern that otherwise generates an avoidable Studio Script Analysis warning.
         for(const matched of masked.matchAll(/\((\s*[A-Za-z_]\w*\s*)\)\s*=>\s*([^\n]+)/g)){
@@ -10447,6 +10515,7 @@ end`;
         automaticLayout: true,
         tabSize: 4,
         insertSpaces: true,
+        autoIndent: "full",
         quickSuggestions: { other: true, comments: false, strings: false },
         suggestOnTriggerCharacters: true,
         snippetSuggestions: "none",
@@ -10625,6 +10694,119 @@ end`;
         if (event.keyCode !== monaco.KeyCode.Enter || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
         if (tryAutoCloseLauaBlock()) { event.preventDefault(); event.stopPropagation(); }
       });
+
+      // Paste-aware indentation for both Laua and editable Luau project files.
+      // Scope is ONLY the inserted text. Never reformat the entire document on paste.
+      function lauaIndentPastedText(text, baseWidth, tabWidth = 4, partialFirstLine = false) {
+        if (!text.includes("\n")) return text;
+        const eol = text.includes("\r\n") ? "\r\n" : "\n";
+        const rows = text.replace(/\r\n/g, "\n").split("\n");
+        const visible = maskNonCode(rows.join("\n")).split("\n");
+        let blockLevel = 0;
+        let caseOpen = false;
+        const delimiters = [];
+        const result = [];
+        const extraIndent = () => delimiters.reduce((count, entry) => count + (entry.indent ? 1 : 0), 0);
+        const indentWidth = prefix => [...prefix].reduce((n, ch) => n + (ch === "\t" ? tabWidth : 1), 0);
+
+        for (let i = 0; i < rows.length; i++) {
+          const raw = rows[i];
+          const code = visible[i] || "";
+          const meaningful = code.trim();
+          const trimmed = raw.trim();
+          if (!trimmed) { result.push(""); continue; }
+          // Never alter the interior of a multi-line literal or comment.
+          if (!meaningful && !trimmed.startsWith("--")) {
+            result.push(raw);
+            continue;
+          }
+          const closingBlock = /^(?:end\b|until\b)/.test(meaningful);
+          const branch = /^(?:else\b|elseif\b)/.test(meaningful);
+          const caseBranch = /^(?:case\b|default\b)/.test(meaningful);
+          if (closingBlock) {
+            if (caseOpen) { blockLevel--; caseOpen = false; }
+            blockLevel--;
+          }
+          if (caseBranch && caseOpen) { blockLevel--; caseOpen = false; }
+          // Reduce continuation indentation for } and ] at line start.
+          let leading = meaningful.match(/^[\s\}\]\)]+/)?.[0] || "";
+          for (const ch of leading) {
+            if (/^[\}\]\)]$/.test(ch)) {
+              const close = ch === "}" ? "{" : ch === "]" ? "[" : "(";
+              if (delimiters[delimiters.length - 1]?.ch === close) delimiters.pop();
+            }
+          }
+          const currentLevel = blockLevel + extraIndent() - (branch ? 1 : 0);
+          const desiredWidth = Math.max(0, baseWidth + tabWidth * currentLevel);
+          if (i === 0 && partialFirstLine) result.push(raw);
+          else result.push(" ".repeat(desiredWidth) + trimmed);
+
+          // Track language blocks, including callbacks such as pcall(function().
+          const opensBlock = /^(?:export\s+)?(?:(?:abstract|final)\s+)?(?:class|namespace|enum|schema)\b/.test(meaningful) ||
+            /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*(?:constructor\s*\(|(?:watch|operator|get|set)\s+)/.test(meaningful) ||
+            /^(?:local\s+)?(?:async\s+)?function\b/.test(meaningful) ||
+            /\bfunction\s*\([^)]*\)/.test(meaningful) ||
+            /^if\b.*\bthen\s*$/.test(meaningful) ||
+            /^(?:for|while)\b.*\bdo\s*$/.test(meaningful) ||
+            /^(?:repeat|do|defer)\s*$/.test(meaningful) ||
+            /^match\b.*$/.test(meaningful);
+          if (caseBranch) { blockLevel++; caseOpen = true; }
+          else if (opensBlock && !/\bend\s*(?:\)|;)?\s*$/.test(meaningful)) blockLevel++;
+
+          // Continuation groups: nested table literals and multi-line calls.
+          // A callback's call parenthesis is not an *extra* indentation level
+          // on top of the callback's function block.
+          const inlineCallback = /\bfunction\s*\([^)]*\)/.test(meaningful);
+          let openedOnLine = false;
+          let firstCode = leading.length;
+          for (let pos = firstCode; pos < code.length; pos++) {
+            const ch = code[pos];
+            if (ch === "(" || ch === "[" || ch === "{") {
+              const contributes = !openedOnLine && !(inlineCallback && ch === "(");
+              delimiters.push({ch, indent: contributes});
+              openedOnLine = true;
+            } else if (ch === ")" || ch === "]" || ch === "}") {
+              const expected = ch === ")" ? "(" : ch === "]" ? "[" : "{";
+              if (delimiters[delimiters.length - 1]?.ch === expected) delimiters.pop();
+            }
+          }
+        }
+        return result.join(eol);
+      }
+
+      function lauaIndentPasteInEditor(event) {
+        const model = lauaEditor.getModel();
+        if (!model || !["laua", "lua"].includes(model.getLanguageId()) || !event?.range) return;
+        const range = event.range;
+        if (range.endLineNumber <= range.startLineNumber) return;
+        const pasted = model.getValueInRange(range);
+        if (!pasted.includes("\n")) return;
+        const options = model.getOptions();
+        const width = options.tabSize || 4;
+        let base = 0;
+        if (range.startColumn > 1) {
+          const current = model.getLineContent(range.startLineNumber);
+          const prefix = /^\s*/.exec(current)?.[0] || "";
+          base = [...prefix].reduce((n, ch) => n + (ch === "\t" ? width : 1), 0);
+        } else {
+          for (let line = range.startLineNumber - 1; line >= 1; line--) {
+            const preceding = model.getLineContent(line);
+            if (!preceding.trim() || preceding.trim().startsWith("--")) continue;
+            const prefix = /^\s*/.exec(preceding)?.[0] || "";
+            base = [...prefix].reduce((n, ch) => n + (ch === "\t" ? width : 1), 0);
+            const code = maskNonCode(preceding).trim();
+            if (/^(?:export\s+)?(?:class|namespace|enum|schema)\b/.test(code) ||
+                /^(?:constructor|function|if|for|while|do|repeat|match)\b/.test(code) ||
+                /\bfunction\s*\([^)]*\)\s*$/.test(code) || /[\{\[(]\s*$/.test(code)) base += width;
+            break;
+          }
+        }
+        const formatted = lauaIndentPastedText(pasted, base, width, range.startColumn > 1);
+        if (formatted === pasted) return;
+        lauaEditor.executeEdits("laua-paste-indent", [{range, text: formatted, forceMoveMarkers: true}]);
+      }
+      // Monaco fires this for keyboard, context-menu and mobile paste.
+      if (typeof lauaEditor.onDidPaste === "function") lauaEditor.onDidPaste(lauaIndentPasteInEditor);
 
       const luauEditor = monaco.editor.create(document.getElementById("luauEditor"), {
         value: "",
