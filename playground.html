@@ -1335,6 +1335,16 @@ print(player.IsAlive)  -- true`;
             if (li < 0) break;
             continue;
           }
+          // Explicit class-table assignments are static values, not instance
+          // fields.  Permit `ClassName.member = value` only for this class;
+          // anything else still gets the regular invalid-member diagnostic.
+          const classTableAssignment = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=\s*(.+)$/.exec(text);
+          if (classTableAssignment && classTableAssignment[1] === name) {
+            if (modifiers.size || attrs.length) throw new Error('Class-table assignments cannot have member modifiers or attributes');
+            statics.push({name: classTableAssignment[2], value: classTableAssignment[3], classTableAssignment: true});
+            li++;
+            continue;
+          }
           const fieldMatch = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^\s=][^=]*)?\s*=\s*(.+)$/) || text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^\s=][^=]*$/);
           if (fieldMatch) {
             if (modifiers.has("override") || modifiers.has("abstract") || modifiers.has("final")) throw new Error(`Invalid modifier for field '${fieldMatch[1]}'`);
@@ -2780,6 +2790,87 @@ print(player.IsAlive)  -- true`;
       return chunks.join('').trim().replace(/(?:;\s*)+$/, '');
     }
 
+    // Re-indent the generated Luau, not Laua source. The token mask keeps
+    // keywords inside comments, quoted text and long strings out of scope.
+    // Only the Readable mode uses this pass; Compact/One Line remain unchanged.
+    function formatGeneratedLuau(source) {
+      // A CRLF sequence inside a long string is data, not formatting.
+      if (source.includes('\r')) return source;
+      const rows = source.split('\n');
+      const codeRows = maskNonCode(source).split('\n');
+      const frames = [], delimiters = [];
+      const depth = () => frames.length + delimiters.reduce((n, entry) => n + (entry.indent ? 1 : 0), 0);
+      const trimLeading = value => value.replace(/^[ \t]*/, '');
+      const isIfStatement = (prefix) => /(?:^|;)\s*if\s*$/.test(prefix);
+      const prettyRows = rows.map((raw, index) => {
+        const code = codeRows[index] || '';
+        const line = trimLeading(raw);
+        const syntax = trimLeading(code);
+        if (!line) return '';
+        // Pure masked noncode can be part of a multi-line string/comment.
+        // Do not alter its bytes, particularly whitespace inside long strings.
+        if (!syntax.trim()) return raw;
+        let before = depth();
+        let cursor = syntax;
+        const previewDelimiters = delimiters.slice();
+        let previewBlocks = frames.length;
+        if (/^(?:elseif|else)\b/.test(cursor) && frames.includes('if')) {
+          before = Math.max(0, before - 1);
+        } else {
+          // A line may begin with several closing delimiters, e.g. '})'.
+          while (true) {
+            const closed = /^(end|until)\b|^([)\]}])/.exec(cursor);
+            if (!closed) break;
+            if (closed[1] && previewBlocks) { previewBlocks--; before = Math.max(0, before - 1); }
+            else if (closed[2] && previewDelimiters.length) {
+              const last = previewDelimiters.pop();
+              if (last.indent) before = Math.max(0, before - 1);
+            }
+            cursor = cursor.slice(closed[0].length).trimStart();
+          }
+        }
+        const tokens = /\b(?:function|if|for|while|do|repeat|until|end)\b|[(){}\[\]]/g;
+        let match, skipDo = 0;
+        const containsBlockOpener = /\bfunction\b/.test(syntax) || /^(?:if|for|while|repeat|do)\b/.test(syntax) || /;\s*(?:if|for|while|repeat|do)\b/.test(syntax);
+        const containsBrace = syntax.includes('{');
+        while ((match = tokens.exec(syntax))) {
+          const token = match[0];
+          if (token === 'function') frames.push('function');
+          else if (token === 'if') {
+            if (isIfStatement(syntax.slice(0, match.index) + 'if')) frames.push('if');
+          } else if (token === 'for' || token === 'while') { frames.push(token); skipDo++; }
+          else if (token === 'repeat') frames.push('repeat');
+          else if (token === 'do') { if (skipDo) skipDo--; else frames.push('do'); }
+          else if (token === 'end') { if (frames.length) frames.pop(); }
+          else if (token === 'until') { if (frames.length && frames[frames.length - 1] === 'repeat') frames.pop(); }
+          else if ('({['.includes(token)) {
+            // A callback opener such as pcall(function() must not indent twice.
+            // Table bodies take precedence over surrounding call parentheses.
+            const indent = token === '{' || (token === '(' && !containsBlockOpener && !containsBrace) || (token === '[' && !containsBlockOpener && !containsBrace);
+            delimiters.push({token, indent});
+          } else if (delimiters.length) {
+            const opens = {')':'(', '}':'{', ']':'['};
+            if (delimiters[delimiters.length - 1].token === opens[token]) delimiters.pop();
+          }
+        }
+        return '    '.repeat(Math.min(64, before)) + line;
+      });
+      // Separate top-level generated declarations and methods for readability.
+      // These are empty physical lines only, never inserted within expressions.
+      const result = [];
+      for (let index = 0; index < prettyRows.length; index++) {
+        const line = prettyRows[index];
+        const previous = result[result.length - 1] || '';
+        // Never insert blank lines inside a multiline string or comment.
+        const topLevel = line && (codeRows[index] || '').trim() && !/^\s/.test(line);
+        const sectionAfterEnd = topLevel && /^(?:function\s|return\s)/.test(line) && /^end(?:\)|\s|$)/.test(previous.trim());
+        const sectionAfterClassHeader = topLevel && /^function\s/.test(line) && /\.__index\s*=/.test(previous);
+        if ((sectionAfterEnd || sectionAfterClassHeader) && previous.trim() && !/^--/.test(previous)) result.push('');
+        result.push(line);
+      }
+      return result.join('\n');
+    }
+
     function compactGeneratedOutput(output) {
       if (/\[(?:=*)\[|`/.test(output)) return output;
       return output.split('\n').filter(row=>row.trim()!=='' && (!/^\s*--/.test(row) || /^\s*--[!#]/.test(row))).map(row => row.trimStart()).join('\n');
@@ -3477,6 +3568,25 @@ print(player.IsAlive)  -- true`;
           try{end=findMatchingEndByLines(source,line.start+masked.slice(line.start,line.end).indexOf('class')).end;}catch{continue;}
           const info={base:cls[2]||null,start:line.start,end,instance:new Map(),statics:new Map(),ctor:null};classes.set(cls[1],info);
           const body=source.slice(line.end+1,end), bodyMasked=maskNonCode(body);
+          // Scan only the class body, not nested methods or callbacks: a
+          // ClassName.field write there must not invent a static declaration.
+          const assignmentLines = splitLinesWithOffsets(body);
+          for (let ai = 0; ai < assignmentLines.length; ai++) {
+            const row = assignmentLines[ai];
+            const code = bodyMasked.slice(row.start, row.end).trim();
+            const staticAssignment = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=\s*.+$/.exec(code);
+            if (staticAssignment && staticAssignment[1] === cls[1]) {
+              info.statics.set(staticAssignment[2], {kind:'field', params:null});
+            }
+            const header = /^(?:(?:public|private|protected|static|override|abstract|final)\s+)*(?:constructor\s*\(|(?:async\s+function|function|get|set|watch|operator)\s+[A-Za-z_]\w*\s*\()/.exec(code);
+            if (header) {
+              const headerAt = row.start + bodyMasked.slice(row.start,row.end).indexOf(header[0]);
+              try {
+                const ending = findMatchingEndByLines(body, headerAt);
+                while (ai + 1 < assignmentLines.length && assignmentLines[ai+1].start <= ending.end) ai++;
+              } catch { /* Incomplete members are diagnosed separately. */ }
+            }
+          }
           const field=/^[ \t]*(?:(?:public|private|protected|static|override|final|abstract)\s+)*(?:(async\s+)?function\s+(\w+)\s*\(([^\n)]*)\)|constructor\s*\(([^\n)]*)\)|(?:lazy|get|set)\s+(\w+)\s*(?:\(([^\n)]*)\))?|([A-Za-z_]\w*)\s*(?::\s*[^=\n]+)?\s*=|([A-Za-z_]\w*)\s*:\s*[^=\n]+$)/gm;
           let m;while((m=field.exec(bodyMasked))){
             const lineEnd=bodyMasked.indexOf('\n',m.index), prefix=bodyMasked.slice(m.index,lineEnd===-1?bodyMasked.length:lineEnd);
@@ -3963,7 +4073,7 @@ end`;
       if(!/\[(?:=*)\[/.test(output) && /[})]\d/.test(maskNonCode(output))){
         throw new Error('Generated Luau contains an expression immediately followed by a number without a separator.');
       }
-      const generated = style==='Compact' ? compactGeneratedOutput(output) : style==='One Line' ? oneLineGeneratedOutput(output) : output;
+      const generated = style==='Compact' ? compactGeneratedOutput(output) : style==='One Line' ? oneLineGeneratedOutput(output) : formatGeneratedLuau(output);
       const header = style==='One Line' ? `--[[ Transpiled with laua v${LAUA_VERSION} ]]` : `-- Transpiled with laua v${LAUA_VERSION}`;
       return style==='One Line' ? (generated.startsWith(header + ' ') || generated === header ? generated : `${header} ${generated}`) : (generated.startsWith(header + '\n') || generated === header ? generated : `${header}\n${generated}`);
     }
@@ -4044,7 +4154,7 @@ end`;
         return members;
       }
 
-      function parseClassMembers(body) {
+      function parseClassMembers(body, className) {
         const instanceMembers = {};
         const staticMembers = {};
         const lines = splitLinesWithOffsets(body);
@@ -4100,6 +4210,14 @@ end`;
             }
           }
 
+          const classTableAssignment = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*=\s*(.+)$/.exec(trimmed);
+          if (classTableAssignment && classTableAssignment[1] === className) {
+            staticMembers[classTableAssignment[2]] = {
+              kind: 'field', visibility: 'public', detail: 'Laua class-table field'
+            };
+            li++;
+            continue;
+          }
           const lazyField = trimmed.match(/^lazy\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/);
           if (lazyField) {
             instanceMembers[lazyField[1]] = {kind: "field", visibility: "public", detail: "Laua lazy property"};
@@ -4283,7 +4401,7 @@ end`;
         try {
           const endPos = findMatchingEndByLines(source, idx);
           const body = source.slice(headerEnd + 1, endPos.start);
-          const members = parseClassMembers(body);
+          const members = parseClassMembers(body, match[1]);
           for (const member of [...Object.values(members.instanceMembers), ...Object.values(members.staticMembers)]) {
             if (member.declarationOffset !== undefined) member.declarationOffset += headerEnd + 1;
           }
