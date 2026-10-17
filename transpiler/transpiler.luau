@@ -1,25 +1,18 @@
-local Transpiler = {Version = "3.56"}
+local Transpiler = {Version = "3.57"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
 local LAUA_ASYNC_RUNTIME_SOURCE = [====[
-type LauaPromiseStatus = "Pending" | "Fulfilled" | "Rejected"
-type LauaPackedValues = {n: number, [number]: any}
-type LauaPromiseState = {
-    _status: LauaPromiseStatus,
-    _values: LauaPackedValues?,
-    _waiters: {thread},
-}
 
-local Async: any = {}
-local Promise: {[string]: any} = {}
+local Async = {}
+local Promise = {}
 Promise.__index = Promise
 
-local function isPromise(value: any): boolean
+local function isPromise(value)
     return type(value) == "table" and getmetatable(value) == Promise
 end
 
-local function settle(promise: LauaPromiseState, status: LauaPromiseStatus, values: LauaPackedValues)
+local function settle(promise, status, values)
     if promise._status ~= "Pending" then return end
     promise._status = status
     promise._values = values
@@ -29,9 +22,9 @@ local function settle(promise: LauaPromiseState, status: LauaPromiseStatus, valu
     table.clear(promise._waiters)
 end
 
-function Async.run(callback: (...any) -> ...any, ...: any)
+function Async.run(callback, ...)
     assert(type(callback) == "function", "Async.run expects a function")
-    local promise: LauaPromiseState = {_status = "Pending", _values = nil, _waiters = {}}
+    local promise = {_status = "Pending", _values = nil, _waiters = {}}
     setmetatable(promise, Promise)
     task.spawn(function(...)
         local result = table.pack(pcall(callback, ...))
@@ -54,10 +47,10 @@ function Async.run(callback: (...any) -> ...any, ...: any)
     return promise
 end
 
-function Async.await(value: any)
+function Async.await(value)
     if not isPromise(value) then
         if type(value) == "table" and type(value.Wait) == "function" and type(value.Fire) == "function" then
-            return (value :: {Wait: (any) -> ...any}):Wait()
+            return (value):Wait()
         end
         return value
     end
@@ -77,13 +70,13 @@ function Promise:await()
     return Async.await(self)
 end
 
-function Promise:andThen(callback: (...any) -> ...any)
+function Promise:andThen(callback)
     return Async.run(function()
         return callback(Async.await(self))
     end)
 end
 
-function Promise:catch(callback: (...any) -> ...any)
+function Promise:catch(callback)
     return Async.run(function()
         local result = table.pack(pcall(Async.await, self))
         if result[1] then return table.unpack(result, 2, result.n) end
@@ -91,7 +84,7 @@ function Promise:catch(callback: (...any) -> ...any)
     end)
 end
 
-function Promise:finally(callback: () -> ())
+function Promise:finally(callback)
     return Async.run(function()
         local result = table.pack(pcall(Async.await, self))
         callback()
@@ -100,7 +93,7 @@ function Promise:finally(callback: () -> ())
     end)
 end
 
-function Promise.getStatus(self: LauaPromiseState): LauaPromiseStatus
+function Promise.getStatus(self)
     return self._status
 end
 
@@ -112,25 +105,25 @@ return Async
 local LAUA_CORE_RUNTIME_SOURCE = [====[
 local LauaCore = {}
 
-function LauaCore.optional(value: any, key: any): any
+function LauaCore.optional(value, key)
     if value == nil then return nil end
     if typeof(value) == "Instance" then
         local ok, result = pcall(function() return value[key] end)
         if ok then return result end
-        if typeof(key) == "string" then return (value :: Instance):FindFirstChild(key) end
+        if typeof(key) == "string" then return (value):FindFirstChild(key) end
         return nil
     end
     return value[key]
 end
 
-function LauaCore.coalesce(value: any, fallback: () -> any): any
+function LauaCore.coalesce(value, fallback)
     if value ~= nil then return value end
     return fallback()
 end
 
 
 -- Laua: spread merges consecutive array entries and then named keys.
-function LauaCore.spread(...: any): {[any]: any}
+function LauaCore.spread(...)
     local result = {}
     for index = 1, select("#", ...) do
         local item = select(index, ...)
@@ -147,7 +140,7 @@ function LauaCore.spread(...: any): {[any]: any}
     return result
 end
 
-function LauaCore.slice(value: any, first: number?, last: number?): any
+function LauaCore.slice(value, first, last)
     local valueType = typeof(value)
     if valueType == "string" then
         return string.sub(value, first or 1, last or #value)
@@ -170,7 +163,7 @@ end
 
 
 -- Laua is: matches a Laua class or one of its ancestors.
-function LauaCore.is(value: any, class: any): boolean
+function LauaCore.is(value, class)
     if type(class) ~= "table" or type(value) ~= "table" then return false end
     local candidate = getmetatable(value)
     for _ = 1, 4 do
@@ -190,43 +183,43 @@ function LauaCore.is(value: any, class: any): boolean
 end
 
 -- Unlike an eager index, the index expression is not evaluated for nil.
-function LauaCore.optionalCall(value: any, callback: (any) -> any): any
+function LauaCore.optionalCall(value, callback)
     if value == nil then return nil end
     return callback(value)
 end
 
-function LauaCore.optionalIndex(value: any, key: () -> any): any
+function LauaCore.optionalIndex(value, key)
     if value == nil then return nil end
     local index = key()
     if typeof(value) == "Instance" then
         local ok, result = pcall(function() return value[index] end)
         if ok then return result end
-        if typeof(index) == "string" then return (value :: Instance):FindFirstChild(index) end
+        if typeof(index) == "string" then return (value):FindFirstChild(index) end
         return nil
     end
     return value[index]
 end
 
 -- Cache complete result tuples, including nils; cache keys use argument identity.
-function LauaCore.memo(callback: (...any) -> ...any): (...any) -> ...any
-    local root: {[any]: any} = {}
+function LauaCore.memo(callback)
+    local root = {}
     local nilKey = {}
     local terminal = {}
     local wrapped = function(...)
-        local node: {[any]: any} = root
+        local node = root
         for index = 1, select("#", ...) do
             local key = select(index, ...)
             if key == nil then key = nilKey end
-            local nextNode: {[any]: any}? = node[key]
+            local nextNode = node[key]
             if nextNode ~= nil then
                 node = nextNode
             else
-                local created: {[any]: any} = {}
+                local created = {}
                 node[key] = created
                 node = created
             end
         end
-        local cached: {n: number, [number]: any}? = node[terminal]
+        local cached = node[terminal]
         if cached == nil then
             local result = table.pack(callback(...))
             node[terminal] = result
@@ -245,7 +238,7 @@ end
 
 -- Clear one memoized function or every memo cache in this script.
 -- Clearing resets the cache, not the memoized function's identity.
-function LauaCore.clearMemo(callback: ((...any) -> ...any)?): boolean
+function LauaCore.clearMemo(callback)
     local resets = LauaCore._memoResets
     if resets == nil then return false end
     if callback ~= nil then
@@ -260,8 +253,8 @@ end
 
 LauaCore.table = {}
 
-function LauaCore.table.filter<T>(items: {T}, predicate: (T, number) -> boolean): {T}
-    local out: {T} = {}
+function LauaCore.table.filter(items, predicate)
+    local out = {}
     local length = 0
     for index, item in items do
         if predicate(item, index) then
@@ -272,21 +265,21 @@ function LauaCore.table.filter<T>(items: {T}, predicate: (T, number) -> boolean)
     return out
 end
 
-function LauaCore.table.map<T, U>(items: {T}, callback: (T, number) -> U): {U}
-    local out: {U} = table.create(#items)
+function LauaCore.table.map(items, callback)
+    local out = table.create(#items)
     for index, item in items do
         out[index] = callback(item, index)
     end
     return out
 end
 
-function LauaCore.table.reduce<T, U>(items: {T}, callback: (U, T, number) -> U, initial: U): U
-    local current: U = initial
+function LauaCore.table.reduce(items, callback, initial)
+    local current = initial
     for index, item in items do current = callback(current, item, index) end
     return current
 end
 
-function LauaCore.table.findWhere<T>(items: {T}, predicate: (T, number) -> boolean): T?
+function LauaCore.table.findWhere(items, predicate)
     for index, item in items do
         if predicate(item, index) then return item end
     end
@@ -295,7 +288,7 @@ end
 
 -- Lazy imports can break *some* initialisation cycles if neither module
 -- accesses the other before both have finished loading.
-function LauaCore.lazyModule(resolve: () -> any): any
+function LauaCore.lazyModule(resolve)
     local loaded = false
     local target = nil
     local function get()
@@ -743,6 +736,7 @@ local function transpileClasses(source: string): string
         local blockLines = splitLines(maskNonCode(body))
         local fields, statics, methods, getters, setters, operators, lazies, watchers = {}, {}, {}, {}, {}, {}, {}, {}
         local classTypes = {}
+        local classLocals = {}
         local classTypeNames = {}
         local attributes = {}
         local names = {}
@@ -762,6 +756,18 @@ local function transpileClasses(source: string): string
                 continue
             end
             local modifiers, remainder = parseModifiers(headerText)
+            -- Local declarations in class bodies are lexically scoped upvalues,
+            -- emitted once before the generated class so methods can capture them.
+            if remainder:match("^local%s+") then
+                if next(modifiers) or #attributes > 0 then error("Class-scoped locals cannot have member modifiers or attributes") end
+                local localName = remainder:match("^local%s+([%a_][%w_]*)")
+                if not localName or not (remainder:match("^local%s+[%a_][%w_]*%s*$") or remainder:match("^local%s+[%a_][%w_]*%s*=%s*.+$") or remainder:match("^local%s+[%a_][%w_]*%s*:%s*[^=]+$") or remainder:match("^local%s+[%a_][%w_]*%s*:%s*[^=]+%s*=%s*.+$")) then
+                    error(`Invalid class-scoped local declaration: {headerText}`)
+                end
+                table.insert(classLocals, remainder)
+                index += 1
+                continue
+            end
             local aliasName = remainder:match("^type%s+([%a_][%w_]*)%s*=") or remainder:match("^type%s+([%a_][%w_]*)%s*%b<>%s*=")
             if aliasName then
                 if next(modifiers) or #attributes > 0 then error("Class type aliases cannot have member modifiers or attributes") end
@@ -903,7 +909,7 @@ local function transpileClasses(source: string): string
                 table.insert(fields, {Name = property.Name, Value = nil, Visibility = property.Visibility})
             end
         end
-        local classTypePrefix = #classTypes > 0 and table.concat(classTypes, "\n") .. "\n" or ""
+        local classTypePrefix = (#classTypes > 0 and table.concat(classTypes, "\n") .. "\n" or "") .. (#classLocals > 0 and table.concat(classLocals, "\n") .. "\n" or "")
         local properties = {}
         for _, member in getters do properties[member.Name] = true end
         for _, member in setters do properties[member.Name] = true end
@@ -991,21 +997,21 @@ local function transpileClasses(source: string): string
             end
         end
         if plainClass then
-            local simple = {"local " .. name .. ": {[string]: any} = {}", name .. ".__index = " .. name}
+            local simple = {"local " .. name .. " = {}", name .. ".__index = " .. name}
             for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
-            table.insert(simple, `function {name}.__init(self: any{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
+            table.insert(simple, `function {name}.__init(self{ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
-            if ctor then for _, property in ctor.Properties do table.insert(simple, `    self.{property.Name} = {property.Name}`) end end end
+            if ctor then for _, property in ctor.Properties do table.insert(simple, `    self.{property.Name} = {property.Name}`) end end
             local simpleCtor = normalized(transpileSource(ctorBody), "    ")
             if simpleCtor ~= "" then table.insert(simple, simpleCtor) end
             table.insert(simple, "end")
-            table.insert(simple, `function {name}.new(...: any): any`)
-            table.insert(simple, "    local self: any = setmetatable({}, " .. name .. ")")
+            table.insert(simple, `function {name}.new(...)`)
+            table.insert(simple, "    local self = setmetatable({}, " .. name .. ")")
             table.insert(simple, `    {name}.__init(self, ...)`)
             table.insert(simple, "    return self")
             table.insert(simple, "end")
             for _, operator in operators do
-                table.insert(simple, `function {name}.{operator.Name}(self: any{trim(operator.Params) ~= "" and ", " .. (operator.Params:match("^%s*[%a_][%w_]*%s*$") and trim(operator.Params) .. ": any" or operator.Params) or ""})`)
+                table.insert(simple, `function {name}.{operator.Name}(self{trim(operator.Params) ~= "" and ", " .. (operator.Params:match("^%s*[%a_][%w_]*%s*$") and trim(operator.Params) .. "" or operator.Params) or ""})`)
                 local code = normalized(transpileSource(operator.Body), "    ")
                 if code ~= "" then table.insert(simple, code) end
                 table.insert(simple, "end")
@@ -1026,9 +1032,9 @@ local function transpileClasses(source: string): string
             local simple = {}
             if base then
                 if checkFinalParent then table.insert(simple, `if {base}.__final then error("Cannot extend final class '{base}'") end`) end
-                table.insert(simple, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
+                table.insert(simple, "local " .. name .. " = setmetatable({}, {__index = " .. base .. "})")
             else
-                table.insert(simple, "local " .. name .. ": {[string]: any} = {}")
+                table.insert(simple, "local " .. name .. " = {}")
             end
             table.insert(simple, `{name}.__index = {name}`)
             if prefix == "abstract" then table.insert(simple, `{name}.__abstract = true`) end
@@ -1042,22 +1048,22 @@ local function transpileClasses(source: string): string
                 table.insert(simple, `{name}.__finalMethods = {base and "setmetatable(" .. finalTable .. ", {__index = " .. base .. ".__finalMethods or {}})" or finalTable}`)
             end
             for _, field in statics do if field.Value ~= nil then table.insert(simple, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
-            table.insert(simple, `function {name}.__init(self: any{not ctor and base and ", ...: any" or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
+            table.insert(simple, `function {name}.__init(self{not ctor and base and ", ..." or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
             if parentInit then table.insert(simple, "    " .. parentInit) end
             for _, field in fields do if field.Value ~= nil then table.insert(simple, `    self.{field.Name} = {transpileSource(field.Value)}`) end end
-            if ctor then for _, property in ctor.Properties do table.insert(simple, `    self.{property.Name} = {property.Name}`) end end end
+            if ctor then for _, property in ctor.Properties do table.insert(simple, `    self.{property.Name} = {property.Name}`) end end
             local init = normalized(transpileSource(ctorBody), "    ")
             if init ~= "" then table.insert(simple, init) end
             table.insert(simple, "end")
-            table.insert(simple, `function {name}.new(...: any): any`)
+            table.insert(simple, `function {name}.new(...)`)
             if prefix == "abstract" then table.insert(simple, `    error("Cannot instantiate abstract class '{name}'")`) end
-            table.insert(simple, "    local self: any = setmetatable({}, " .. name .. ")")
+            table.insert(simple, "    local self = setmetatable({}, " .. name .. ")")
             table.insert(simple, `    {name}.__init(self, ...)`)
             table.insert(simple, "    return self")
             table.insert(simple, "end")
             for _, op in operators do
                 local opBody = normalized(transpileSource(base and replaceSuper(op.Body, base) or op.Body), "    ")
-                table.insert(simple, `function {name}.{op.Name}(self: any{trim(op.Params) ~= "" and ", " .. (op.Params:match("^%s*[%a_][%w_]*%s*$") and trim(op.Params) .. ": any" or op.Params) or ""})`)
+                table.insert(simple, `function {name}.{op.Name}(self{trim(op.Params) ~= "" and ", " .. (op.Params:match("^%s*[%a_][%w_]*%s*$") and trim(op.Params) .. "" or op.Params) or ""})`)
                 if opBody ~= "" then table.insert(simple, opBody) end
                 table.insert(simple, "end")
             end
@@ -1081,9 +1087,9 @@ local function transpileClasses(source: string): string
         local generated = {}
         if base then
             if checkFinalParent then table.insert(generated, `if {base}.__final then error("Cannot extend final class '{base}'") end`) end
-            table.insert(generated, "local " .. name .. ": any = setmetatable({}, {__index = " .. base .. "})")
+            table.insert(generated, "local " .. name .. " = setmetatable({}, {__index = " .. base .. "})")
         else
-            table.insert(generated, "local " .. name .. ": {[string]: any} = {}")
+            table.insert(generated, "local " .. name .. " = {}")
         end
         if prefix == "final" then table.insert(generated, `{name}.__final = true`) end
         if prefix == "abstract" then table.insert(generated, `{name}.__abstract = true`) end
@@ -1114,7 +1120,7 @@ local function transpileClasses(source: string): string
         if not usesGetters and not usesLazy and not usesWatchers then
             table.insert(generated, `{name}.__index = {name}`)
         else
-            table.insert(generated, `{name}.__index = function(self: any, key: any)`)
+            table.insert(generated, `{name}.__index = function(self, key)`)
             if usesGetters then
                 table.insert(generated, `    local getter: ((any) -> any)? = {name}.__getters[key]`)
                 table.insert(generated, "    if getter then return getter(self) end")
@@ -1136,7 +1142,7 @@ local function transpileClasses(source: string): string
             table.insert(generated, "end")
         end
         if usesSetters or usesGetters or usesLazy or usesWatchers then
-            table.insert(generated, `{name}.__newindex = function(self: any, key: any, value: any)`)
+            table.insert(generated, `{name}.__newindex = function(self, key, value)`)
             if usesSetters then
                 table.insert(generated, `    local setter: ((any, any) -> ())? = {name}.__setters[key]`)
                 table.insert(generated, "    if setter then setter(self, value); return end")
@@ -1160,16 +1166,16 @@ local function transpileClasses(source: string): string
             table.insert(generated, "end")
         end
         for lazyName, lazyValue in lazies do
-            table.insert(generated, `{name}.__lazy["{lazyName}"] = function(self: any) return {transpileSource(lazyValue)} end`)
+            table.insert(generated, `{name}.__lazy["{lazyName}"] = function(self) return {transpileSource(lazyValue)} end`)
         end
         for watchName, watcher in watchers do
-            table.insert(generated, `{name}.__watchers["{watchName}"] = function(self: any, {watcher.Params})`)
+            table.insert(generated, `{name}.__watchers["{watchName}"] = function(self, {watcher.Params})`)
             local code = normalized(transpileSource(base and replaceSuper(watcher.Body, base) or watcher.Body), "    ")
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
         end
         for _, field in statics do if field.Value ~= nil then table.insert(generated, `{name}.{field.Name} = {transpileSource(field.Value)}`) end end
-        table.insert(generated, `function {name}.__init(self: any{not ctor and base and ", ...: any" or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
+        table.insert(generated, `function {name}.__init(self{not ctor and base and ", ..." or ctor and trim(ctor.Params) ~= "" and ", " .. ctor.Params or ""})`)
         if parentInit then table.insert(generated, "    " .. parentInit) end
         for _, field in fields do
             if field.Value == nil then continue end
@@ -1188,32 +1194,32 @@ local function transpileClasses(source: string): string
         local innerCtor = normalized(transpileSource(ctorBody), "    ")
         if innerCtor ~= "" then table.insert(generated, innerCtor) end
         table.insert(generated, "end")
-        table.insert(generated, `function {name}.new(...: any): any`)
+        table.insert(generated, `function {name}.new(...)`)
         if prefix == "abstract" then table.insert(generated, `    error("Cannot instantiate abstract class '{name}'")`) end
         local instanceSlots = {}
         if needsValues then table.insert(instanceSlots, "__lauaValues = {}") end
         if needsInitialized then table.insert(instanceSlots, "__lauaInitialized = {}") end
-        table.insert(generated, "    local self: any = setmetatable({" .. table.concat(instanceSlots, ", ") .. "}, " .. name .. ")")
+        table.insert(generated, "    local self = setmetatable({" .. table.concat(instanceSlots, ", ") .. "}, " .. name .. ")")
         table.insert(generated, `    {name}.__init(self, ...)`)
         table.insert(generated, "    return self")
         table.insert(generated, "end")
         for _, member in getters do
             local nested = base and replaceSuper(member.Body, base) or member.Body
-            table.insert(generated, `{name}.__getters.{member.Name} = function(self: any){member.ReturnType ~= "" and ": " .. member.ReturnType or ""}`)
+            table.insert(generated, `{name}.__getters.{member.Name} = function(self){member.ReturnType ~= "" and ": " .. member.ReturnType or ""}`)
             local code = normalized(transpileSource(nested), "    ")
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
         end
         for _, member in setters do
             local nested = base and replaceSuper(member.Body, base) or member.Body
-            table.insert(generated, `{name}.__setters.{member.Name} = function(self: any, {member.Params}){member.ReturnType ~= "" and ": " .. member.ReturnType or ""}`)
+            table.insert(generated, `{name}.__setters.{member.Name} = function(self, {member.Params}){member.ReturnType ~= "" and ": " .. member.ReturnType or ""}`)
             local code = normalized(transpileSource(nested), "    ")
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
         end
         for _, operator in operators do
             local nested = base and replaceSuper(operator.Body, base) or operator.Body
-            table.insert(generated, `function {name}.{operator.Name}(self: any{trim(operator.Params) ~= "" and ", " .. (operator.Params:match("^%s*[%a_][%w_]*%s*$") and trim(operator.Params) .. ": any" or operator.Params) or ""})`)
+            table.insert(generated, `function {name}.{operator.Name}(self{trim(operator.Params) ~= "" and ", " .. (operator.Params:match("^%s*[%a_][%w_]*%s*$") and trim(operator.Params) .. "" or operator.Params) or ""})`)
             local code = normalized(transpileSource(nested), "    ")
             if code ~= "" then table.insert(generated, code) end
             table.insert(generated, "end")
@@ -2280,7 +2286,7 @@ local function transpileUsing(source: string): string
             local code = {
                 indent .. "local " .. name .. " = " .. expression,
                 indent .. "defer",
-                indent .. "    local __lauaResource: any = " .. name,
+                indent .. "    local __lauaResource = " .. name,
                 indent .. "    if __lauaResource ~= nil then",
                 indent .. "        if typeof(" .. "__lauaResource" .. ') == "RBXScriptConnection" then',
                 indent .. "            " .. "(__lauaResource :: RBXScriptConnection):Disconnect()",
@@ -2288,13 +2294,13 @@ local function transpileUsing(source: string): string
                 indent .. "            " .. "(__lauaResource :: Instance):Destroy()",
                 indent .. "        elseif type(" .. "__lauaResource" .. ') == "table" then',
                 indent .. "            if type(" .. "__lauaResource" .. '.Dispose) == "function" then',
-                indent .. "                local __lauaInvoke: (any) -> () = (__lauaResource.Dispose :: any)",
+                indent .. "                local __lauaInvoke = __lauaResource.Dispose",
                 indent .. "                __lauaInvoke(__lauaResource)",
                 indent .. "            elseif type(" .. "__lauaResource" .. '.Disconnect) == "function" then',
-                indent .. "                local __lauaInvoke: (any) -> () = (__lauaResource.Disconnect :: any)",
+                indent .. "                local __lauaInvoke = __lauaResource.Disconnect",
                 indent .. "                __lauaInvoke(__lauaResource)",
                 indent .. "            elseif type(" .. "__lauaResource" .. '.Destroy) == "function" then',
-                indent .. "                local __lauaInvoke: (any) -> () = (__lauaResource.Destroy :: any)",
+                indent .. "                local __lauaInvoke = __lauaResource.Destroy",
                 indent .. "                __lauaInvoke(__lauaResource)",
                 indent .. "            else",
                 indent .. '                error("using resource has no Dispose, Disconnect, or Destroy method")',
@@ -2468,13 +2474,13 @@ end
 -- Initialize runtime tables directly and isolate private bindings with do blocks.
 -- This avoids the one-shot function allocation/call without exposing internals.
 local function runtimeDoBlock(name: string, alias: string, body: string): string
-    local oldDeclaration = alias == "Async" and "local Async: any = {}" or "local LauaCore = {}"
-    local newDeclaration = "local " .. alias .. ": {[string]: any} = " .. name
+    local oldDeclaration = alias == "Async" and "local Async = {}" or "local LauaCore = {}"
+    local newDeclaration = "local " .. alias .. " = " .. name
     local declarationAt = body:find(oldDeclaration, 1, true)
     assert(declarationAt == 1 or (declarationAt ~= nil and body:sub(1, declarationAt - 1):find("^type ")), "Missing runtime library declaration")
     body = body:gsub(oldDeclaration:gsub("(%W)", "%%%1"), newDeclaration, 1)
     body = body:gsub("%s*return " .. alias .. "%s*$", "")
-    return "local " .. name .. ": {[string]: any} = {}\ndo\n" .. body .. "\nend"
+    return "local " .. name .. " = {}\ndo\n" .. body .. "\nend"
 end
 
 -- Embedded runtimes are inserted once, after header directives. Generated
@@ -3204,11 +3210,21 @@ local function validateLauaSemantics(source: string): {any}
                     if prefix == "static" then isStatic = true end
                     clean = trim(clean:sub(#prefix + 1))
                 end
-                for dynamicField in body:gmatch("self%.([%a_][%w_]*)%s*=") do
-                    if not info.Instance[dynamicField] then info.Instance[dynamicField] = {Kind = "field"} end
-                end
                 local ctor = clean:match("^constructor%s*%(([^)]*)%)")
                 if ctor then
+                    -- Constructor initialization introduces instance fields,
+                    -- but assignments in arbitrary methods must not silently
+                    -- make misspelled property reads valid. Masked lines keep
+                    -- comments and strings out of the member index.
+                    local constructorEnding = findBlock(source, row.Start, lines)
+                    for _, assignmentRow in lines do
+                        if assignmentRow.Start <= row.Start or assignmentRow.Start >= constructorEnding.Start then continue end
+                        local assignment = trim(assignmentRow.Text)
+                        local dynamicField, equals = assignment:match("^self%s*%.%s*([%a_][%w_]*)%s*=(=?)")
+                        if dynamicField and equals == "" and not info.Instance[dynamicField] then
+                            info.Instance[dynamicField] = {Kind = "field"}
+                        end
+                    end
                     local normalizedParams, props = parseConstructorProperties(ctor)
                     info.Constructor = normalizedParams
                     for _, property in props do info.Instance[property.Name] = {Kind = "field"} end
@@ -3750,7 +3766,7 @@ local function nativeTranspileContracts(source: string): string
         local out = {}
         if kind == "schema" then
             table.insert(out, "local " .. name .. " = {}")
-            table.insert(out, `function {name}.Validate(value: any): (boolean, string?)`)
+            table.insert(out, `function {name}.Validate(value)`)
             table.insert(out, '    if type(value) ~= "table" then return false, "Expected table" end')
             local seen = {}
             for _, row in rows do
@@ -3768,7 +3784,7 @@ local function nativeTranspileContracts(source: string): string
             end
             table.insert(out,'    return true, nil')
             table.insert(out,'end')
-            table.insert(out,`function {name}.Assert(value: any): any`)
+            table.insert(out,`function {name}.Assert(value)`)
             table.insert(out,`    local ok, message = {name}.Validate(value)`)
             table.insert(out,'    if not ok then error(message, 2) end')
             table.insert(out,'    return value')
