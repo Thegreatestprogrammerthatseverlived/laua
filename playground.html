@@ -194,7 +194,7 @@
         </select>
       </label>
       <button id="transpileBtn">Transpile</button>
-      <button id="forceTranspileBtn" title="Bypass lint and preflight errors; syntax/transpilation errors still stop output">Force Transpile</button>
+      <button id="forceTranspileBtn" title="Best-effort transpile even with errors; if conversion fails, show original source with warning">Force Transpile</button>
       <button id="copyBtn" title="Copy generated Luau code">Copy Luau</button>
       <a id="githubBtn" class="github-btn" href="https://github.com/Thegreatestprogrammerthatseverlived/laua" target="_blank" rel="noopener noreferrer" title="Open Laua on GitHub">GitHub</a>
       <a id="discordBtn" class="github-btn" href="https://discord.gg/9drrUjhQcQ" target="_blank" rel="noopener noreferrer" title="Join the Laua Discord server">Discord</a>
@@ -1157,6 +1157,7 @@ print(player.IsAlive)  -- true`;
         const blockIndex = {lines, masked: maskNonCode(body)};
         const fields = [], statics = [], methods = [], getters = [], setters = [], operators = [], lazyFields = [], watchers = [];
         const classTypeAliases = [];
+        const classScopedLocals = [];
         const classTypeNames = new Set();
         let ctor = null;
         let attrs = [];
@@ -1185,6 +1186,16 @@ print(player.IsAlive)  -- true`;
             continue;
           }
           const { modifiers, text } = parseLauaModifiers(original);
+          // Class-body locals belong to the lexical scope surrounding the generated
+          // class, not to each instance. Hoisting in source order lets methods close
+          // over DataStoreService handles without creating instance fields.
+          if (/^local\s+/.test(text)) {
+            if (modifiers.size || attrs.length) throw new Error('Class-scoped locals cannot have member modifiers or attributes');
+            if (!/^local\s+[A-Za-z_]\w*(?:\s*:\s*[^=\n]+)?(?:\s*=\s*.+)?$/.test(text)) throw new Error(`Invalid class-scoped local declaration: ${original}`);
+            classScopedLocals.push(text);
+            li++;
+            continue;
+          }
           // Type aliases inside a class are compile-time declarations, not runtime fields.
           // Lift them ahead of generated class code so Luau can resolve their names.
           const aliasDeclaration = /^type\s+([A-Za-z_]\w*)(?:\s*<[^>\n]+>)?\s*=\s*(.*)$/.exec(text);
@@ -1397,24 +1408,24 @@ print(player.IsAlive)  -- true`;
         finalClassFlags.set(name, isFinal);
         const plainClass = !base && !isAbstract && !isFinal && !getters.length && !setters.length && !lazyFields.length && !watchers.length && !ctor?.attributes && methods.every(member => !member.abstract && !member.final && !member.override);
         if (plainClass) {
-          let output = `local ${name}: {[string]: any} = {}\n${name}.__index = ${name}\n`;
+          let output = `local ${name} = {}\n${name}.__index = ${name}\n`;
           for (const field of statics) if (field.value !== null) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
-          output += `function ${name}.__init(self: any${ctor?.params?.trim() ? ", " + ctor.params : ""})\n`;
+          output += `function ${name}.__init(self${ctor?.params?.trim() ? ", " + ctor.params : ""})\n`;
           for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
           for (const property of ctor?.properties || []) output += `    self.${property.name} = ${property.name}\n`;
           const initBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
           if (initBody) output += initBody + "\n";
-          output += `end\nfunction ${name}.new(...: any): any\n    local self: any = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
+          output += `end\nfunction ${name}.new(...)\n    local self = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
           for (const operator of operators) {
             const memberBody = normalizeBlockIndent(transpileCore(operator.body), "    ");
-            output += `function ${name}.${operator.name}(self: any${operator.params ? ", " + (/^[A-Za-z_]\w*$/.test(operator.params.trim()) ? operator.params.trim() + ": any" : operator.params) : ""})\n${memberBody ? memberBody + "\n" : ""}end\n`;
+            output += `function ${name}.${operator.name}(self${operator.params ? ", " + (/^[A-Za-z_]\w*$/.test(operator.params.trim()) ? operator.params.trim() + "" : operator.params) : ""})\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
           for (const member of methods) {
             const memberBody = normalizeBlockIndent(transpileCore(member.body), "    ");
             if (/\bsuper\s*\(/.test(maskNonCode(member.body))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
-            output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n${memberBody ? memberBody + "\n" : ""}end\n`;
+            output += `${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n${memberBody ? memberBody + "\n" : ""}end\n`;
           }
-          const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + output.trimEnd();
+          const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + (classScopedLocals.length ? classScopedLocals.join('\n') + '\n' : '') + output.trimEnd();
           generatedOffsetShift += emitted.length - (endPos.end - declStart);
           source = source.slice(0, declStart) + emitted + source.slice(endPos.end);
           continue;
@@ -1425,8 +1436,8 @@ print(player.IsAlive)  -- true`;
         // dynamic parent guards: skipping those would change error behavior.
         if (hookFree) {
           let output = base
-            ? `${checkFinalParent ? `if ${base}.__final then error("Cannot extend final class '${base}'") end\n` : ''}local ${name}: any = setmetatable({}, {__index = ${base}})\n`
-            : `local ${name}: {[string]: any} = {}\n`;
+            ? `${checkFinalParent ? `if ${base}.__final then error("Cannot extend final class '${base}'") end\n` : ''}local ${name} = setmetatable({}, {__index = ${base}})\n`
+            : `local ${name} = {}\n`;
           output += `${name}.__index = ${name}\n`;
           if (isAbstract) output += `${name}.__abstract = true\n`;
           if (isFinal) output += `${name}.__final = true\n`;
@@ -1435,29 +1446,29 @@ print(player.IsAlive)  -- true`;
             output += `${name}.__finalMethods = ${base ? `setmetatable({${ownFinals}}, {__index = ${base}.__finalMethods or {}})` : `{${ownFinals}}`}\n`;
           }
           for (const field of statics) if (field.value !== null) output += `${name}.${field.name} = ${transpileCore(field.value)}\n`;
-          const arglist = ctor?.params?.trim() ? ', ' + ctor.params : base && !ctor ? ', ...: any' : '';
-          output += `function ${name}.__init(self: any${arglist})\n`;
+          const arglist = ctor?.params?.trim() ? ', ' + ctor.params : base && !ctor ? ', ...' : '';
+          output += `function ${name}.__init(self${arglist})\n`;
           if (parentInit) output += `    ${parentInit}\n`;
           for (const field of fields) if (field.value !== null) output += `    self.${field.name} = ${transpileCore(field.value)}\n`;
           for (const property of ctor?.properties || []) output += `    self.${property.name} = ${property.name}\n`;
           const init = normalizeBlockIndent(transpileCore(constructorBody));
           if (init) output += init + '\n';
-          output += `end\nfunction ${name}.new(...: any): any\n${isAbstract ? `    error("Cannot instantiate abstract class '${name}'")\n` : ''}    local self: any = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
+          output += `end\nfunction ${name}.new(...)\n${isAbstract ? `    error("Cannot instantiate abstract class '${name}'")\n` : ''}    local self = setmetatable({}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
           for (const op of operators) {
             const body = normalizeBlockIndent(transpileCore(base ? replaceSuperReferences(op.body, base) : op.body));
-            output += `function ${name}.${op.name}(self: any${op.params ? ', ' + (/^[A-Za-z_]\w*$/.test(op.params.trim()) ? op.params.trim() + ': any' : op.params) : ''})\n${body ? body + '\n' : ''}end\n`;
+            output += `function ${name}.${op.name}(self${op.params ? ', ' + (/^[A-Za-z_]\w*$/.test(op.params.trim()) ? op.params.trim() + '' : op.params) : ''})\n${body ? body + '\n' : ''}end\n`;
           }
           for (const member of methods) {
             if (base && parentFinalMethods) output += `if ${base}.__finalMethods and ${base}.__finalMethods[${JSON.stringify(member.name)}] then error("Cannot override final method '${member.name}'") end\n`;
             let body = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
             if (/\bsuper\s*\(/.test(maskNonCode(body))) throw classLocation(new Error('super(...) can only be called in constructors'), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
             body = normalizeBlockIndent(transpileCore(body));
-            output += `${member.attributes ? member.attributes + '\n' : ''}${member.kind === 'async function' ? 'async ' : ''}function ${name}.${member.name}(${member.static ? member.params : 'self: any' + (member.params.trim() ? ', ' + member.params : '')})${member.returnType ? ': ' + member.returnType : ''}\n`;
+            output += `${member.attributes ? member.attributes + '\n' : ''}${member.kind === 'async function' ? 'async ' : ''}function ${name}.${member.name}(${member.static ? member.params : 'self' + (member.params.trim() ? ', ' + member.params : '')})${member.returnType ? ': ' + member.returnType : ''}\n`;
             if (member.abstract) output += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
             else if (body) output += body + '\n';
             output += 'end\n';
           }
-          const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + output.trimEnd();
+          const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + (classScopedLocals.length ? classScopedLocals.join('\n') + '\n' : '') + output.trimEnd();
           generatedOffsetShift += emitted.length - (endPos.end - declStart);
           source = source.slice(0, declStart) + emitted + source.slice(endPos.end);
           continue;
@@ -1471,8 +1482,8 @@ print(player.IsAlive)  -- true`;
           : '{}';
         const ownFinalMethods = methods.filter(method => method.final).map(method => `[${JSON.stringify(method.name)}] = true`).join(', ');
         let generated = base
-          ? `${checkFinalParent ? `if ${base}.__final then error("Cannot extend final class '${base}'") end\n` : ''}local ${name}: any = setmetatable({}, {__index = ${base}})\n`
-          : `local ${name}: {[string]: any} = {}\n`;
+          ? `${checkFinalParent ? `if ${base}.__final then error("Cannot extend final class '${base}'") end\n` : ''}local ${name} = setmetatable({}, {__index = ${base}})\n`
+          : `local ${name} = {}\n`;
         if (isAbstract) generated += `${name}.__abstract = true\n`;
         if (isFinal) generated += `${name}.__final = true\n`;
         if (needsFinalMethods) generated += `${name}.__finalMethods = ${base ? (methods.some(method => method.final) ? `setmetatable({${ownFinalMethods}}, {__index = ${base}.__finalMethods or {}})` : `(${base}.__finalMethods or {})`) : `{${ownFinalMethods}}`}\n`;
@@ -1488,9 +1499,9 @@ print(player.IsAlive)  -- true`;
         if (!uses.getters && !uses.lazy && !uses.watchers) {
           generated += `${name}.__index = ${name}\n`;
         } else {
-          generated += `${name}.__index = function(self: any, key: any)\n`;
-          if (uses.getters) generated += `    local getter: ((any) -> any)? = ${name}.__getters[key]\n    if getter then return getter(self) end\n`;
-          if (uses.lazy) generated += `    local lazy: ((any) -> any)? = ${name}.__lazy[key]\n    if lazy then\n` +
+          generated += `${name}.__index = function(self, key)\n`;
+          if (uses.getters) generated += `    local getter = ${name}.__getters[key]\n    if getter then return getter(self) end\n`;
+          if (uses.lazy) generated += `    local lazy = ${name}.__lazy[key]\n    if lazy then\n` +
             `        if not self.__lauaInitialized[key] then\n            self.__lauaInitialized[key] = true\n` +
             `            local ok, value = pcall(lazy, self)\n` +
             `            if not ok then self.__lauaInitialized[key] = nil; error(value, 0) end\n` +
@@ -1500,8 +1511,8 @@ print(player.IsAlive)  -- true`;
         }
         // Only allocate __newindex when writes need interception.
         if (uses.setters || uses.getters || uses.lazy || uses.watchers) {
-          generated += `${name}.__newindex = function(self: any, key: any, value: any)\n`;
-          if (uses.setters) generated += `    local setter: ((any, any) -> ())? = ${name}.__setters[key]\n    if setter then setter(self, value); return end\n`;
+          generated += `${name}.__newindex = function(self, key, value)\n`;
+          if (uses.setters) generated += `    local setter = ${name}.__setters[key]\n    if setter then setter(self, value); return end\n`;
           if (uses.getters) generated += `    if ${name}.__getters[key] then error("Cannot assign to read-only property: " .. key) end\n`;
           if (uses.lazy || uses.watchers) {
             const tracked = [uses.watchers ? `${name}.__watchedFields[key]` : null, uses.lazy ? `${name}.__lazy[key]` : null].filter(Boolean).join(' or ');
@@ -1509,7 +1520,7 @@ print(player.IsAlive)  -- true`;
               `        local oldValue = self.__lauaValues[key]\n`;
             if (uses.lazy) generated += `        if ${name}.__lazy[key] and not self.__lauaInitialized[key] then self.__lauaInitialized[key] = true end\n`;
             generated += `        self.__lauaValues[key] = value\n`;
-            if (uses.watchers) generated += `        local watcher: ((any, any, any) -> ())? = ${name}.__watchers[key]\n` +
+            if (uses.watchers) generated += `        local watcher = ${name}.__watchers[key]\n` +
               `        if watcher and oldValue ~= value then watcher(self, oldValue, value) end\n`;
             generated += `        return\n    end\n`;
           }
@@ -1522,7 +1533,7 @@ print(player.IsAlive)  -- true`;
         }
         for (const f of statics) if (f.value !== null) generated += `${name}.${f.name} = ${transpileCore(f.value)}\n`;
         const arglist = ctor ? ctor.params : "...";
-        generated += `\nfunction ${name}.__init(self: any${arglist.trim() ? ", " + arglist : ""})\n`;
+        generated += `\nfunction ${name}.__init(self${arglist.trim() ? ", " + arglist : ""})\n`;
         if (parentInit) generated += `    ${parentInit}\n`;
         for (const f of fields) {
           if (f.value === null) continue;
@@ -1536,36 +1547,36 @@ print(player.IsAlive)  -- true`;
         constructorBody = normalizeBlockIndent(transpileCore(constructorBody), "    ");
         if (constructorBody) generated += constructorBody + "\n";
         generated += "end\n";
-        generated += `\n${ctor?.attributes ? ctor.attributes + "\n" : ""}function ${name}.new(...: any): any\n`;
+        generated += `\n${ctor?.attributes ? ctor.attributes + "\n" : ""}function ${name}.new(...)\n`;
         if (isAbstract) generated += `    error("Cannot instantiate abstract class '${name}'")\n`;
         const instanceSlots = [];
         if (needsValues) instanceSlots.push('__lauaValues = {}');
         if (needsInitialized) instanceSlots.push('__lauaInitialized = {}');
-        generated += `    local self: any = setmetatable({${instanceSlots.join(', ')}}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
+        generated += `    local self = setmetatable({${instanceSlots.join(', ')}}, ${name})\n    ${name}.__init(self, ...)\n    return self\nend\n`;
         for (const member of [...getters, ...setters]) {
           const tableName = getters.includes(member) ? "__getters" : "__setters";
           let memberBody = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
           if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
-          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self: any${member.params.trim() ? ", " + member.params : ""})${member.returnType ? ": " + member.returnType : ""}\n`;
+          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${name}.${tableName}.${member.name} = function(self${member.params.trim() ? ", " + member.params : ""})${member.returnType ? ": " + member.returnType : ""}\n`;
           if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
         }
         for (const op of operators) {
           const body = normalizeBlockIndent(transpileCore(base ? replaceSuperReferences(op.body, base) : op.body), "    ");
-          generated += `\nfunction ${name}.${op.name}(self: any${op.params ? ", " + (/^[A-Za-z_]\w*$/.test(op.params.trim()) ? op.params.trim() + ": any" : op.params) : ""})\n${body ? body + "\n" : ""}end\n`;
+          generated += `\nfunction ${name}.${op.name}(self${op.params ? ", " + (/^[A-Za-z_]\w*$/.test(op.params.trim()) ? op.params.trim() + ": any" : op.params) : ""})\n${body ? body + "\n" : ""}end\n`;
         }
         for (const member of methods) {
           if (base && parentFinalMethods) generated += `\nif ${base}.__finalMethods and ${base}.__finalMethods[${JSON.stringify(member.name)}] then error("Cannot override final method '${member.name}'") end\n`;
           let memberBody = base ? replaceSuperReferences(member.body, base, !member.static) : member.body;
           if (/\bsuper\s*\(/.test(maskNonCode(memberBody))) throw classLocation(new Error("super(...) can only be called in constructors"), member.bodyStart + maskNonCode(member.body).search(/\bsuper\s*\(/), 5);
           memberBody = normalizeBlockIndent(transpileCore(memberBody), "    ");
-          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self: any" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n`;
+          generated += `\n${member.attributes ? member.attributes + "\n" : ""}${member.kind === "async function" ? "async " : ""}function ${name}.${member.name}(${member.static ? member.params : "self" + (member.params.trim() ? ", " + member.params : "")})${member.returnType ? ": " + member.returnType : ""}\n`;
           if (member.abstract) generated += `    error("Abstract method '${name}.${member.name}' must be overridden")\n`;
           else if (memberBody) generated += memberBody + "\n";
           generated += "end\n";
         }
-        const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + generated;
+        const emitted = (classTypeAliases.length ? classTypeAliases.join('\n') + '\n' : '') + (classScopedLocals.length ? classScopedLocals.join('\n') + '\n' : '') + generated;
         generatedOffsetShift += emitted.length - (endPos.end - declStart);
           source = source.slice(0, declStart) + emitted + source.slice(endPos.end);
       }
@@ -1592,7 +1603,7 @@ print(player.IsAlive)  -- true`;
       for (const replacement of deferred.reverse()) {
         body = body.slice(0, replacement.start) + replacement.code + body.slice(replacement.end);
       }
-      const wrapped = `local __lauaDefers: {() -> ...any} = {}\nlocal __lauaResult = table.pack(xpcall(function()\n${normalizeBlockIndent(body, "    ")}\nend, function(err) return err end))\n` +
+      const wrapped = `local __lauaDefers = {}\nlocal __lauaResult = table.pack(xpcall(function()\n${normalizeBlockIndent(body, "    ")}\nend, function(err) return err end))\n` +
         `local __lauaCleanupError = nil\nfor __lauaIndex = #__lauaDefers, 1, -1 do\n    local __lauaOK, __lauaError = pcall(__lauaDefers[__lauaIndex])\n    if not __lauaOK and not __lauaCleanupError then __lauaCleanupError = __lauaError end\nend\n` +
         `if __lauaCleanupError then error(__lauaCleanupError, 0) end\nif not __lauaResult[1] then error(__lauaResult[2], 0) end\nreturn table.unpack(__lauaResult, 2, __lauaResult.n)`;
       return { code: wrapped, hasDefer: true };
@@ -2068,7 +2079,7 @@ print(player.IsAlive)  -- true`;
           if(closing<0)throw new Error('Unclosed optional method call');
           const receiver=source.slice(left,pos).trim();
           const args=source.slice(openAt+1,closing);
-          const invoke=`(__lauaMethod :: ((...any) -> any))(${colon?'__lauaReceiver'+(args.trim()? ', ':'') : ''}${args})`;
+          const invoke=`__lauaMethod(${colon?'__lauaReceiver'+(args.trim()? ', ':'') : ''}${args})`;
           rewrite(left, closing+1, `__lauaCore.optionalCall(${receiver}, function(__lauaReceiver) local __lauaMethod = __lauaCore.optional(__lauaReceiver, "${name[1]}"); if __lauaMethod == nil then return nil end; return ${invoke} end)`);
           continue;
         }
@@ -2188,7 +2199,7 @@ print(player.IsAlive)  -- true`;
         results.push([
           `${indent}local ${name} = ${expression}`,
           `${indent}defer`,
-          `${indent}    local __lauaResource: any = ${name}`,
+          `${indent}    local __lauaResource = ${name}`,
           `${indent}    if __lauaResource ~= nil then`,
           `${indent}        if typeof(__lauaResource) == "RBXScriptConnection" then`,
           `${indent}            (__lauaResource :: RBXScriptConnection):Disconnect()`,
@@ -2196,13 +2207,13 @@ print(player.IsAlive)  -- true`;
           `${indent}            (__lauaResource :: Instance):Destroy()`,
           `${indent}        elseif type(__lauaResource) == "table" then`,
           `${indent}            if type(__lauaResource.Dispose) == "function" then`,
-          `${indent}                local __lauaInvoke: (any) -> () = (__lauaResource.Dispose :: any)`,
+          `${indent}                local __lauaInvoke = __lauaResource.Dispose`,
           `${indent}                __lauaInvoke(__lauaResource)`,
           `${indent}            elseif type(__lauaResource.Disconnect) == "function" then`,
-          `${indent}                local __lauaInvoke: (any) -> () = (__lauaResource.Disconnect :: any)`,
+          `${indent}                local __lauaInvoke = __lauaResource.Disconnect`,
           `${indent}                __lauaInvoke(__lauaResource)`,
           `${indent}            elseif type(__lauaResource.Destroy) == "function" then`,
-          `${indent}                local __lauaInvoke: (any) -> () = (__lauaResource.Destroy :: any)`,
+          `${indent}                local __lauaInvoke = __lauaResource.Destroy`,
           `${indent}                __lauaInvoke(__lauaResource)`,
           `${indent}            else`,
           `${indent}                error("using resource has no Dispose, Disconnect, or Destroy method")`,
@@ -2289,8 +2300,8 @@ print(player.IsAlive)  -- true`;
 
     // The playground embeds the same runtime implementations as transpiler.luau.
     // Generated output is self-contained; no sibling Laua runtime ModuleScripts are required.
-    const LAUA_ASYNC_RUNTIME_SOURCE = "type LauaPromiseStatus = \"Pending\" | \"Fulfilled\" | \"Rejected\"\ntype LauaPackedValues = {n: number, [number]: any}\ntype LauaPromiseState = {\n    _status: LauaPromiseStatus,\n    _values: LauaPackedValues?,\n    _waiters: {thread},\n}\n\nlocal Async: any = {}\nlocal Promise: {[string]: any} = {}\nPromise.__index = Promise\n\nlocal function isPromise(value: any): boolean\n    return type(value) == \"table\" and getmetatable(value) == Promise\nend\n\nlocal function settle(promise: LauaPromiseState, status: LauaPromiseStatus, values: LauaPackedValues)\n    if promise._status ~= \"Pending\" then return end\n    promise._status = status\n    promise._values = values\n    for _, thread in promise._waiters do\n        task.spawn(thread, status == \"Fulfilled\", table.unpack(values, 1, values.n))\n    end\n    table.clear(promise._waiters)\nend\n\nfunction Async.run(callback: (...any) -> ...any, ...: any)\n    assert(type(callback) == \"function\", \"Async.run expects a function\")\n    local promise: LauaPromiseState = {_status = \"Pending\", _values = nil, _waiters = {}}\n    setmetatable(promise, Promise)\n    task.spawn(function(...)\n        local result = table.pack(pcall(callback, ...))\n        if result[1] then\n            local values = table.pack(table.unpack(result, 2, result.n))\n            if values.n == 1 and isPromise(values[1]) then\n                local settled = table.pack(pcall(Async.await, values[1]))\n                if settled[1] then\n                    settle(promise, \"Fulfilled\", table.pack(table.unpack(settled, 2, settled.n)))\n                else\n                    settle(promise, \"Rejected\", table.pack(settled[2]))\n                end\n            else\n                settle(promise, \"Fulfilled\", values)\n            end\n        else\n            settle(promise, \"Rejected\", table.pack(result[2]))\n        end\n    end, ...)\n    return promise\nend\n\nfunction Async.await(value: any)\n    if not isPromise(value) then\n        if type(value) == \"table\" and type(value.Wait) == \"function\" and type(value.Fire) == \"function\" then\n            return (value :: {Wait: (any) -> ...any}):Wait()\n        end\n        return value\n    end\n    if value._status == \"Fulfilled\" then\n        return table.unpack(value._values, 1, value._values.n)\n    end\n    if value._status == \"Rejected\" then error(value._values[1], 2) end\n    local current = coroutine.running()\n    if not current then error(\"await requires a yieldable coroutine\", 2) end\n    table.insert(value._waiters, current)\n    local outcome = table.pack(coroutine.yield())\n    if not outcome[1] then error(outcome[2], 2) end\n    return table.unpack(outcome, 2, outcome.n)\nend\n\nfunction Promise:await()\n    return Async.await(self)\nend\n\nfunction Promise:andThen(callback: (...any) -> ...any)\n    return Async.run(function()\n        return callback(Async.await(self))\n    end)\nend\n\nfunction Promise:catch(callback: (...any) -> ...any)\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        if result[1] then return table.unpack(result, 2, result.n) end\n        return callback(result[2])\n    end)\nend\n\nfunction Promise:finally(callback: () -> ())\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        callback()\n        if not result[1] then error(result[2], 0) end\n        return table.unpack(result, 2, result.n)\n    end)\nend\n\nfunction Promise.getStatus(self: LauaPromiseState): LauaPromiseStatus\n    return self._status\nend\n\nAsync.Promise = Promise\nAsync.isPromise = isPromise\nreturn Async";
-    const LAUA_CORE_RUNTIME_SOURCE = "local LauaCore = {}\n\nfunction LauaCore.optional(value: any, key: any): any\n    if value == nil then return nil end\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[key] end)\n        if ok then return result end\n        if typeof(key) == \"string\" then return (value :: Instance):FindFirstChild(key) end\n        return nil\n    end\n    return value[key]\nend\n\nfunction LauaCore.coalesce(value: any, fallback: () -> any): any\n    if value ~= nil then return value end\n    return fallback()\nend\n\n\n-- Laua: spread merges consecutive array entries and then named keys.\nfunction LauaCore.spread(...: any): {[any]: any}\n    local result = {}\n    for index = 1, select(\"#\", ...) do\n        local item = select(index, ...)\n        assert(type(item) == \"table\", \"spread expects tables\")\n        for arrayIndex = 1, #item do\n            table.insert(result, item[arrayIndex])\n        end\n        for key, value in item do\n            if type(key) ~= \"number\" or key % 1 ~= 0 or key < 1 or key > #item then\n                result[key] = value\n            end\n        end\n    end\n    return result\nend\n\nfunction LauaCore.slice(value: any, first: number?, last: number?): any\n    local valueType = typeof(value)\n    if valueType == \"string\" then\n        return string.sub(value, first or 1, last or #value)\n    end\n    if valueType == \"buffer\" then\n        local length = buffer.len(value)\n        local startIndex = first or 1\n        local endIndex = last or length\n        if startIndex < 0 then startIndex = length + startIndex + 1 end\n        if endIndex < 0 then endIndex = length + endIndex + 1 end\n        startIndex = math.clamp(startIndex, 1, length + 1)\n        endIndex = math.clamp(endIndex, 0, length)\n        local size = math.max(0, endIndex - startIndex + 1)\n        local result = buffer.create(size)\n        if size > 0 then buffer.copy(result, 0, value, startIndex - 1, size) end\n        return result\n    end\n    error(\"slice supports strings and buffers only\")\nend\n\n\n-- Laua is: matches a Laua class or one of its ancestors.\nfunction LauaCore.is(value: any, class: any): boolean\n    if type(class) ~= \"table\" or type(value) ~= \"table\" then return false end\n    local candidate = getmetatable(value)\n    for _ = 1, 4 do\n        if type(candidate) ~= \"table\" then return false end\n        if candidate == class then return true end\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    local visited = {}\n    while type(candidate) == \"table\" and not visited[candidate] do\n        if candidate == class then return true end\n        visited[candidate] = true\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    return false\nend\n\n-- Unlike an eager index, the index expression is not evaluated for nil.\nfunction LauaCore.optionalCall(value: any, callback: (any) -> any): any\n    if value == nil then return nil end\n    return callback(value)\nend\n\nfunction LauaCore.optionalIndex(value: any, key: () -> any): any\n    if value == nil then return nil end\n    local index = key()\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[index] end)\n        if ok then return result end\n        if typeof(index) == \"string\" then return (value :: Instance):FindFirstChild(index) end\n        return nil\n    end\n    return value[index]\nend\n\n-- Cache complete result tuples, including nils; cache keys use argument identity.\nfunction LauaCore.memo(callback: (...any) -> ...any): (...any) -> ...any\n    local root: {[any]: any} = {}\n    local nilKey = {}\n    local terminal = {}\n    local wrapped = function(...)\n        local node: {[any]: any} = root\n        for index = 1, select(\"#\", ...) do\n            local key = select(index, ...)\n            if key == nil then key = nilKey end\n            local nextNode: {[any]: any}? = node[key]\n            if nextNode ~= nil then\n                node = nextNode\n            else\n                local created: {[any]: any} = {}\n                node[key] = created\n                node = created\n            end\n        end\n        local cached: {n: number, [number]: any}? = node[terminal]\n        if cached == nil then\n            local result = table.pack(callback(...))\n            node[terminal] = result\n            return table.unpack(result, 1, result.n)\n        end\n        return table.unpack(cached, 1, cached.n)\n    end\n    if LauaCore._memoResets == nil then\n        LauaCore._memoResets = setmetatable({}, {__mode = \"k\"})\n    end\n    LauaCore._memoResets[wrapped] = function()\n        root = {}\n    end\n    return wrapped\nend\n\n-- Clear one memoized function or every memo cache in this script.\n-- Clearing resets the cache, not the memoized function's identity.\nfunction LauaCore.clearMemo(callback: ((...any) -> ...any)?): boolean\n    local resets = LauaCore._memoResets\n    if resets == nil then return false end\n    if callback ~= nil then\n        local reset = resets[callback]\n        if reset == nil then error(\"memo.clear expects a memoized function\", 2) end\n        reset()\n        return true\n    end\n    for _, reset in resets do reset() end\n    return true\nend\n\nLauaCore.table = {}\n\nfunction LauaCore.table.filter<T>(items: {T}, predicate: (T, number) -> boolean): {T}\n    local out: {T} = {}\n    local length = 0\n    for index, item in items do\n        if predicate(item, index) then\n            length += 1\n            out[length] = item\n        end\n    end\n    return out\nend\n\nfunction LauaCore.table.map<T, U>(items: {T}, callback: (T, number) -> U): {U}\n    local out: {U} = table.create(#items)\n    for index, item in items do\n        out[index] = callback(item, index)\n    end\n    return out\nend\n\nfunction LauaCore.table.reduce<T, U>(items: {T}, callback: (U, T, number) -> U, initial: U): U\n    local current: U = initial\n    for index, item in items do current = callback(current, item, index) end\n    return current\nend\n\nfunction LauaCore.table.findWhere<T>(items: {T}, predicate: (T, number) -> boolean): T?\n    for index, item in items do\n        if predicate(item, index) then return item end\n    end\n    return nil\nend\n\n-- Lazy imports can break *some* initialisation cycles if neither module\n-- accesses the other before both have finished loading.\nfunction LauaCore.lazyModule(resolve: () -> any): any\n    local loaded = false\n    local target = nil\n    local function get()\n        if not loaded then\n            target = resolve()\n            loaded = true\n        end\n        return target\n    end\n    return setmetatable({}, {\n        __index = function(_, key) return get()[key] end,\n        __newindex = function(_, key, value) get()[key] = value end,\n        __call = function(_, ...) return get()(...) end,\n    })\nend\n\nreturn LauaCore";
+    const LAUA_ASYNC_RUNTIME_SOURCE = "\nlocal Async = {}\nlocal Promise = {}\nPromise.__index = Promise\n\nlocal function isPromise(value)\n    return type(value) == \"table\" and getmetatable(value) == Promise\nend\n\nlocal function settle(promise, status, values)\n    if promise._status ~= \"Pending\" then return end\n    promise._status = status\n    promise._values = values\n    for _, thread in promise._waiters do\n        task.spawn(thread, status == \"Fulfilled\", table.unpack(values, 1, values.n))\n    end\n    table.clear(promise._waiters)\nend\n\nfunction Async.run(callback, ...)\n    assert(type(callback) == \"function\", \"Async.run expects a function\")\n    local promise = {_status = \"Pending\", _values = nil, _waiters = {}}\n    setmetatable(promise, Promise)\n    task.spawn(function(...)\n        local result = table.pack(pcall(callback, ...))\n        if result[1] then\n            local values = table.pack(table.unpack(result, 2, result.n))\n            if values.n == 1 and isPromise(values[1]) then\n                local settled = table.pack(pcall(Async.await, values[1]))\n                if settled[1] then\n                    settle(promise, \"Fulfilled\", table.pack(table.unpack(settled, 2, settled.n)))\n                else\n                    settle(promise, \"Rejected\", table.pack(settled[2]))\n                end\n            else\n                settle(promise, \"Fulfilled\", values)\n            end\n        else\n            settle(promise, \"Rejected\", table.pack(result[2]))\n        end\n    end, ...)\n    return promise\nend\n\nfunction Async.await(value)\n    if not isPromise(value) then\n        if type(value) == \"table\" and type(value.Wait) == \"function\" and type(value.Fire) == \"function\" then\n            return (value):Wait()\n        end\n        return value\n    end\n    if value._status == \"Fulfilled\" then\n        return table.unpack(value._values, 1, value._values.n)\n    end\n    if value._status == \"Rejected\" then error(value._values[1], 2) end\n    local current = coroutine.running()\n    if not current then error(\"await requires a yieldable coroutine\", 2) end\n    table.insert(value._waiters, current)\n    local outcome = table.pack(coroutine.yield())\n    if not outcome[1] then error(outcome[2], 2) end\n    return table.unpack(outcome, 2, outcome.n)\nend\n\nfunction Promise:await()\n    return Async.await(self)\nend\n\nfunction Promise:andThen(callback)\n    return Async.run(function()\n        return callback(Async.await(self))\n    end)\nend\n\nfunction Promise:catch(callback)\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        if result[1] then return table.unpack(result, 2, result.n) end\n        return callback(result[2])\n    end)\nend\n\nfunction Promise:finally(callback)\n    return Async.run(function()\n        local result = table.pack(pcall(Async.await, self))\n        callback()\n        if not result[1] then error(result[2], 0) end\n        return table.unpack(result, 2, result.n)\n    end)\nend\n\nfunction Promise.getStatus(self)\n    return self._status\nend\n\nAsync.Promise = Promise\nAsync.isPromise = isPromise\nreturn Async";
+    const LAUA_CORE_RUNTIME_SOURCE = "local LauaCore = {}\n\nfunction LauaCore.optional(value, key)\n    if value == nil then return nil end\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[key] end)\n        if ok then return result end\n        if typeof(key) == \"string\" then return (value):FindFirstChild(key) end\n        return nil\n    end\n    return value[key]\nend\n\nfunction LauaCore.coalesce(value, fallback)\n    if value ~= nil then return value end\n    return fallback()\nend\n\n\n-- Laua: spread merges consecutive array entries and then named keys.\nfunction LauaCore.spread(...)\n    local result = {}\n    for index = 1, select(\"#\", ...) do\n        local item = select(index, ...)\n        assert(type(item) == \"table\", \"spread expects tables\")\n        for arrayIndex = 1, #item do\n            table.insert(result, item[arrayIndex])\n        end\n        for key, value in item do\n            if type(key) ~= \"number\" or key % 1 ~= 0 or key < 1 or key > #item then\n                result[key] = value\n            end\n        end\n    end\n    return result\nend\n\nfunction LauaCore.slice(value, first, last)\n    local valueType = typeof(value)\n    if valueType == \"string\" then\n        return string.sub(value, first or 1, last or #value)\n    end\n    if valueType == \"buffer\" then\n        local length = buffer.len(value)\n        local startIndex = first or 1\n        local endIndex = last or length\n        if startIndex < 0 then startIndex = length + startIndex + 1 end\n        if endIndex < 0 then endIndex = length + endIndex + 1 end\n        startIndex = math.clamp(startIndex, 1, length + 1)\n        endIndex = math.clamp(endIndex, 0, length)\n        local size = math.max(0, endIndex - startIndex + 1)\n        local result = buffer.create(size)\n        if size > 0 then buffer.copy(result, 0, value, startIndex - 1, size) end\n        return result\n    end\n    error(\"slice supports strings and buffers only\")\nend\n\n\n-- Laua is: matches a Laua class or one of its ancestors.\nfunction LauaCore.is(value, class)\n    if type(class) ~= \"table\" or type(value) ~= \"table\" then return false end\n    local candidate = getmetatable(value)\n    for _ = 1, 4 do\n        if type(candidate) ~= \"table\" then return false end\n        if candidate == class then return true end\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    local visited = {}\n    while type(candidate) == \"table\" and not visited[candidate] do\n        if candidate == class then return true end\n        visited[candidate] = true\n        local meta = getmetatable(candidate)\n        candidate = type(meta) == \"table\" and meta.__index or nil\n    end\n    return false\nend\n\n-- Unlike an eager index, the index expression is not evaluated for nil.\nfunction LauaCore.optionalCall(value, callback)\n    if value == nil then return nil end\n    return callback(value)\nend\n\nfunction LauaCore.optionalIndex(value, key)\n    if value == nil then return nil end\n    local index = key()\n    if typeof(value) == \"Instance\" then\n        local ok, result = pcall(function() return value[index] end)\n        if ok then return result end\n        if typeof(index) == \"string\" then return (value):FindFirstChild(index) end\n        return nil\n    end\n    return value[index]\nend\n\n-- Cache complete result tuples, including nils; cache keys use argument identity.\nfunction LauaCore.memo(callback)\n    local root = {}\n    local nilKey = {}\n    local terminal = {}\n    local wrapped = function(...)\n        local node = root\n        for index = 1, select(\"#\", ...) do\n            local key = select(index, ...)\n            if key == nil then key = nilKey end\n            local nextNode = node[key]\n            if nextNode ~= nil then\n                node = nextNode\n            else\n                local created = {}\n                node[key] = created\n                node = created\n            end\n        end\n        local cached = node[terminal]\n        if cached == nil then\n            local result = table.pack(callback(...))\n            node[terminal] = result\n            return table.unpack(result, 1, result.n)\n        end\n        return table.unpack(cached, 1, cached.n)\n    end\n    if LauaCore._memoResets == nil then\n        LauaCore._memoResets = setmetatable({}, {__mode = \"k\"})\n    end\n    LauaCore._memoResets[wrapped] = function()\n        root = {}\n    end\n    return wrapped\nend\n\n-- Clear one memoized function or every memo cache in this script.\n-- Clearing resets the cache, not the memoized function's identity.\nfunction LauaCore.clearMemo(callback)\n    local resets = LauaCore._memoResets\n    if resets == nil then return false end\n    if callback ~= nil then\n        local reset = resets[callback]\n        if reset == nil then error(\"memo.clear expects a memoized function\", 2) end\n        reset()\n        return true\n    end\n    for _, reset in resets do reset() end\n    return true\nend\n\nLauaCore.table = {}\n\nfunction LauaCore.table.filter(items, predicate)\n    local out = {}\n    local length = 0\n    for index, item in items do\n        if predicate(item, index) then\n            length += 1\n            out[length] = item\n        end\n    end\n    return out\nend\n\nfunction LauaCore.table.map(items, callback)\n    local out = table.create(#items)\n    for index, item in items do\n        out[index] = callback(item, index)\n    end\n    return out\nend\n\nfunction LauaCore.table.reduce(items, callback, initial)\n    local current = initial\n    for index, item in items do current = callback(current, item, index) end\n    return current\nend\n\nfunction LauaCore.table.findWhere(items, predicate)\n    for index, item in items do\n        if predicate(item, index) then return item end\n    end\n    return nil\nend\n\n-- Lazy imports can break *some* initialisation cycles if neither module\n-- accesses the other before both have finished loading.\nfunction LauaCore.lazyModule(resolve)\n    local loaded = false\n    local target = nil\n    local function get()\n        if not loaded then\n            target = resolve()\n            loaded = true\n        end\n        return target\n    end\n    return setmetatable({}, {\n        __index = function(_, key) return get()[key] end,\n        __newindex = function(_, key, value) get()[key] = value end,\n        __call = function(_, ...) return get()(...) end,\n    })\nend\n\nreturn LauaCore";
 
     // Generate only the LauaCore helpers used by this file. This avoids
     // initializing unrelated functions in every compiled script, but keeps
@@ -2332,10 +2343,10 @@ print(player.IsAlive)  -- true`;
     }
 
     function runtimeDoBlock(name, alias, body) {
-      const declaration = alias === "Async" ? "local Async: any = {}" : "local LauaCore = {}";
+      const declaration = alias === "Async" ? "local Async = {}" : "local LauaCore = {}";
       if (!body.includes(declaration)) throw new Error(`Missing ${alias} runtime declaration`);
-      const inner = body.replace(declaration, `local ${alias}: {[string]: any} = ${name}`).replace(new RegExp(`\\s*return ${alias}\\s*$`), "");
-      return `local ${name}: {[string]: any} = {}\ndo\n${inner}\nend`;
+      const inner = body.replace(declaration, `local ${alias} = ${name}`).replace(new RegExp(`\\s*return ${alias}\\s*$`), "");
+      return `local ${name} = {}\ndo\n${inner}\nend`;
     }
 
     function insertLauaEmbeddedRuntimes(source) {
@@ -3717,7 +3728,7 @@ print(player.IsAlive)  -- true`;
           seen.add(f.name);fields.push(f);
         }
         const emitted=[`local ${m[1]} = {}`,
-          `function ${m[1]}.Validate(value: any): (boolean, string?)`,
+          `function ${m[1]}.Validate(value)`,
           '    if type(value) ~= "table" then return false, "Expected table" end'];
         for(const f of fields) {
           const value=`value[${JSON.stringify(f.name)}]`;
@@ -3725,7 +3736,7 @@ print(player.IsAlive)  -- true`;
           emitted.push(`    if ${f.optional ? `${value} ~= nil and ` : ''}not (${expression}) then return false, ${JSON.stringify(`Invalid field ${f.name}: expected ${f.type}${f.optional?'?':''}`)} end`);
         }
         emitted.push('    return true, nil','end',
-          `function ${m[1]}.Assert(value: any): any`,
+          `function ${m[1]}.Assert(value)`,
           `    local ok, message = ${m[1]}.Validate(value)`,
           '    if not ok then error(message, 2) end',
           '    return value','end');
@@ -3840,7 +3851,7 @@ end`;
         (full, indentation, whitespace, declaration) => indentation + ' '.repeat('export'.length + whitespace.length) + declaration);
     }
 
-    const LAUA_VERSION = "3.56";
+    const LAUA_VERSION = "3.57";
 
     function transpile(source, options = {}) {
       const originalLauaSource = source;
@@ -6638,43 +6649,30 @@ end`;
 
     function lintDuplicateParameters(maskedSource, pushMarker) {
       const patterns = [
-        /\bfunction\s+[A-Za-z_][A-Za-z0-9_.:]*\s*\(([^)]*)\)/g,
-        /\blocal\s+function\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)/g,
+        /\b(?:local\s+)?function\s+[A-Za-z_][A-Za-z0-9_.:]*\s*\(([^)]*)\)/g,
         /\bconstructor\s*\(([^)]*)\)/g,
         /\bfunction\s*\(([^)]*)\)/g
       ];
-
+      const processed = new Set();
       for (const pattern of patterns) {
         let match;
-
         while ((match = pattern.exec(maskedSource)) !== null) {
           const paramsText = match[1];
           const paramsStart = match.index + match[0].indexOf("(") + 1;
+          if (processed.has(paramsStart)) continue;
+          processed.add(paramsStart);
+          const constructor = /^constructor\b/.test(match[0]);
           const seen = new Set();
-
-          for (const rawParam of paramsText.split(",")) {
-            const trimmed = rawParam.trim();
-            if (!trimmed || trimmed === "...") continue;
-
-            const paramMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)/);
-            if (!paramMatch) continue;
-
-            const name = paramMatch[1];
-
-            if (seen.has(name)) {
-              const relative = paramsText.indexOf(name, paramsText.indexOf(name) + 1);
-              const start = relative >= 0
-                ? paramsStart + relative
-                : paramsStart;
-
-              pushMarker(
-                start,
-                start + name.length,
-                monaco.MarkerSeverity.Warning,
-                `Duplicate parameter '${name}'.`
-              );
-            }
-
+          // Preserve offsets for the actual duplicate name, including after
+          // visibility modifiers and in nested type annotations.
+          for (const param of splitLauaAttributeParts(paramsText)) {
+            const prefix = /^\s*(?:(?:public|private|protected)\s+)?/.exec(param.text)[0];
+            const paramName = param.text.slice(constructor ? prefix.length : (/^\s*/.exec(param.text)[0].length));
+            const nameMatch = /^([A-Za-z_][A-Za-z0-9_]*)\b/.exec(paramName);
+            if (!nameMatch) continue;
+            const name = nameMatch[1];
+            const at = paramsStart + param.start + (constructor ? prefix.length : /^\s*/.exec(param.text)[0].length);
+            if (seen.has(name)) pushMarker(at, at + name.length, monaco.MarkerSeverity.Error, `Duplicate parameter '${name}'.`);
             seen.add(name);
           }
         }
@@ -10868,8 +10866,23 @@ end`;
           status.className = force && (preflight.errors || importErrors.length || generatedErrors.length) ? "error" : "ok";
           return output;
         } catch (err) {
-          // Never let Copy use stale code from an earlier successful transpilation.
+          // Force Transpile must always produce current-source output. If the
+          // converter itself fails, preserve the source and show the failure;
+          // never imply the fallback is valid, runnable Luau.
           const failureMessage = err?.message || String(err);
+          if (force) {
+            const file = projectFiles.get(activeFile);
+            const fallback = '-- Force Transpile: conversion incomplete; original source follows.\n'
+              + '-- Error: ' + String(failureMessage).replaceAll('\n', ' ') + '\n'
+              + lauaEditor.getValue();
+            luauEditor.setValue(fallback);
+            monaco.editor.setModelMarkers(luauEditor.getModel(), 'laua-generated', []);
+            if (file) { file.generated=fallback; file.generatedForce=true; }
+            status.textContent = 'Force Transpile fallback: ' + failureMessage + ' · Original source shown; may not run in Roblox Studio.';
+            status.className = 'error';
+            return fallback;
+          }
+          // Never let Copy use stale code from an earlier successful transpilation.
           monaco.editor.setModelMarkers(luauEditor.getModel(),'laua-generated',[]);
           luauEditor.setValue("-- Transpilation failed. Fix the error in the Laua editor.\n-- " + String(failureMessage).replaceAll("\n", "\n-- "));
           if (activeFile) { projectFiles.get(activeFile).generated=null; projectFiles.get(activeFile).generatedForce=false; }
