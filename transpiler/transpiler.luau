@@ -1,4 +1,4 @@
-local Transpiler = {Version = "3.57"}
+local Transpiler = {Version = "3.58"}
 
 -- Embedded runtime sources. Generated scripts are self-contained and do not require external Laua runtime modules.
 
@@ -401,7 +401,7 @@ local function splitLines(source: string)
 end
 
 local function blockStart(line: string): boolean
-    if line:match("^abstract%s+class%s+") or line:match("^final%s+class%s+") or line:match("^class%s+") then return true end
+    if line:match("^abstract%s+class%s+") or line:match("^final%s+class%s+") or line:match("^class%s+") or line:match("^interface%s+") or line == "try" or line:match("^guard%s+.+%s+else$") or line:match("^unless%s+.+%s+then$") then return true end
     if line:match("^namespace%s+") or line:match("^return%s+namespace%s+") or line:match("^enum%s+") or line:match("^match%s+") or line:match("^schema%s+") then return true end
     if line:match("^constructor%s*%(") or line:match("^defer%s*$") or line:match("^operator%s+") or line:match("^watch%s+[%a_][%w_]*%s*%(") then return true end
     if line:match("^async%s+function%s+") or line:match("^local%s+async%s+function%s+") then return true end
@@ -4150,6 +4150,272 @@ local function maskExportedClassDeclarations(source: string): string
     end))
 end
 
+-- Laua v3.58 feature lowering. Interface and readonly declarations are checked
+-- before code generation, and no implicit types or runtime modules are added.
+local function v358Opens(line: string): boolean
+    if line:match("^interface%s+") or line == "try" or line:match("^unless%s+.+%s+then$") or line:match("^guard%s+.+%s+else$") then return true end
+    if line:match("^export%s+class%s+") or line:match("^export%s+abstract%s+class%s+") or line:match("^export%s+final%s+class%s+") then return true end
+    if line:match("^class%s+") or line:match("^abstract%s+class%s+") or line:match("^final%s+class%s+") then return true end
+    if line:match("^constructor%s*%(") or line:match("^public%s+function%s+") or line:match("^private%s+function%s+") or line:match("^protected%s+function%s+") or line:match("^static%s+function%s+") or line:match("^function%s+") or line:match("^local%s+function%s+") or line:match("^async%s+function%s+") or line:match("^get%s+") or line:match("^set%s+") or line:match("^watch%s+") or line:match("^operator%s+") then return true end
+    if line:match("^namespace%s+") or line:match("^schema%s+") or line:match("^enum%s+") or line:match("^match%s+") or line == "do" or line == "repeat" then return true end
+    if line:match("^if%s+.+%s+then%s*$") or line:match("^while%s+.+%s+do%s*$") or line:match("^for%s+.+%s+do%s*$") then return true end
+    if line:find("function%s*%(") and not line:match("%f[%w]end%s*[)%s]*$") then return true end
+    return false
+end
+
+local function lowerV358Features(source: string): string
+    local maskedSource = maskNonCode(source)
+    if not (maskedSource:find("interface",1,true) or maskedSource:find("implements",1,true) or maskedSource:find("readonly",1,true) or maskedSource:find("guard",1,true) or maskedSource:find("unless",1,true) or maskedSource:find("try",1,true) or maskedSource:find("catch",1,true) or maskedSource:find("finally",1,true)) then return source end
+    local rawLines, maskLines = splitLines(source), splitLines(maskedSource)
+    local entries, removed, overrides = {}, {}, {}
+    for i, line in rawLines do
+        entries[i] = {Raw = line.Text, Code = trim(maskLines[i].Text), Indent = line.Text:match("^[ \t]*") or "", Offset = line.Start}
+    end
+    local function failure(message: string, at: number)
+        error(`Laua v3.58: {message} (line {at})`)
+    end
+    local function ending(start: number): number
+        local depth = 0
+        for j = start, #entries do
+            local code = entries[j].Code
+            if v358Opens(code) then depth += 1 end
+            if code:match("^end%f[%W]") or code:match("^until%f[%W]") then
+                depth -= 1
+                if depth == 0 then return j end
+            end
+        end
+        failure("Missing end", start)
+        return #entries
+    end
+    local interfaces, classes = {}, {}
+    for i, row in entries do
+        local name = row.Code:match("^interface%s+([%a_][%w_]*)$")
+        if not name then continue end
+        if interfaces[name] then failure(`Duplicate interface '{name}'`,i) end
+        local last = nil
+        for j = i + 1, #entries do if entries[j].Code == "end" then last = j; break end end
+        if not last then failure(`Unclosed interface '{name}'`,i) end
+        local spec = {Fields={},Methods={}}
+        for j = i + 1, last - 1 do
+            local raw = trim(entries[j].Raw)
+            local code = entries[j].Code
+            if code == "" then continue end
+            local methodName, params, returns = raw:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*(.+)$")
+            if not methodName then methodName, params = raw:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*$") end
+            local field, fieldType = raw:match("^([%a_][%w_]*)%s*:%s*(.+)$")
+            if methodName then
+                if spec.Methods[methodName] or spec.Fields[methodName] then failure(`Duplicate interface member '{methodName}'`,j) end
+                spec.Methods[methodName]={Params=params,Return=returns or ""}
+            elseif field then
+                if spec.Fields[field] or spec.Methods[field] then failure(`Duplicate interface member '{field}'`,j) end
+                spec.Fields[field]=trim(fieldType)
+            else failure(`Invalid interface member '{raw}'`,j) end
+        end
+        interfaces[name]=spec
+        for j=i,last do removed[j]=true end
+    end
+    for i, row in entries do
+        if removed[i] then continue end
+        local header = row.Code
+        local name = header:match("^class%s+([%a_][%w_]*)") or header:match("^export%s+class%s+([%a_][%w_]*)") or header:match("^abstract%s+class%s+([%a_][%w_]*)") or header:match("^final%s+class%s+([%a_][%w_]*)") or header:match("^export%s+abstract%s+class%s+([%a_][%w_]*)") or header:match("^export%s+final%s+class%s+([%a_][%w_]*)")
+        if not name then continue end
+        local last = ending(i)
+        local base = header:match("%s+extends%s+([%a_][%w_%.]*)")
+        local implemented = header:match("%s+implements%s+([%w_,%s]+)$")
+        local info = {Name=name,Base=base,Interfaces={},Fields={},Methods={},Readonly={},Start=i,Finish=last}
+        if implemented then
+            for part in implemented:gmatch("[^,]+") do table.insert(info.Interfaces,trim(part)) end
+            overrides[i] = (row.Raw:gsub("%s+implements%s+[%w_,%s]+$", ""))
+        end
+        classes[name]=info
+        local skipThrough = 0
+        for j=i+1,last-1 do
+            if j <= skipThrough then continue end
+            local item=entries[j]
+            if not item or removed[j] or item.Code=="" then continue end
+            local text=trim(item.Raw)
+            local readonlyName = text:match("^readonly%s+([%a_][%w_]*)") or text:match("^[%a_]+%s+readonly%s+([%a_][%w_]*)")
+            if readonlyName then
+                local after=text:match("readonly%s+[%a_][%w_]*%s*:%s*(.-)%s*=") or text:match("readonly%s+[%a_][%w_]*%s*:%s*(.+)$") or ""
+                local initializer = text:match("readonly%s+[%a_][%w_]*%s*=%s*.+") ~= nil or text:match("readonly%s+[%a_][%w_]*%s*:%s*.-%s*=%s*.+") ~= nil
+                if trim(after)=="" and not initializer then failure(`readonly field '{readonlyName}' requires a type or initializer`,j) end
+                info.Readonly[readonlyName]={Initializer=initializer,Writes=0}
+                info.Fields[readonlyName]={Type=trim(after)}
+                overrides[j] = (item.Raw:gsub("%f[%w]readonly%s+", "", 1))
+                continue
+            end
+            local clean=text
+            for _=1,8 do
+                local prefix=clean:match("^([%a_]+)%s+")
+                if prefix~="public" and prefix~="private" and prefix~="protected" and prefix~="static" and prefix~="final" and prefix~="override" and prefix~="abstract" then break end
+                clean=trim(clean:sub(#prefix+1))
+            end
+            local method,params,ret=clean:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*:%s*(.+)$")
+            if not method then method,params=clean:match("^function%s+([%a_][%w_]*)%s*%(([^)]*)%)%s*$") end
+            if method then
+                if not text:match("%f[%w]static%s+") then info.Methods[method]={Params=params,Return=ret or ""} end
+                skipThrough = ending(j)
+            else
+                local field,ty = clean:match("^([%a_][%w_]*)%s*:%s*(.-)%s*=")
+                if not field then field,ty=clean:match("^([%a_][%w_]*)%s*:%s*(.+)$") end
+                if not field then field=clean:match("^([%a_][%w_]*)%s*=") end
+                if field and not text:match("%f[%w]static%s+") then info.Fields[field]={Type=trim(ty or "")} end
+                local ctor=clean:match("^constructor%s*%(([^)]*)%)")
+                if ctor then
+                    skipThrough = ending(j)
+                    for p in ctor:gmatch("[^,]+") do
+                        local fname,ptype = nil,nil
+                        -- Luau patterns do not support non-capturing groups.
+                        if not fname then
+                            local modifier,fieldName,typeName=p:match("^%s*([%a_]+)%s+([%a_][%w_]*)%s*:%s*(.+)$")
+                            if modifier=="public" or modifier=="private" or modifier=="protected" then fname,ptype=fieldName,typeName end
+                        end
+                        if fname then info.Fields[fname]={Type=trim(ptype)} end
+                    end
+                end
+                if clean:match("^get%s+") or clean:match("^set%s+") or clean:match("^watch%s+") or clean:match("^operator%s+") then skipThrough=ending(j) end
+            end
+        end
+    end
+    local function member(className: string?, key: string, group: string, seen: {[string]:boolean}?): any
+        local visited=seen or {}
+        if not className or visited[className] then return nil end
+        visited[className]=true
+        local info=classes[className]
+        if not info then return nil end
+        return info[group][key] or member(info.Base,key,group,visited)
+    end
+    local function normalized(s: string): string return s:gsub("%s+","") end
+    local function paramCount(s: string): number
+        if trim(s)=="" then return 0 end
+        local n=0
+        for _ in s:gmatch("[^,]+") do n+=1 end
+        return n
+    end
+    for _,cls in classes do
+        for _,iname in cls.Interfaces do
+            local spec=interfaces[iname]
+            if not spec then failure(`Unknown interface '{iname}'`,cls.Start) end
+            for name,expected in spec.Fields do
+                local actual=member(cls.Name,name,"Fields")
+                if not actual then failure(`Class '{cls.Name}' does not implement interface '{iname}': missing field '{name}'`,cls.Start) end
+                if normalized(actual.Type)~=normalized(expected) then failure(`Interface '{iname}' field '{name}' requires type '{expected}'`,cls.Start) end
+            end
+            for name,expected in spec.Methods do
+                local actual=member(cls.Name,name,"Methods")
+                if not actual then failure(`Class '{cls.Name}' does not implement interface '{iname}': missing method '{name}'`,cls.Start) end
+                if paramCount(actual.Params)~=paramCount(expected.Params) or normalized(actual.Return)~=normalized(expected.Return) then failure(`Interface '{iname}' method '{name}' has incompatible signature`,cls.Start) end
+                local expectedParts, actualParts={},{}
+                for part in expected.Params:gmatch("[^,]+") do table.insert(expectedParts,trim(part)) end
+                for part in actual.Params:gmatch("[^,]+") do table.insert(actualParts,trim(part)) end
+                for n, part in expectedParts do
+                    local required = trim(part:match(":%s*(.+)$") or "")
+                    local supplied = trim(actualParts[n]:match(":%s*(.+)$") or "")
+                    if required~="" and normalized(required)~=normalized(supplied) then failure(`Interface '{iname}' method '{name}' has incompatible parameter types`,cls.Start) end
+                end
+            end
+        end
+    end
+    local bindings={}
+    for _,r in entries do
+        local variable,cls=r.Code:match("local%s+([%a_][%w_]*)%s*=%s*new%s+([%a_][%w_]*)")
+        if variable then bindings[variable]=cls end
+    end
+    local function enclosing(i: number): any
+        for _,cls in classes do if i>cls.Start and i<cls.Finish then return cls end end
+        return nil
+    end
+    for i,r in entries do
+        if removed[i] then continue end
+        local target,property,operator=r.Code:match("^%s*([%a_][%w_]*)%.([%a_][%w_]*)%s*([%+%-%*/]?=)")
+        if not target then target,property,operator=r.Code:match("[%s;]([%a_][%w_]*)%.([%a_][%w_]*)%s*([%+%-%*/]?=)") end
+        if not target then continue end
+        local current=enclosing(i)
+        local className=target=="self" and current and current.Name or bindings[target] or (classes[target] and target)
+        local field=className and member(className,property,"Readonly")
+        if not field then continue end
+        if target~="self" or not current then failure(`Cannot reassign readonly field '{property}'`,i) end
+        local ctorRow=nil
+        for j=current.Start+1,current.Finish-1 do if entries[j].Code:match("^constructor%s*%(") then ctorRow=j;break end end
+        if not ctorRow or i<=ctorRow or i>=ending(ctorRow) or field.Initializer or operator~="=" then failure(`Readonly field '{property}' can only be initialized once in constructor`,i) end
+        field.Writes+=1
+        if field.Writes>1 then failure(`readonly field '{property}' assigned twice`,i) end
+    end
+    for _,cls in classes do for fname,f in cls.Readonly do if not f.Initializer and f.Writes~=1 then failure(`Readonly field '{fname}' must be initialized in constructor`,cls.Start) end end end
+    local stack, output, serial = {},{},0
+    local function emit(s: string) table.insert(output,s) end
+    for i,r in entries do
+        local code,indent=r.Code,r.Indent
+        if removed[i] then emit("");continue end
+        if code:match("^readonly%f[%W]") and not enclosing(i) then failure("readonly must declare a class field",i) end
+        if code:match("^guard%f[%W]") and not code:match("^guard%s+.+%s+else%s*$") and not code:match("^guard%s+.+%s+else%s+.+$") then failure("guard requires condition and else",i) end
+        if code:match("^unless%f[%W]") and not code:match("^unless%s+.+%s+then%s*$") then failure("unless requires condition and then",i) end
+        local raw=overrides[i] or r.Raw
+        local condition=code:match("^guard%s+(.+)%s+else%s*$")
+        if condition then
+            emit(indent.."if not ("..trim(r.Raw):match("^guard%s+(.+)%s+else%s*$")..") then")
+            table.insert(stack,{Kind="guard"})
+            continue
+        end
+        local instantCondition,instantExit=trim(r.Raw):match("^guard%s+(.+)%s+else%s+(return.+)$")
+        if instantCondition then
+            emit(indent.."if not ("..instantCondition..") then "..instantExit.." end")
+            continue
+        end
+        condition=code:match("^unless%s+(.+)%s+then%s*$")
+        if condition then
+            emit(indent.."if not ("..trim(r.Raw):match("^unless%s+(.+)%s+then%s*$")..") then")
+            table.insert(stack,{Kind="unless"})
+            continue
+        end
+        if code=="try" then
+            serial+=1
+            local id="__lauaTry358_"..serial
+            emit(indent.."do\n"..indent.."    local "..id.."_ok\n"..indent.."    local "..id.."_err\n"..indent.."    "..id.."_ok, "..id.."_err = pcall(function()")
+            table.insert(stack,{Kind="try",Id=id,Phase="try",HadCatch=false})
+            continue
+        end
+        local top=stack[#stack]
+        local catchName=code:match("^catch%s+([%a_][%w_]*)$")
+        if code=="catch" or catchName then
+            if not top or top.Kind~="try" or top.Phase~="try" then failure("catch must follow try",i) end
+            top.Phase="catch"; top.HadCatch=true
+            local id=top.Id
+            emit(indent.."    end)\n"..indent.."    local "..id.."_catch_ok = true\n"..indent.."    local "..id.."_catch_err\n"..indent.."    if not "..id.."_ok then\n"..indent.."        local "..(catchName or "err").." = "..id.."_err\n"..indent.."        "..id.."_catch_ok, "..id.."_catch_err = pcall(function()")
+            continue
+        end
+        if code=="finally" then
+            if not top or top.Kind~="try" or top.Phase=="finally" then failure("finally must follow try or catch",i) end
+            local id=top.Id
+            if top.Phase=="try" then emit(indent.."    end)") else emit(indent.."        end)\n"..indent.."    end") end
+            emit(indent.."    local "..id.."_finally_ok\n"..indent.."    local "..id.."_finally_err\n"..indent.."    "..id.."_finally_ok, "..id.."_finally_err = pcall(function()")
+            top.Phase="finally"
+            continue
+        end
+        if code:match("^end%f[%W]") and top then
+            table.remove(stack)
+            if top.Kind=="try" then
+                local id=top.Id
+                if top.Phase=="try" then emit(indent.."    end)\n"..indent.."    if not "..id.."_ok then error("..id.."_err, 0) end\n"..indent.."end")
+                elseif top.Phase=="catch" then emit(indent.."        end)\n"..indent.."    end\n"..indent.."    if not "..id.."_catch_ok then error("..id.."_catch_err, 0) end\n"..indent.."end")
+                else
+                    emit(indent.."    end)\n"..indent.."    if not "..id.."_finally_ok then error("..id.."_finally_err, 0) end\n"..indent.."    if not "..id..(top.HadCatch and "_catch_ok" or "_ok").." then error("..id..(top.HadCatch and "_catch_err" or "_err")..", 0) end\n"..indent.."end")
+                end
+            else emit(raw) end
+            continue
+        end
+        if code:find("%f[%w]return%f[%W]") or code:find("%f[%w]break%f[%W]") or code:find("%f[%w]continue%f[%W]") then
+            for _,entry in stack do if entry.Kind=="try" then failure("return, break and continue inside try/catch/finally are unsupported",i) end end
+        end
+        emit(raw)
+        if v358Opens(code) then table.insert(stack,{Kind="ordinary"}) end
+    end
+    for _,entry in stack do
+        if entry.Kind=="try" or entry.Kind=="guard" or entry.Kind=="unless" then failure("Missing end for "..entry.Kind.." block",#entries) end
+    end
+    return table.concat(output,"\n")
+end
+
 function Transpiler.Transpile(source: string, options: any?): string
     assert(type(source) == "string", "Expected Laua source string")
     local mode = type(options) == "table" and options.Mode or "Development"
@@ -4158,12 +4424,14 @@ function Transpiler.Transpile(source: string, options: any?): string
     if style ~= "Readable" and style ~= "Compact" and style ~= "One Line" then error("Invalid Laua output style") end
 
     if source:find("--#", 1, true) then source = preprocessMode(source, mode) end
+    local originalSource = source
+    source = lowerV358Features(source)
     validateExpressionSyntax(source)
     local checkSource = (source:find('schema', 1, true)) and nativeMaskContractBodies(source) or source
     checkSource = maskExportedClassDeclarations(checkSource)
     local getterRewrites = {}
     if type(options) ~= "table" or options.SemanticCheck ~= false then
-        validateReservedBindings(source)
+        validateReservedBindings(originalSource)
         validateClassContracts(checkSource)
         getterRewrites = validateLauaSemantics(checkSource)
         validateTypedSemantics(checkSource)
