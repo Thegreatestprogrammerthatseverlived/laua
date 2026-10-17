@@ -888,6 +888,15 @@ local function transpileClasses(source: string): string
                 index = nextIndex or (#lines + 1)
                 continue
             end
+            -- Explicit assignment to this class table is a static field.
+            -- Do not accidentally accept assignments to unrelated objects.
+            local owner, staticField, staticValue = remainder:match("^([%a_][%w_]*)%.([%a_][%w_]*)%s*=%s*(.+)$")
+            if owner == name then
+                if next(modifiers) or #attributes > 0 then error("Class-table assignments cannot have member modifiers or attributes") end
+                table.insert(statics, {Name = staticField, Value = staticValue})
+                index += 1
+                continue
+            end
             local field, value = remainder:match("^([%a_][%w_]*)%s*=%s*(.+)$")
             if not field then field, value = remainder:match("^([%a_][%w_]*)%s*:%s*[^%s=].-%s*=%s*(.+)$") end
             if not field then field = remainder:match("^([%a_][%w_]*)%s*:%s*[^%s=].-%s*$") end
@@ -2707,6 +2716,140 @@ local function oneLineGeneratedOutput(source: string): string
     return flattened:gsub(";%s*$", "")
 end
 
+-- Readable output formatting only. The mask prevents comments, quoted text,
+-- and multiline strings from being treated as executable block delimiters.
+local function formatGeneratedLuau(source: string): string
+    -- CRLFs may be significant data inside long string literals.
+    if source:find("\r", 1, true) then return source end
+    local masked = maskNonCode(source)
+    local lines = {}
+    local codeLines = {}
+    for line in (source .. "\n"):gmatch("(.-)\n") do table.insert(lines, line) end
+    for line in (masked .. "\n"):gmatch("(.-)\n") do table.insert(codeLines, line) end
+    local frames = {}
+    local delimiters = {}
+    local output = {}
+
+    local function depth(): number
+        local count = #frames
+        for _, entry in delimiters do
+            if entry.Indent then count += 1 end
+        end
+        return count
+    end
+
+    local function beginsWith(value: string, word: string): boolean
+        if value:sub(1, #word) ~= word then return false end
+        return not value:sub(#word + 1, #word + 1):match("[%w_]")
+    end
+
+    for index, raw in lines do
+        local line = raw:gsub("^[ \t]*", "")
+        local syntax = (codeLines[index] or ""):gsub("^[ \t]*", "")
+        if line == "" then
+            table.insert(output, "")
+            continue
+        end
+        -- Do not alter whitespace within literal contents or long comments.
+        if not syntax:find("%S") then
+            table.insert(output, raw)
+            continue
+        end
+
+        local before = depth()
+        local cursor = syntax
+        if (beginsWith(cursor, "elseif") or beginsWith(cursor, "else")) and table.find(frames, "if") then
+            before = math.max(0, before - 1)
+        else
+            local previewBlocks = #frames
+            local previewDelimiters = table.clone(delimiters)
+            while true do
+                local closed
+                if beginsWith(cursor, "end") then closed = "end"
+                elseif beginsWith(cursor, "until") then closed = "until"
+                else
+                    local first = cursor:sub(1, 1)
+                    if first == ")" or first == "}" or first == "]" then closed = first end
+                end
+                if not closed then break end
+                if closed == "end" or closed == "until" then
+                    if previewBlocks > 0 then
+                        previewBlocks -= 1
+                        before = math.max(0, before - 1)
+                    end
+                elseif #previewDelimiters > 0 then
+                    local entry = table.remove(previewDelimiters)
+                    if entry.Indent then before = math.max(0, before - 1) end
+                end
+                cursor = (cursor:sub(#closed + 1):gsub("^%s*", ""))
+            end
+        end
+
+        local skipDo = 0
+        local containsBlockOpener = syntax:find("%f[%a]function%f[%A]") ~= nil
+        -- Lua patterns have no alternation; check each block keyword.
+        if not containsBlockOpener then
+            for _, keyword in {"if", "for", "while", "repeat", "do"} do
+                if beginsWith(syntax, keyword) or syntax:find(";%s*" .. keyword .. "%f[%W]") then
+                    containsBlockOpener = true
+                    break
+                end
+            end
+        end
+        local containsBrace = syntax:find("{", 1, true) ~= nil
+        local position = 1
+        while position <= #syntax do
+            local char = syntax:sub(position, position)
+            if char:match("[%a_]") then
+                local first, last = syntax:find("[%a_][%w_]*", position)
+                local token = first == position and syntax:sub(first, last) or char
+                if token == "function" then
+                    table.insert(frames, "function")
+                elseif token == "if" then
+                    local prefix = syntax:sub(1, position - 1)
+                    if prefix:match("^%s*$") or prefix:match(";%s*$") then table.insert(frames, "if") end
+                elseif token == "for" or token == "while" then
+                    table.insert(frames, token)
+                    skipDo += 1
+                elseif token == "repeat" then
+                    table.insert(frames, "repeat")
+                elseif token == "do" then
+                    if skipDo > 0 then skipDo -= 1 else table.insert(frames, "do") end
+                elseif token == "end" then
+                    if #frames > 0 then table.remove(frames) end
+                elseif token == "until" then
+                    if frames[#frames] == "repeat" then table.remove(frames) end
+                end
+                position += #token
+            else
+                if char == "(" or char == "{" or char == "[" then
+                    local shouldIndent = char == "{" or ((char == "(" or char == "[") and not containsBlockOpener and not containsBrace)
+                    table.insert(delimiters, {Token = char, Indent = shouldIndent})
+                elseif char == ")" or char == "}" or char == "]" then
+                    local entry = delimiters[#delimiters]
+                    local opening = char == ")" and "(" or (char == "}" and "{" or "[")
+                    if entry and entry.Token == opening then table.remove(delimiters) end
+                end
+                position += 1
+            end
+        end
+        table.insert(output, string.rep("    ", math.min(64, before)) .. line)
+    end
+    -- Blank lines between generated top-level functions and returns.
+    local result = {}
+    for index, line in output do
+        local previous = result[#result] or ""
+        local topLevel = line ~= "" and (codeLines[index] or ""):find("%S") ~= nil and not line:match("^%s")
+        local sectionAfterEnd = topLevel and (line:match("^function%s") or line:match("^return%s")) and trim(previous):match("^end[%s%)]*$") ~= nil
+        local sectionAfterClassHeader = topLevel and line:match("^function%s") and previous:match("%.__index%s*=")
+        if (sectionAfterEnd or sectionAfterClassHeader) and trim(previous) ~= "" and not previous:match("^%s*%-%-") then
+            table.insert(result, "")
+        end
+        table.insert(result, line)
+    end
+    return table.concat(result, "\n")
+end
+
 local function compactGeneratedOutput(source: string): string
     if source:find("[[]=*[[]") or source:find("`",1,true) then return source end
     local result = {}
@@ -4078,7 +4221,7 @@ function Transpiler.Transpile(source: string, options: any?): string
             error("Generated Luau contains an expression immediately followed by a number without a separator")
         end
     end
-    local generated = style == "Compact" and compactGeneratedOutput(source) or (style == "One Line" and oneLineGeneratedOutput(source) or source)
+    local generated = style == "Compact" and compactGeneratedOutput(source) or (style == "One Line" and oneLineGeneratedOutput(source) or formatGeneratedLuau(source))
     local header = style == "One Line" and ("--[[ Transpiled with laua v" .. Transpiler.Version .. " ]]") or ("-- Transpiled with laua v" .. Transpiler.Version)
     if style == "One Line" then
         if generated:sub(1, #header + 1) == header .. " " or generated == header then return generated end
