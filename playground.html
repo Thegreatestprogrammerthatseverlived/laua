@@ -827,7 +827,7 @@ print(player.IsAlive)  -- true`;
         if (marker === undefined) {
           const maskedLine = masked.slice(lines[li].start, lines[li].end).trim();
           const opens =
-            /^(abstract\s+|final\s+)?class\b/.test(maskedLine) ||
+            /^(?:export\s+)?(?:(?:abstract|final)\s+)*class\b/.test(maskedLine) ||
             /^(?:return\s+)?namespace\b/.test(maskedLine) ||
             /^enum\b/.test(maskedLine) ||
             /^schema\b/.test(maskedLine) ||
