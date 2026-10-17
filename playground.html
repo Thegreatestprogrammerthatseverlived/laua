@@ -7456,8 +7456,8 @@ end`;
         randomseed: "seed: number, additionalSeed: number?", round: "x: number", sign: "x: number",
         sin: "x: number", sqrt: "x: number", tan: "x: number"
       },
-      task: { cancel: "thread: thread", defer: "callback: function, ...: any", delay: "seconds: number, callback: function, ...: any",
-        desynchronize: "", spawn: "callback: function, ...: any", synchronize: "", wait: "seconds: number?" },
+      task: { cancel: "thread: thread", defer: "callback: function | thread, ...: any", delay: "seconds: number, callback: function | thread, ...: any",
+        desynchronize: "", spawn: "callback: function | thread, ...: any", synchronize: "", wait: "seconds: number?" },
       coroutine: { close: "thread: thread", create: "callback: function", isyieldable: "",
         resume: "thread: thread, ...: any", running: "", status: "thread: thread", wrap: "callback: function", yield: "...: any" },
       utf8: { char: "...: number", codes: "s: string", codepoint: "s: string, start: number?, finish: number?",
@@ -7487,7 +7487,14 @@ end`;
       unpack: "t: table, start: number?, finish: number?", newproxy: "withMetatable: boolean?",
       gcinfo: "", tick: "", time: "", elapsedTime: "", wait: "seconds: number?",
       delay: "seconds: number, callback: function, ...: any", spawn: "callback: function, ...: any",
-      UserSettings: "", settings: "", cancelScope: ""
+      UserSettings: "", settings: "", cancelScope: "",
+      collectgarbage: ["", 'option: "count"'],
+      getfenv: "target: function | number?", setfenv: "target: function | number, environment: table",
+      loadstring: "source: string, chunkName: string?", ypcall: "callback: function, ...: any",
+      // Older Roblox Studio globals are available only in some contexts. They
+      // remain in the autocomplete catalog but do not masquerade as generic
+      // zero-parameter methods when they have arguments.
+      DebuggerManager: "", PluginManager: "", printidentity: "", stats: "", version: ""
     });
 
     function getPlaygroundLibrarySignatures(library, name) {
@@ -8945,12 +8952,17 @@ end`;
             ...LUAU_KEYWORDS.map(name => makeKeyword(name)),
             ...(isLaua ? LAUA_KEYWORDS.filter(name => name !== "self").map(name => makeKeyword(name, "Laua keyword")) : []),
             ...(typeContext ? LUAU_TYPE_WORDS.map(name => makeName(name, monaco.languages.CompletionItemKind.TypeParameter, "Luau type", "0200")) : []),
-            ...LUAU_GLOBAL_FUNCTIONS.map(name => makeName(
-              name,
-              monaco.languages.CompletionItemKind.Function,
-              LUAU_DEPRECATED_GLOBALS.has(name) ? "Deprecated Luau/Roblox global" : "Luau/Roblox global function",
-              LUAU_DEPRECATED_GLOBALS.has(name) ? "0900" : "0300"
-            )),
+            ...LUAU_GLOBAL_FUNCTIONS.map(name => ({
+              ...makeName(name, monaco.languages.CompletionItemKind.Function,
+                LUAU_DEPRECATED_GLOBALS.has(name) ? "Deprecated Luau/Roblox global" : "Luau/Roblox global function",
+                LUAU_DEPRECATED_GLOBALS.has(name) ? "0900" : "0300"),
+              documentation: PLAYGROUND_GLOBAL_SIGNATURES[name] !== undefined
+                ? (Array.isArray(PLAYGROUND_GLOBAL_SIGNATURES[name])
+                    ? PLAYGROUND_GLOBAL_SIGNATURES[name]
+                    : [PLAYGROUND_GLOBAL_SIGNATURES[name]])
+                    .map(params => `${name}(${params})`).join("\n")
+                : undefined
+            })),
             ...LUAU_GLOBAL_OBJECTS.map(name => makeName(name, monaco.languages.CompletionItemKind.Variable, "Roblox/Luau global", "0300")),
             ...LUAU_LIBRARIES.map(name => makeName(name, monaco.languages.CompletionItemKind.Module, "Luau library", "0300")),
             ...(typeContext ? LUAU_BUILTIN_TYPES : LUAU_RUNTIME_CONSTRUCTORS).map(name => makeName(name, monaco.languages.CompletionItemKind.Class, typeContext ? "Roblox datatype or type" : "Roblox constructor", typeContext ? "0200" : "0300")),
@@ -9647,7 +9659,7 @@ end`;
         };
       }
 
-      monaco.languages.registerSignatureHelpProvider("laua", {
+      const lauaSignatureHelpProvider = {
         signatureHelpTriggerCharacters: ["(", ","],
         signatureHelpRetriggerCharacters: [","] ,
         provideSignatureHelp(model, position) {
@@ -9679,7 +9691,13 @@ end`;
               : getSymbolMembers(symbols, owner, operator, cursorOffset);
             const info = members?.[member];
             if (info && (info.kind === "function" || info.kind === "method")) {
-              if (!declarations) declarations = info.signatures || (typeof info.params === "string" ? [info.params] : null);
+              // A missing signature is UNKNOWN, not a zero-parameter API.
+              // Roblox fallback members often have `kind: "function"` without
+              // parameter metadata; showing Method() would be misleading.
+              // Explicit empty signatures from a real API dump are genuine
+              // zero-argument functions and remain supported.
+              if (!declarations) declarations = info.signatures ||
+                (typeof info.params === "string" && info.params.trim() ? [info.params] : null);
               if (info.apiMember && Array.isArray(info.apiMember.Parameters)) {
                 declarations = [info.apiMember.Parameters.map(param =>
                   `${param.Name || "value"}: ${displayRobloxCallbackType(param.Type)}`).join(", ")];
@@ -9690,12 +9708,18 @@ end`;
             declarations = [symbols.localFunctions[name].params || ""];
           } else if (!symbols.locals[name] && !symbols.variables[name] &&
                      Object.prototype.hasOwnProperty.call(PLAYGROUND_GLOBAL_SIGNATURES, name)) {
-            declarations = [PLAYGROUND_GLOBAL_SIGNATURES[name]];
-            documentation = "Luau global function";
+            const signature = PLAYGROUND_GLOBAL_SIGNATURES[name];
+            declarations = Array.isArray(signature) ? signature : [signature];
+            documentation = "Luau/Roblox global function";
           }
           return makeLauaSignatureHelp(name, declarations, activeParameter, documentation);
         }
-      });
+      };
+      // .laua source models use "laua", whereas imported or edited .luau
+      // models use "lua". Autocomplete works in both, so signature help must.
+      for (const languageId of ["laua", "lua"]) {
+        monaco.languages.registerSignatureHelpProvider(languageId, lauaSignatureHelpProvider);
+      }
 
       function findDeclaredSymbolOffset(source, name) {
         const masked = maskNonCode(source), safe=name.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
