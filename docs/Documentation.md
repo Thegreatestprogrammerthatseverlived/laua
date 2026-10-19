@@ -38,13 +38,9 @@ The v3.46 release ZIP includes native and JavaScript transpilers, the browser pl
 
 | File | Purpose |
 | --- | --- |
-| `compiler.js` | Standalone JavaScript **transpiler** (historical filename; not a separate language runtime). |
 | `playground.html` | Preferred self-contained web playground with an embedded JavaScript transpiler core; `index.html` can be a hosting alias. |
 | `transpiler.luau` | Native Luau ModuleScript transpiler, marked v3.46. Native execution in Roblox Studio is **unverified**. |
-| `project-transpiler.cjs` | Opt-in multi-file transpilation, module checks, conservative cross-file diagnostics, and line maps. |
-| `Studio-Verification.luau` | Script for a developer to run in Roblox Studio; its presence is not proof of Studio validation. |
 | `docs/Documentation.md`, `docs/SYNTAX.md`, `docs/KEYWORDS.md` | Current v3.46 references. |
-| `tests/` | Regression, feature, stress, browser-parity, and compatibility-runtime checks. |
 
 You do **not** install a separate Laua virtual machine into your game. The transpiled `.luau` code is what Roblox executes.
 
