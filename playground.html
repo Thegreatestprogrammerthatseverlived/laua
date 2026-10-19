@@ -5849,6 +5849,13 @@ end`;
       return `${base}${note ? ` · ${note}` : ""}${deprecated}`;
     }
 
+    // Roblox's API dump can list parameters that are optional at runtime
+    // without supplying a Default value. WaitForChild's timeout is one of them.
+    function isOptionalRobloxParameter(member, parameter) {
+      return Object.prototype.hasOwnProperty.call(parameter, "Default") ||
+        parameter.Optional === true ||
+        (member?.Name === "WaitForChild" && /^timeout$/i.test(parameter.Name || ""));
+    }
     function robloxFunctionParams(member) {
       if (!Array.isArray(member.Parameters)) return "";
 
@@ -5856,7 +5863,10 @@ end`;
         const name = parameter.Name || "value";
         const typeName = robloxTypeName(parameter.Type);
 
-        return typeName ? `${name}: ${typeName}` : name;
+        const optional = isOptionalRobloxParameter(member, parameter);
+        return typeName
+          ? `${name}: ${typeName}${optional && !typeName.endsWith("?") ? "?" : ""}`
+          : `${name}${optional ? "?" : ""}`;
       }).join(", ");
     }
 
@@ -8006,7 +8016,7 @@ end`;
                   parameter.Name === "..." || parameter.Type?.Name === "Tuple");
                 const required = apiParams.filter(parameter =>
                   parameter.Name !== "..." && parameter.Type?.Name !== "Tuple" &&
-                  !Object.prototype.hasOwnProperty.call(parameter, "Default")).length;
+                  !isOptionalRobloxParameter(member.apiMember, parameter)).length;
                 const max = variadic ? Infinity : apiParams.length;
                 if (parsed.args.length < required || parsed.args.length > max) {
                   const expected = required === max ? String(required) :
@@ -10691,8 +10701,11 @@ end`;
               if (!declarations) declarations = info.signatures ||
                 (typeof info.params === "string" && info.params.trim() ? [info.params] : null);
               if (info.apiMember && Array.isArray(info.apiMember.Parameters)) {
-                declarations = [info.apiMember.Parameters.map(param =>
-                  `${param.Name || "value"}: ${displayRobloxCallbackType(param.Type)}`).join(", ")];
+                declarations = [info.apiMember.Parameters.map(param => {
+                  const typeName = displayRobloxCallbackType(param.Type);
+                  const optional = isOptionalRobloxParameter(info.apiMember, param);
+                  return `${param.Name || "value"}: ${typeName}${optional && !typeName.endsWith("?") ? "?" : ""}`;
+                }).join(", ")];
               }
               documentation = info.documentation || info.detail || documentation;
             }
